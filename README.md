@@ -33,18 +33,24 @@ forwarded opaquely.
 ## 30-second quickstart
 
 ```sh
-# From source
-cargo run
-# -> relay listening on 127.0.0.1:4000
-
-# Or build the release image (tagged releases are published to GHCR)
-docker build -t paseo-relay .
+# Run the published multi-arch image (GHCR tags: v0.1.0 and latest)
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 paseo-relay
+  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.0
 
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
+```
+
+**Developers** — run from source or build the image locally (this is not the
+default path for users):
+
+```sh
+cargo run                             # from source, listening on 127.0.0.1:4000
+docker build -t paseo-relay .         # or build the image from source
+docker run --rm --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 127.0.0.1:4000:4000 paseo-relay
 ```
 
 For anything public, put it behind TLS and an edge load balancer. See
@@ -131,7 +137,7 @@ daemon ───────┘                                                 
                                             │ hyper HTTP/1.1 + custom RFC 6455 codec │
                                             │  per-socket reader ──► session registry│
                                             │  per-socket writer ◄── bounded queues  │
-                                            │  ingress budget / caps / metrics        │
+                                            │  ingress budget / caps / metrics       │
                                             └────────────────────────────────────────┘
 ```
 
@@ -158,13 +164,39 @@ codes, and known differences from the Elixir relay.
 
 ## Deployment
 
-Release workflow publishes multi-arch (`linux/amd64`, `linux/arm64`) images to
-GHCR on `v*` tags with provenance and SBOM; pin the digest from the release
-notes. The release build attaches buildx provenance and an SBOM; inspect the
-published image with:
+Release `v0.1.0` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+GHCR with provenance and SBOM. Use the short version tag; the tag includes the
+leading `v` (`0.1.0` without it is not published):
+
+- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.0` (also tagged `latest`).
+
+Inspect the published image with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay@sha256:<digest>
+docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.0
+```
+
+If your policy requires an immutable reference, pin the multi-arch index digest
+for `v0.1.0` from the
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0)
+instead of the tag.
+
+Both topologies use the same image; the edge in front of it does the routing
+affinity:
+
+```mermaid
+flowchart LR
+  subgraph SN["Single node"]
+    DNS["DNS relay.example.com"] --> EDGE["Caddy TLS edge"]
+    EDGE --> RELAY["relay process"]
+  end
+  subgraph MN["Multiple nodes"]
+    CL["Paseo clients"] --> LB["edge LB hashes the serverId query parameter"]
+    DM["Paseo daemons"] --> LB
+    LB --> N1["relay node 1"]
+    LB --> N2["relay node 2"]
+    LB --> NN["relay node N"]
+  end
 ```
 
 Image contents are reproducible in spirit (pinned Rust toolchain, lockfile,

@@ -31,18 +31,23 @@
 ## 30 秒快速开始
 
 ```sh
-# 从源码运行
-cargo run
-# -> relay listening on 127.0.0.1:4000
-
-# 或构建发布镜像（带 tag 的发布由 GHCR 工作流完成）
-docker build -t paseo-relay .
+# 运行已发布的多架构镜像（GHCR tag：v0.1.0 和 latest）
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 paseo-relay
+  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.0
 
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
+```
+
+**开发者** —— 从源码运行，或在本地构建镜像（普通用户不需要走这条路径）：
+
+```sh
+cargo run                             # 从源码运行，监听 127.0.0.1:4000
+docker build -t paseo-relay .         # 或在本地从源码构建镜像
+docker run --rm --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 127.0.0.1:4000:4000 paseo-relay
 ```
 
 只要对公网开放，就应该放在 TLS 和边缘负载均衡之后。见[部署](#部署)。
@@ -121,7 +126,7 @@ daemon ───────┘                                                 
                                             │ hyper HTTP/1.1 + custom RFC 6455 codec │
                                             │  per-socket reader ──► session registry│
                                             │  per-socket writer ◄── bounded queues  │
-                                            │  ingress budget / caps / metrics        │
+                                            │  ingress budget / caps / metrics       │
                                             └────────────────────────────────────────┘
 ```
 
@@ -145,12 +150,36 @@ probe 脚本和输出未提交，因此只作为补充材料，不是可复现�
 
 ## 部署
 
-发布工作流会在 `v*` tag 上把多架构（`linux/amd64`、`linux/arm64`）镜像发布到
-GHCR，附带 buildx provenance 和 SBOM；请按 release notes 里的 digest 固定镜像。
+发布 `v0.1.0` 会把多架构（`linux/amd64`、`linux/arm64`）镜像发布到 GHCR，
+附带 provenance 和 SBOM。直接用短版本 tag 即可；tag 带前导 `v`（不带 `v` 的
+`0.1.0` 没有发布）：
+
+- **镜像 tag：** `ghcr.io/kfxhjz/paseo-relay:v0.1.0`（同时打 `latest`）。
+
 可以用以下命令检查已发布镜像：
 
 ```sh
-docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay@sha256:<digest>
+docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.0
+```
+
+如果部署策略要求不可变引用，请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0)
+中 `v0.1.0` 对应的多架构 index digest，而不是 tag。
+
+两种拓扑使用同一个镜像；区别在于前置的边缘如何做路由亲和：
+
+```mermaid
+flowchart LR
+  subgraph SN["单节点"]
+    DNS["DNS relay.example.com"] --> EDGE["Caddy TLS 边缘"]
+    EDGE --> RELAY["relay 进程"]
+  end
+  subgraph MN["多节点"]
+    CL["Paseo client"] --> LB["边缘 LB 按 serverId query 参数哈希"]
+    DM["Paseo daemon"] --> LB
+    LB --> N1["relay 节点 1"]
+    LB --> N2["relay 节点 2"]
+    LB --> NN["relay 节点 N"]
+  end
 ```
 
 镜像在供应链意义上可复现（固定 Rust 工具链、lockfile、digest-pinned builder、

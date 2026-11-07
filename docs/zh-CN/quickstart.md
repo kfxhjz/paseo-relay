@@ -19,6 +19,8 @@
 
 ## 部署已发布镜像
 
+直接使用已发布镜像，不需要 Rust 工具链。
+
 ```sh
 git clone https://github.com/kfxhjz/paseo-relay.git
 cd paseo-relay
@@ -27,14 +29,9 @@ RELAY_DOMAIN=relay.example.com \
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
-Compose 会拉取 `ghcr.io/kfxhjz/paseo-relay:0.1.0`。生产环境请固定 release
-digest：
-
-```sh
-RELAY_DOMAIN=relay.example.com \
-PASEO_RELAY_IMAGE=ghcr.io/kfxhjz/paseo-relay@sha256:<digest> \
-docker compose -f examples/docker-compose.caddy.yml up -d
-```
+Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.0`；`latest` 跟随
+最新 release。可用 `PASEO_RELAY_IMAGE` 覆盖版本；如果需要固定不可变的 digest，
+见[部署指南](deployment.md)。
 
 Caddy 会自动申请证书。验证：
 
@@ -46,9 +43,19 @@ relay 本身不映射到宿主机端口，只有 Caddy 对外；relay 以 read-o
 drop 所有 capability 运行。`/metrics` 和 `/ready` 被 Caddy 屏蔽；如果要 Prometheus，
 请在 Compose 内网抓取。
 
+各组件运行位置：
+
+```mermaid
+flowchart LR
+  WEB["互联网或手机客户端"] --> CADDY["Caddy 443 自动 TLS"]
+  DAEMON["Paseo daemon"] -->|"主动出站 wss"| CADDY
+  CADDY --> RELAY["relay 容器 4000 仅内网"]
+```
+
 ## 从源码构建（可选）
 
-只在首个 release 之前，或你要改 relay 时使用。需要至少 ~1 GB 内存：
+只在你要改 relay 本身时使用；正常部署直接用已发布镜像。需要至少 ~1 GB 内存和
+支持 Rust 的 Docker builder：
 
 ```sh
 RELAY_DOMAIN=relay.example.com \

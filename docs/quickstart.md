@@ -20,6 +20,8 @@ cluster.
 
 ## Deploy the published image
 
+The published image is ready to run; this path needs no Rust toolchain.
+
 ```sh
 git clone https://github.com/kfxhjz/paseo-relay.git
 cd paseo-relay
@@ -28,14 +30,10 @@ RELAY_DOMAIN=relay.example.com \
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
-The Compose file pulls `ghcr.io/kfxhjz/paseo-relay:0.1.0`. For production, pin
-the release digest:
-
-```sh
-RELAY_DOMAIN=relay.example.com \
-PASEO_RELAY_IMAGE=ghcr.io/kfxhjz/paseo-relay@sha256:<digest> \
-docker compose -f examples/docker-compose.caddy.yml up -d
-```
+The Compose file pulls the current release,
+`ghcr.io/kfxhjz/paseo-relay:v0.1.0`; `latest` follows the newest release. Set
+`PASEO_RELAY_IMAGE` to override the version, and see
+[deployment.md](deployment.md) if you need an immutable digest pin.
 
 Caddy will obtain a certificate automatically. Verify:
 
@@ -48,10 +46,20 @@ relay runs read-only, non-root, with all capabilities dropped. `/metrics` and
 `/ready` are blocked by Caddy; scrape metrics on the private Compose network if
 you run Prometheus.
 
+What runs where:
+
+```mermaid
+flowchart LR
+  WEB["Internet or mobile client"] --> CADDY["Caddy 443 automatic TLS"]
+  DAEMON["Paseo daemon"] -->|"outbound wss"| CADDY
+  CADDY --> RELAY["relay container 4000 internal only"]
+```
+
 ## Build from source instead
 
-Only use this before the first release or if you are changing the relay. It
-needs at least ~1 GB RAM and a Rust-capable Docker builder:
+Only use this if you are changing the relay itself; the published image covers
+normal deployments. It needs at least ~1 GB RAM and a Rust-capable Docker
+builder:
 
 ```sh
 RELAY_DOMAIN=relay.example.com \

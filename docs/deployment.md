@@ -20,6 +20,22 @@ Do **not** put two relay nodes behind round-robin DNS, plain `least_conn`, or a
 random load balancer. A Paseo daemon and client for the same `serverId` must
 reach the same relay process for the lifetime of the session.
 
+The recommended multi-node layout keeps every socket for one `serverId` on the
+same relay node, with `/ready` as the health signal:
+
+```mermaid
+flowchart TD
+  CLI["Paseo clients"] --> LB["TLS edge load balancer"]
+  DMN["Paseo daemons"] --> LB
+  LB -->|"consistent hash on serverId"| R1["relay node 1"]
+  LB -->|"consistent hash on serverId"| R2["relay node 2"]
+  LB -->|"consistent hash on serverId"| RN["relay node N"]
+  LB -.->|"GET /ready for health"| R1
+  LB -.->|"GET /ready for health"| R2
+  LB -.->|"GET /ready for health"| RN
+  LB -.->|"round-robin or random: wrong"| BAD["one serverId split across nodes"]
+```
+
 ## TLS
 
 Public deployments must serve `wss://`. Either:
@@ -72,11 +88,27 @@ exposed without a proxy, set a value appropriate for your users (for example
 
 ## Single-node container
 
+The published image is the default path and needs no Rust toolchain. Pull and
+run the current release:
+
 ```sh
-docker build -t paseo-relay .
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.0
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 paseo-relay
+  -p 127.0.0.1:4000:4000 \
+  ghcr.io/kfxhjz/paseo-relay:v0.1.0
+```
+
+`v0.1.0` is the current release tag and `latest` follows the newest release. For
+an immutable reference, pin the multi-arch index digest for `v0.1.0` listed in
+the [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0)
+instead of the tag:
+
+```sh
+docker run --rm --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 127.0.0.1:4000:4000 \
+  ghcr.io/kfxhjz/paseo-relay@sha256:<digest>
 ```
 
 The image is a static musl binary in a `scratch` filesystem, runs as UID/GID
@@ -85,7 +117,17 @@ The image is a static musl binary in a `scratch` filesystem, runs as UID/GID
 `curl`.
 
 See [examples/docker-compose.yml](../examples/docker-compose.yml) for a
-read-only Compose example.
+read-only Compose example that also pulls the published image.
+
+To build the relay from source (only needed while changing the relay itself),
+use the build override
+([examples/docker-compose.build.yml](../examples/docker-compose.build.yml)) or a
+plain `docker build -t paseo-relay .`:
+
+```sh
+docker compose -f examples/docker-compose.yml \
+  -f examples/docker-compose.build.yml up -d --build
+```
 
 ## Kubernetes
 
@@ -126,6 +168,23 @@ allow enough `TimeoutStopSec` for the drain grace window
 Recommended rollout: remove the node from the LB (readiness), wait for the LB
 to observe `/ready=503`, send `SIGTERM`, wait at least the grace window, then
 kill if it has not exited.
+
+The drain and rollout sequence for one node:
+
+```mermaid
+sequenceDiagram
+  participant O as Operator
+  participant LB as Edge load balancer
+  participant R as Relay node
+  participant C as Paseo clients
+  LB->>R: GET /ready
+  R-->>LB: 503
+  LB->>LB: remove node from rotation
+  O->>R: SIGTERM
+  Note over R: grace window PASEO_RELAY_SHUTDOWN_GRACE_MS
+  R-->>C: close 1012
+  R-->>O: exit
+```
 
 ## Metrics and alerting
 

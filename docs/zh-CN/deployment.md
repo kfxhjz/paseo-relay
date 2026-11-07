@@ -17,6 +17,22 @@ ownership registry 或 409 reroute；这是刻意取舍（见[完整中文设计
 **不要** 用 round-robin DNS、普通 `least_conn` 或随机负载均衡。同一 `serverId` 的
 Paseo daemon 和 client 必须到达同一个 relay 进程，否则无法配对。
 
+推荐的多节点拓扑：同一 `serverId` 的所有 socket 固定在同一 relay 节点，健康检查用
+`/ready`：
+
+```mermaid
+flowchart TD
+  CLI["Paseo 客户端"] --> LB["TLS 边缘负载均衡"]
+  DMN["Paseo daemon"] --> LB
+  LB -->|"按 serverId 一致性哈希"| R1["relay 节点 1"]
+  LB -->|"按 serverId 一致性哈希"| R2["relay 节点 2"]
+  LB -->|"按 serverId 一致性哈希"| RN["relay 节点 N"]
+  LB -.->|"GET /ready 健康检查"| R1
+  LB -.->|"GET /ready 健康检查"| R2
+  LB -.->|"GET /ready 健康检查"| RN
+  LB -.->|"round-robin 或随机：错误"| BAD["同一 serverId 被拆到不同节点"]
+```
+
 ## TLS
 
 公网部署必须使用 `wss://`。可以：
@@ -60,18 +76,42 @@ LB 终止连接后，relay 看到的每个连接都来自代理 IP。此时
 
 ## 单节点容器
 
+镜像已发布，是默认路径，不需要 Rust 工具链。先拉取并运行当前 release：
+
 ```sh
-docker build -t paseo-relay .
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.0
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 paseo-relay
+  -p 127.0.0.1:4000:4000 \
+  ghcr.io/kfxhjz/paseo-relay:v0.1.0
+```
+
+`v0.1.0` 是当前 release tag，`latest` 跟随最新 release。如果需要不可变引用，请改用
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0) 中
+`v0.1.0` 对应的多架构 index digest，而不是 tag：
+
+```sh
+docker run --rm --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 127.0.0.1:4000:4000 \
+  ghcr.io/kfxhjz/paseo-relay@sha256:<digest>
 ```
 
 镜像是 `scratch` 中的静态 musl 二进制，以 UID/GID `65532` 运行，不写磁盘，并内置
 `healthcheck` 子命令（镜像 `HEALTHCHECK` 调用 `/paseo-relay healthcheck`）。
 不需要 shell 或 `curl`。
 
-Compose 示例见 [examples/docker-compose.yml](../../examples/docker-compose.yml)。
+Compose 示例见 [examples/docker-compose.yml](../../examples/docker-compose.yml)，
+同样默认拉取已发布镜像。
+
+只有在修改 relay 本身时才需要从源码构建：使用 build override
+（[examples/docker-compose.build.yml](../../examples/docker-compose.build.yml)），
+或直接 `docker build -t paseo-relay .`：
+
+```sh
+docker compose -f examples/docker-compose.yml \
+  -f examples/docker-compose.build.yml up -d --build
+```
 
 ## Kubernetes
 
@@ -105,6 +145,23 @@ Compose 示例见 [examples/docker-compose.yml](../../examples/docker-compose.ym
 
 推荐滚动流程：先从 LB 摘除（readiness），等 LB 观察到 `/ready=503`，发 SIGTERM，
 等待至少 grace window，再在必要时 kill。
+
+单个节点的 drain/滚动顺序：
+
+```mermaid
+sequenceDiagram
+  participant O as 运维
+  participant LB as 边缘负载均衡
+  participant R as relay 节点
+  participant C as Paseo 客户端
+  LB->>R: GET /ready
+  R-->>LB: 503
+  LB->>LB: 从轮转中摘除节点
+  O->>R: SIGTERM
+  Note over R: grace window PASEO_RELAY_SHUTDOWN_GRACE_MS
+  R-->>C: close 1012
+  R-->>O: 进程退出
+```
 
 ## 指标与告警
 
