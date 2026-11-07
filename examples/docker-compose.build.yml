@@ -1,0 +1,15 @@
+# Optional override: build the relay from the local checkout instead of pulling
+# the published image. This is for development or when you are changing the
+# relay; normal deployments should use the published image.
+#
+# Building Rust/musl needs substantially more memory than running the relay; use
+# at least ~1 GB RAM and expect several minutes on a small VPS.
+#
+#   docker compose -f examples/docker-compose.yml \
+#     -f examples/docker-compose.build.yml up -d --build
+
+services:
+  paseo-relay:
+    build:
+      context: ..
+    image: paseo-relay:local

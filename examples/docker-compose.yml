@@ -1,12 +1,17 @@
 # Single-node quickstart with a read-only, non-root container.
 #
+# This pulls the published image by default. Override it with PASEO_RELAY_IMAGE,
+# ideally by digest for production. To build from a local checkout instead, add
+# the build override:
+#   docker compose -f examples/docker-compose.yml \
+#     -f examples/docker-compose.build.yml up -d --build
+#
 # For anything public, terminate TLS at a reverse proxy / load balancer and
 # hash on the `serverId` query parameter (see examples/nginx.conf and
 # examples/haproxy.cfg). Expose the relay only on a private interface.
 services:
   paseo-relay:
-    build: .
-    image: paseo-relay:local
+    image: "${PASEO_RELAY_IMAGE:-ghcr.io/kfxhjz/paseo-relay:v0.1.0}"
     restart: unless-stopped
     read_only: true
     cap_drop: ["ALL"]
