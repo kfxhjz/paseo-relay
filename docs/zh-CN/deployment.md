@@ -76,22 +76,39 @@ LB 终止连接后，relay 看到的每个连接都来自代理 IP。此时
 
 ## 单节点容器
 
-镜像已发布，是默认路径，不需要 Rust 工具链。先拉取并运行当前 release：
+镜像已发布，是默认路径，不需要 Rust 工具链。先拉取 release，然后后台运行，并加重启
+策略和比 drain 宽限期更长的 stop timeout（`--rm` 与 `--restart` 互斥）：
 
 ```sh
 docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
-docker run --rm --read-only --cap-drop ALL \
+docker run -d \
+  --name paseo-relay \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
   ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
+
+只想临时前台试跑时，去掉 `-d`/`--restart`/`--stop-timeout`、加上 `--rm`，再用
+`curl` 探测 `/health`（见 README 快速开始）。停止后台容器用
+`docker stop paseo-relay`：SIGTERM 会触发优雅 drain。
+
+上面的命令只发布到 loopback，因为 TLS 预期在边缘代理终止。如果要由 relay 直接提供
+TLS，请挂载 PEM 证书、设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`，并发布
+TLS 端口（例如 `-p 0.0.0.0:443:4000`）。
 
 `v0.1.1` 是当前 release tag，`latest` 跟随最新 release。如果需要不可变引用，请改用
 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1) 中
 `v0.1.1` 对应的多架构 index digest，而不是 tag：
 
 ```sh
-docker run --rm --read-only --cap-drop ALL \
+docker run -d \
+  --name paseo-relay \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
   ghcr.io/kfxhjz/paseo-relay@sha256:<digest>

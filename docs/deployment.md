@@ -88,16 +88,30 @@ exposed without a proxy, set a value appropriate for your users (for example
 
 ## Single-node container
 
-The published image is the default path and needs no Rust toolchain. Pull and
-run the current release:
+The published image is the default path and needs no Rust toolchain. Pull the
+release, then run it detached with a restart policy and a stop timeout longer
+than the drain grace window (`--rm` and `--restart` are mutually exclusive):
 
 ```sh
 docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
-docker run --rm --read-only --cap-drop ALL \
+docker run -d \
+  --name paseo-relay \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
   ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
+
+For a one-off foreground check, drop `-d`/`--restart`/`--stop-timeout`, add
+`--rm`, and `curl` `/health` (see the README quickstart). Stop a detached
+container with `docker stop paseo-relay`: SIGTERM starts the graceful drain.
+
+The commands above publish on loopback because TLS is expected to terminate at
+an edge proxy. To serve TLS directly from the relay, mount the PEM files, set
+`PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`, and publish the TLS port (for
+example `-p 0.0.0.0:443:4000`).
 
 `v0.1.1` is the current release tag and `latest` follows the newest release. For
 an immutable reference, pin the multi-arch index digest for `v0.1.1` listed in
@@ -105,7 +119,11 @@ the [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
 instead of the tag:
 
 ```sh
-docker run --rm --read-only --cap-drop ALL \
+docker run -d \
+  --name paseo-relay \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
   ghcr.io/kfxhjz/paseo-relay@sha256:<digest>

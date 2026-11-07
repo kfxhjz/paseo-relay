@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Quick production `docker run` recipes (detached, `--restart unless-stopped`,
+  30 s stop timeout) next to the foreground quickstart check, in both READMEs
+  and the deployment guide.
+
 ### Changed
 
 - The release workflow builds `linux/amd64` and `linux/arm64` natively on

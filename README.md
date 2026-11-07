@@ -28,12 +28,15 @@ forwarded opaquely.
   — Caddy automatic HTTPS + Docker Compose.
 - **Multiple nodes / operators:** [Deployment guide](docs/deployment.md),
   including Nginx/HAProxy/Kubernetes and the `serverId` hashing requirement.
-- **Just want to run it locally?** The 30-second quickstart below.
+- **Just want to run it?** The 30-second quickstart below (foreground test and
+  a detached deployment command).
 
 ## 30-second quickstart
 
+Try the published multi-arch image in the foreground (no Rust toolchain needed):
+
 ```sh
-# Run the published multi-arch image (GHCR tags: v0.1.1 and latest)
+# GHCR tags: v0.1.1 and latest
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.1
@@ -41,6 +44,26 @@ docker run --rm --read-only --cap-drop ALL \
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
 ```
+
+For an actual deployment, run it detached with a restart policy (`--rm` and
+`--restart` are mutually exclusive) and a stop timeout longer than the drain
+grace window:
+
+```sh
+docker run -d \
+  --name paseo-relay \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 127.0.0.1:4000:4000 \
+  ghcr.io/kfxhjz/paseo-relay:v0.1.1
+```
+
+This keeps the relay on loopback. For public traffic terminate TLS in front of
+it ([five-minute VPS quickstart](docs/quickstart.md)), or mount PEM files and
+set `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`. `docker stop paseo-relay`
+performs the graceful drain.
 
 **Developers** — run from source or build the image locally (this is not the
 default path for users):

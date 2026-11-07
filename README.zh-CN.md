@@ -26,12 +26,14 @@
   —— Caddy 自动 HTTPS + Docker Compose。
 - **多节点/运营者**：[部署指南](docs/zh-CN/deployment.md)，包含 Nginx/HAProxy/
   Kubernetes 和 `serverId` 哈希要求。
-- **只想本地跑？** 见下面的 30 秒快速开始。
+- **只想跑起来？** 见下面的 30 秒快速开始（前台试跑 + 后台正式部署指令）。
 
 ## 30 秒快速开始
 
+先在前台试跑已发布的多架构镜像（不需要 Rust 工具链）：
+
 ```sh
-# 运行已发布的多架构镜像（GHCR tag：v0.1.1 和 latest）
+# GHCR tag：v0.1.1 和 latest
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.1
@@ -39,6 +41,25 @@ docker run --rm --read-only --cap-drop ALL \
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
 ```
+
+正式部署时改为后台运行，并加重启策略（`--rm` 与 `--restart` 互斥）和比 drain
+宽限期更长的 stop timeout：
+
+```sh
+docker run -d \
+  --name paseo-relay \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 127.0.0.1:4000:4000 \
+  ghcr.io/kfxhjz/paseo-relay:v0.1.1
+```
+
+这条命令只监听 loopback；公网流量请在前面终止 TLS
+（[五分钟 VPS 快速部署](docs/zh-CN/quickstart.md)），或挂载 PEM 证书并设置
+`PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`。`docker stop paseo-relay`
+会触发优雅 drain。
 
 **开发者** —— 从源码运行，或在本地构建镜像（普通用户不需要走这条路径）：
 
