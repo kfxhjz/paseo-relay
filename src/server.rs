@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::convert::Infallible;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
@@ -430,16 +430,12 @@ fn build_tls(config: &Config) -> Result<Option<tokio_rustls::TlsAcceptor>> {
     let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) else {
         return Ok(None);
     };
-    let cert_file = std::fs::File::open(cert_path)
-        .with_context(|| format!("opening TLS certificate {}", cert_path.display()))?;
-    let key_file = std::fs::File::open(key_path)
-        .with_context(|| format!("opening TLS key {}", key_path.display()))?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("opening TLS certificate {}", cert_path.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("parsing TLS certificate chain")?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .context("parsing TLS private key")?
-        .context("TLS key file contains no private key")?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .with_context(|| format!("opening TLS key {}", key_path.display()))?;
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
