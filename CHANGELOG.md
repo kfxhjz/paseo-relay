@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Diagrams throughout the documentation: Mermaid connection-lifecycle flowchart
+  in `DESIGN.md`/`DESIGN.zh-CN.md`, a single-node/multi-node deployment topology
+  in both READMEs, v1 and v2 protocol sequence diagrams, a multi-node `serverId`
+  hashing topology and a drain/rollout sequence in the deployment guide, an
+  ingress-budget/bounded-queue flow in the configuration guide, and a
+  what-runs-where diagram in the quickstart (English and Chinese).
+- `examples/docker-compose.build.yml` source-build override for the single-node
+  Compose example.
+- `scripts/check-docs.py` now fails on misaligned framed ASCII diagrams
+  (East Asian characters counted as two display columns), so README/DESIGN
+  diagram regressions are caught in CI.
+
+### Changed
+
+- Documentation now defaults to the published release image
+  (`ghcr.io/kfxhjz/paseo-relay:v0.1.0`) instead of a local source build: README
+  30-second quickstart, VPS quickstart, deployment guide, Compose examples, and
+  the Kubernetes example. Source builds and `cargo run` remain as a clearly
+  labelled developer path. Optional immutable digest pinning is documented in
+  the deployment guide and release notes.
+- Dependencies: `base64` 0.22 -> 0.23, `rand` 0.9 -> 0.10, dev-dependency
+  `tokio-tungstenite` 0.28 -> 0.30, and `smallvec` 1.16.4 -> 1.16.5. This
+  removes the legacy `digest` 0.10 / `generic-array` tree from the lockfile.
+
+### Fixed
+
+- Aligned the ASCII architecture diagrams in `README.md`, `README.zh-CN.md`,
+  `DESIGN.md`, and `DESIGN.zh-CN.md` (including CJK display widths and the
+  overflowing `SessionRegistry` line), and the continuation bar in
+  `docs/zh-CN/design-summary.md`.
+- Corrected the published image tag in the docs: GHCR publishes `v0.1.0` (with
+  the `v`), not `0.1.0`. The short version tag is now the documented default;
+  the release digest is only mentioned for optional immutable pinning.
+
 ## [0.1.0] - 2026-11-07
 
 Initial public Rust rewrite. See `DESIGN.md` for the architecture and design
