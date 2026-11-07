@@ -31,6 +31,27 @@ connection". Data frames are forwarded to the opposite role, preserving the
 WebSocket opcode. If the opposite peer is absent, the frame is dropped for that
 socket; the session topology is unchanged.
 
+The v1 pairing and replacement flow:
+
+```mermaid
+sequenceDiagram
+  participant D as Paseo daemon
+  participant R as Relay
+  participant C as Paseo client
+  participant C2 as Newer client socket
+  D->>R: GET /ws?role=server&v=1&serverId=...
+  R-->>D: 101 Switching Protocols
+  C->>R: GET /ws?role=client&v=1&serverId=...
+  R-->>C: 101 Switching Protocols
+  D->>R: data frame
+  R->>C: forwarded data frame
+  C->>R: data frame
+  R->>D: forwarded data frame
+  C2->>R: GET /ws?role=client&v=1&serverId=...
+  R-->>C2: 101 Switching Protocols
+  R-->>C: close 1008 Replaced by new connection
+```
+
 ## v2
 
 The daemon opens:
@@ -60,6 +81,35 @@ Behavior:
 - Control input is ignored except text `{"type":"ping"}`, answered with
   `{"type":"pong","ts":<unix ms>}`. Binary frames on the control socket are
   ignored.
+
+The v2 control/data flow and close propagation:
+
+```mermaid
+sequenceDiagram
+  participant D as Paseo daemon
+  participant R as Relay
+  participant C as Paseo client
+  D->>R: control GET /ws?role=server&v=2
+  R-->>D: 101 Switching Protocols
+  R-->>D: sync connectionIds
+  C->>R: client GET /ws?role=client&v=2
+  R-->>C: 101 Switching Protocols
+  R-->>D: connected connectionId
+  D->>R: data GET /ws?role=server&v=2&connectionId=...
+  R-->>D: 101 Switching Protocols
+  C->>R: data frame
+  R->>D: forwarded data frame
+  D->>R: control text ping
+  R-->>D: pong ts
+  Note over R: data socket disconnects
+  R-->>C: close 1012 Server disconnected
+  Note over R: last client for a connectionId detaches
+  R-->>D: disconnected connectionId
+  R-->>D: close 1001 Client disconnected
+  Note over R: control silent while a client waits for data
+  R-->>D: resend sync after CONTROL_NUDGE_MS
+  R-->>D: close 1011 if still unresponsive
+```
 
 ## Frames and limits
 

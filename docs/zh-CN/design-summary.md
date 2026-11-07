@@ -23,7 +23,7 @@
 ```
 client ──wss──┐
               ├── edge (TLS, per-IP limits, hash on serverId) ──► relay
-daemon ───────┘                                                   │
+daemon ───────┘                                                    │
                      hyper HTTP/1.1 + 自研 RFC 6455 codec          │
                      per-socket reader ──► SessionRegistry         │
                      per-socket writer ◄── bounded queues          │

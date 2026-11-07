@@ -34,23 +34,23 @@ no clustering, ownership registry, reroute protocol, or cross-node frame path.
 ```
                         edge load balancer (TLS, per-IP limits, hashing on serverId)
                                              │
-                        ┌────────────────────▼────────────────────┐
-                        │              relay process              │
-                        │  hyper HTTP/1.1 server (accept loop)     │
-                        │   ├─ GET /health /ready /metrics         │
-                        │   └─ GET /ws ── pre-upgrade validation    │
-                        │              └─ hyper upgrade ──┐        │
-                        │  per-socket reader task          │        │
-                        │   ├─ RFC 6455 frame decode       │        │
-                        │   ├─ ingress budget reservation  │        │
-                        │   └─ route via session registry  │        │
-                        │  per-socket writer task          │        │
-                        │   ├─ bounded mpsc + byte permits │        │
-                        │   └─ RFC 6455 frame encode/flush │        │
-                        │  SessionRegistry: DashMap<serverId, Session>│
-                        │   └─ per-session Mutex<topology only>      │
-                        │  Capacity: WS/TCP/per-IP semaphores + budget│
-                        └──────────────────────────────────────────┘
+                        ┌────────────────────▼───────────────────────────┐
+                        │                 relay process                  │
+                        │  hyper HTTP/1.1 server (accept loop)           │
+                        │   ├─ GET /health /ready /metrics               │
+                        │   └─ GET /ws ── pre-upgrade validation         │
+                        │                 └─ hyper upgrade ──┐           │
+                        │  per-socket reader task            │           │
+                        │   ├─ RFC 6455 frame decode         │           │
+                        │   ├─ ingress budget reservation    │           │
+                        │   └─ route via session registry    │           │
+                        │  per-socket writer task            │           │
+                        │   ├─ bounded mpsc + byte permits   │           │
+                        │   └─ RFC 6455 frame encode/flush   │           │
+                        │  SessionRegistry: DashMap<serverId, Session>   │
+                        │   └─ per-session Mutex<topology only>          │
+                        │  Capacity: WS/TCP/per-IP semaphores + budget   │
+                        └────────────────────────────────────────────────┘
 ```
 
 ### 2.1 Runtime and HTTP layer
@@ -73,6 +73,20 @@ no clustering, ownership registry, reroute protocol, or cross-node frame path.
   them on an internal network or filter them at the edge.
 
 ### 2.2 Connection lifecycle
+
+The flowchart below sums up the lifecycle; the numbered list gives each step in
+detail.
+
+```mermaid
+flowchart TD
+  A["TCP accept: acquire TCP slot and start header timeout"] --> B["Pre-upgrade validation: method path upgrade headers key query Origin"]
+  B -->|fail| C["Fail closed 400 403 404 426 without allocating state"]
+  B -->|pass| D["Admission: WS slot then session slot then per-IP slot"]
+  D --> E["101 upgrade"]
+  E --> F["Split reader and writer tasks over a bounded queue"]
+  F --> G["Detach and cleanup: return capacity tokens and idle sweep"]
+  G --> H["Drain: SIGTERM and /ready 503 and close 1012"]
+```
 
 1. **TCP accept.** The listener acquires a TCP slot (`MAX_TCP_CONNECTIONS`)
    before reading a request. The HTTP header phase is bounded by a header

@@ -42,6 +42,27 @@ and `paseo-relay --dump-config` to print the effective settings (no secrets).
 | `PASEO_RELAY_HEALTHCHECK_HOST` | `127.0.0.1` | Host used by the `paseo-relay healthcheck` self-probe. |
 | `PASEO_RELAY_BUILD_REVISION` | build-derived | Build-time revision embedded in `/version` and metrics; overrides the git-derived value. |
 
+## Ingress budget and bounded queues
+
+Every stage in the forwarding path is bounded, and the node-wide weighted
+ingress budget is reserved **before** the relay allocates a payload buffer:
+
+```mermaid
+flowchart TD
+  A["socket read"] -->|"PASEO_RELAY_FRAME_READ_TIMEOUT_MS"| B["frame decode"]
+  B -->|"PASEO_RELAY_INGRESS_BUDGET_BYTES"| C["weighted reservation before payload allocation"]
+  C --> D["router and session registry"]
+  D -->|"PASEO_RELAY_CONTROL_QUEUE_BYTES"| E["bounded per-destination writer queue"]
+  E -->|"PASEO_RELAY_DELIVERY_TIMEOUT_MS"| F["frame encode and flush"]
+```
+
+A reserved message is charged `PASEO_RELAY_INGRESS_WEIGHT` per payload byte plus
+a fixed 256-byte overhead. If a source cannot reserve within
+`PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS`, it is closed with `1013`; a destination
+whose writer queue or write exceeds `PASEO_RELAY_DELIVERY_TIMEOUT_MS` is shed
+with `1013`. Session and socket counts are bounded separately by
+`PASEO_RELAY_MAX_SESSIONS` and `PASEO_RELAY_MAX_CONNECTIONS`.
+
 ## CLI
 
 ```text

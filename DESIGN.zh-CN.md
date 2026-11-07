@@ -30,23 +30,23 @@
 ```
                         边缘负载均衡器（TLS、per-IP 限制、按 serverId 哈希）
                                              │
-                        ┌────────────────────▼────────────────────┐
-                        │              relay 进程                 │
-                        │  hyper HTTP/1.1 server（accept loop）    │
-                        │   ├─ GET /health /ready /metrics         │
-                        │   └─ GET /ws ── upgrade 前校验           │
-                        │              └─ hyper upgrade ──┐        │
-                        │  per-socket reader task          │        │
-                        │   ├─ RFC 6455 frame decode       │        │
-                        │   ├─ ingress budget reservation  │        │
-                        │   └─ route via session registry  │        │
-                        │  per-socket writer task          │        │
-                        │   ├─ bounded mpsc + byte permits │        │
-                        │   └─ RFC 6455 frame encode/flush │        │
-                        │  SessionRegistry: DashMap<serverId, Session>│
-                        │   └─ per-session Mutex<仅拓扑>             │
-                        │  Capacity: WS/TCP/per-IP 信号量 + budget    │
-                        └──────────────────────────────────────────┘
+                        ┌────────────────────▼───────────────────────────┐
+                        │                   relay 进程                   │
+                        │  hyper HTTP/1.1 server（accept loop）          │
+                        │   ├─ GET /health /ready /metrics               │
+                        │   └─ GET /ws ── upgrade 前校验                 │
+                        │                 └─ hyper upgrade ──┐           │
+                        │  per-socket reader task            │           │
+                        │   ├─ RFC 6455 frame decode         │           │
+                        │   ├─ ingress budget reservation    │           │
+                        │   └─ route via session registry    │           │
+                        │  per-socket writer task            │           │
+                        │   ├─ bounded mpsc + byte permits   │           │
+                        │   └─ RFC 6455 frame encode/flush   │           │
+                        │  SessionRegistry: DashMap<serverId, Session>   │
+                        │   └─ per-session Mutex<仅拓扑>                 │
+                        │  Capacity: WS/TCP/per-IP 信号量 + budget       │
+                        └────────────────────────────────────────────────┘
 ```
 
 ### 2.1 运行时与 HTTP 层
@@ -66,6 +66,19 @@
   它们按设计没有认证，因此部署必须把它们放在内网或在边缘过滤。
 
 ### 2.2 连接生命周期
+
+下图概括了连接生命周期；下面的编号列表给出每个步骤的细节。
+
+```mermaid
+flowchart TD
+  A["TCP accept：获取 TCP slot 并启动 header timeout"] --> B["upgrade 前校验：method path upgrade headers key query Origin"]
+  B -->|fail| C["fail closed 400 403 404 426；不分配任何状态"]
+  B -->|pass| D["Admission：获取 WS slot 与 session slot 与 per-IP slot"]
+  D --> E["101 upgrade"]
+  E --> F["拆分为 reader 与 writer task 并通过有界队列通信"]
+  F --> G["detach 与清理：归还容量 token 并等待 idle sweep"]
+  G --> H["drain：SIGTERM 后 /ready 返回 503 并 close 1012"]
+```
 
 1. **TCP accept。** listener 在读取请求之前先获取 TCP slot
    （`MAX_TCP_CONNECTIONS`）。HTTP header 阶段有 header timeout，慢 client 不能无限

@@ -28,6 +28,27 @@ session。relay 按设计不增加认证；安全模型见 README 与 `SECURITY.
 替换旧 socket，旧连接收到 close `1008` "Replaced by new connection"。数据帧转发给
 对端 role，保留 WebSocket opcode。对端不存在时该帧被丢弃，session 拓扑不变。
 
+v1 的配对与替换流程：
+
+```mermaid
+sequenceDiagram
+  participant D as Paseo daemon
+  participant R as relay
+  participant C as Paseo client
+  participant C2 as 新的 client socket
+  D->>R: GET /ws?role=server&v=1&serverId=...
+  R-->>D: 101 Switching Protocols
+  C->>R: GET /ws?role=client&v=1&serverId=...
+  R-->>C: 101 Switching Protocols
+  D->>R: data frame
+  R->>C: forwarded data frame
+  C->>R: data frame
+  R->>D: forwarded data frame
+  C2->>R: GET /ws?role=client&v=1&serverId=...
+  R-->>C2: 101 Switching Protocols
+  R-->>C: close 1008 Replaced by new connection
+```
+
 ## v2
 
 daemon 会打开：
@@ -52,6 +73,35 @@ daemon 会打开：
   在 `CONTROL_UNRESPONSIVE_MS` 后若仍无响应则以 `1011` 关闭 control socket。
 - control 输入除文本 `{"type":"ping"}` 外忽略；ping 回复
   `{"type":"pong","ts":<unix ms>}`。control 上的二进制帧忽略。
+
+v2 的 control/data 流程与 close 传播：
+
+```mermaid
+sequenceDiagram
+  participant D as Paseo daemon
+  participant R as relay
+  participant C as Paseo client
+  D->>R: control GET /ws?role=server&v=2
+  R-->>D: 101 Switching Protocols
+  R-->>D: sync connectionIds
+  C->>R: client GET /ws?role=client&v=2
+  R-->>C: 101 Switching Protocols
+  R-->>D: connected connectionId
+  D->>R: data GET /ws?role=server&v=2&connectionId=...
+  R-->>D: 101 Switching Protocols
+  C->>R: data frame
+  R->>D: forwarded data frame
+  D->>R: control text ping
+  R-->>D: pong ts
+  Note over R: data socket 断开
+  R-->>C: close 1012 Server disconnected
+  Note over R: 某 connectionId 的最后一个 client detach
+  R-->>D: disconnected connectionId
+  R-->>D: close 1001 Client disconnected
+  Note over R: client 等 data 期间 control 无响应
+  R-->>D: CONTROL_NUDGE_MS 后重发 sync
+  R-->>D: 仍无响应则 close 1011
+```
 
 ## 帧与限制
 

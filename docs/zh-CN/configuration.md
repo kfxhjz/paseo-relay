@@ -41,6 +41,26 @@ relay 只从环境变量读取配置。启动时会校验；非法值会带说�
 | `PASEO_RELAY_HEALTHCHECK_HOST` | `127.0.0.1` | `paseo-relay healthcheck` 自检使用的 host。 |
 | `PASEO_RELAY_BUILD_REVISION` | 构建时推导 | 嵌入 `/version` 和指标的 revision；覆盖 git 推导值。 |
 
+## Ingress 预算与有界队列
+
+转发路径上的每个阶段都有上界，节点级加权 ingress 预算在分配 payload 缓冲**之前**
+预留：
+
+```mermaid
+flowchart TD
+  A["socket 读取"] -->|"PASEO_RELAY_FRAME_READ_TIMEOUT_MS"| B["帧解码"]
+  B -->|"PASEO_RELAY_INGRESS_BUDGET_BYTES"| C["分配 payload 之前预扣加权预算"]
+  C --> D["router 与 session registry"]
+  D -->|"PASEO_RELAY_CONTROL_QUEUE_BYTES"| E["有界 per-destination writer 队列"]
+  E -->|"PASEO_RELAY_DELIVERY_TIMEOUT_MS"| F["帧编码与发送"]
+```
+
+预留的消息按每 payload 字节 `PASEO_RELAY_INGRESS_WEIGHT` 加权，另加固定 256 字节
+开销。source 在 `PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS` 内无法预留时以 `1013` 关闭；
+destination 的 writer 队列或写入超过 `PASEO_RELAY_DELIVERY_TIMEOUT_MS` 时以 `1013`
+shed。session 和 socket 数量分别由 `PASEO_RELAY_MAX_SESSIONS`、
+`PASEO_RELAY_MAX_CONNECTIONS` 限制。
+
 ## CLI
 
 ```text
