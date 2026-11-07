@@ -1,21 +1,30 @@
 version: 2
 updates:
+  # One grouped PR per week keeps cargo updates (including majors) reviewable
+  # together instead of opening several PRs at once.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      cargo-minor:
+      cargo:
         patterns: ["*"]
-        update-types: ["minor", "patch"]
+  # Group every GitHub Actions bump (including majors) into one PR.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]
+  # Group Docker base-image bumps into one PR.
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    groups:
+      docker:
+        patterns: ["*"]

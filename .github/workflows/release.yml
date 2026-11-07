@@ -3,14 +3,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Manual runs are build-only (no push, no release): they exercise the native
-  # amd64/arm64 build matrix so the pipeline can be timed and validated.
-  # Publishing only happens for v* tag pushes.
-  workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
+
+# Serialise releases so two tags pushed close together cannot race `latest`.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   verify:
@@ -22,7 +23,6 @@ jobs:
         with:
           fetch-depth: 0
       - name: Ensure the tag commit is on main
-        if: github.event_name == 'push'
         run: |
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
@@ -64,8 +64,7 @@ jobs:
           set -euo pipefail
           echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - name: Log in to GHCR
-        if: github.event_name == 'push'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -76,18 +75,17 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name == 'push' }}
+          push: true
           # Digest-only push here; the publish job assembles the multi-arch
           # index after both platforms finish.
-          outputs: ${{ github.event_name == 'push' && format('type=image,name={0},push-by-digest=true,name-canonical=true', steps.image.outputs.name) || '' }}
+          outputs: "type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true"
           cache-from: type=gha,scope=release-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
           build-args: |
             PASEO_RELAY_BUILD_REVISION=${{ github.sha }}
-          provenance: ${{ github.event_name == 'push' && 'mode=max' || '' }}
-          sbom: ${{ github.event_name == 'push' }}
+          provenance: mode=max
+          sbom: true
       - name: Export digest
-        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           digest="${{ steps.build.outputs.digest }}"
@@ -95,7 +93,6 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${digest#sha256:}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name == 'push'
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -104,7 +101,6 @@ jobs:
 
   publish:
     name: Publish multi-arch image and release
-    if: github.event_name == 'push'
     needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -115,7 +111,7 @@ jobs:
           pattern: digests-*
           merge-multiple: true
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -170,7 +166,7 @@ jobs:
             echo "Provenance and SBOM attestations were attached per platform by buildx."
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Create GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           body: |
