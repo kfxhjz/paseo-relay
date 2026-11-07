@@ -33,10 +33,10 @@ forwarded opaquely.
 ## 30-second quickstart
 
 ```sh
-# Run the published multi-arch image (GHCR tags: v0.1.0 and latest)
+# Run the published multi-arch image (GHCR tags: v0.1.1 and latest)
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.0
+  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.1
 
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
@@ -61,7 +61,7 @@ small, auditable relay with a simple single-node failure model and no Erlang
 operational surface. **Not for:** deployments that need built-in clustering,
 ownership failover, or relay-level authentication (see [Limitations](#limitations-and-non-goals)).
 
-Project status: `v0.1.0` — wire-compatible and already passing Paseo's own relay
+Project status: `v0.1.1` — wire-compatible and already passing Paseo's own relay
 transport E2E; interfaces may still evolve before `1.0`.
 
 ## Use it with Paseo
@@ -164,21 +164,21 @@ codes, and known differences from the Elixir relay.
 
 ## Deployment
 
-Release `v0.1.0` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+Release `v0.1.1` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
 GHCR with provenance and SBOM. Use the short version tag; the tag includes the
-leading `v` (`0.1.0` without it is not published):
+leading `v` (`0.1.1` without it is not published):
 
-- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.0` (also tagged `latest`).
+- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.1` (also tagged `latest`).
 
 Inspect the published image with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.0
+docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
 If your policy requires an immutable reference, pin the multi-arch index digest
-for `v0.1.0` from the
-[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0)
+for `v0.1.1` from the
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
 instead of the tag.
 
 Both topologies use the same image; the edge in front of it does the routing
@@ -267,7 +267,7 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
   limits and a privacy/abuse policy; see [operator-policy.md](docs/operator-policy.md).
 - **No third-party security audit**: the evidence here is code review,
   real-socket tests, fuzzing scaffolds, and the Paseo compatibility suite. Treat
-  v0.1.0 as early software and review the threat model before relying on it.
+  v0.1.1 as early software and review the threat model before relying on it.
 - **Not proven at internet scale**: the included benchmark is loopback; run your
   own capacity tests and monitor before a large public deployment.
 

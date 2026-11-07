@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-07
+
 ### Added
 
 - Diagrams throughout the documentation: Mermaid connection-lifecycle flowchart
@@ -23,7 +25,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Documentation now defaults to the published release image
-  (`ghcr.io/kfxhjz/paseo-relay:v0.1.0`) instead of a local source build: README
+  (`ghcr.io/kfxhjz/paseo-relay:v0.1.1`) instead of a local source build: README
   30-second quickstart, VPS quickstart, deployment guide, Compose examples, and
   the Kubernetes example. Source builds and `cargo run` remain as a clearly
   labelled developer path. Optional immutable digest pinning is documented in
@@ -38,9 +40,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DESIGN.md`, and `DESIGN.zh-CN.md` (including CJK display widths and the
   overflowing `SessionRegistry` line), and the continuation bar in
   `docs/zh-CN/design-summary.md`.
-- Corrected the published image tag in the docs: GHCR publishes `v0.1.0` (with
-  the `v`), not `0.1.0`. The short version tag is now the documented default;
-  the release digest is only mentioned for optional immutable pinning.
+- Corrected the image tag in the docs: GHCR release tags carry a leading `v`
+  (for example `v0.1.1`, not `0.1.1`). The short version tag is now the
+  documented default; the release digest is only mentioned for optional
+  immutable pinning.
 
 ## [0.1.0] - 2026-11-07
 
@@ -92,5 +95,6 @@ invariants.
   their own deadline.
 - Invalid UTF-8 IDs are rejected with HTTP 400, never encoded or crashed on.
 
-[Unreleased]: https://github.com/kfxhjz/paseo-relay/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kfxhjz/paseo-relay/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0

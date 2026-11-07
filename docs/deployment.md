@@ -92,16 +92,16 @@ The published image is the default path and needs no Rust toolchain. Pull and
 run the current release:
 
 ```sh
-docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.0
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.0
+  ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
-`v0.1.0` is the current release tag and `latest` follows the newest release. For
-an immutable reference, pin the multi-arch index digest for `v0.1.0` listed in
-the [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0)
+`v0.1.1` is the current release tag and `latest` follows the newest release. For
+an immutable reference, pin the multi-arch index digest for `v0.1.1` listed in
+the [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
 instead of the tag:
 
 ```sh

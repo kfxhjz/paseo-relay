@@ -36,7 +36,7 @@ disclosure.
 There has been **no independent third-party security audit** of this relay.
 The repository contains code review notes, real-socket tests, fuzzing targets,
 and Paseo compatibility evidence; those are not a substitute for an audit.
-Treat v0.1.0 as early software and review the threat model for your deployment.
+Treat v0.1.1 as early software and review the threat model for your deployment.
 
 ## Threat model
 

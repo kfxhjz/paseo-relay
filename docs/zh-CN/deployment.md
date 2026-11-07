@@ -79,16 +79,16 @@ LB 终止连接后，relay 看到的每个连接都来自代理 IP。此时
 镜像已发布，是默认路径，不需要 Rust 工具链。先拉取并运行当前 release：
 
 ```sh
-docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.0
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.0
+  ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
-`v0.1.0` 是当前 release tag，`latest` 跟随最新 release。如果需要不可变引用，请改用
-[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0) 中
-`v0.1.0` 对应的多架构 index digest，而不是 tag：
+`v0.1.1` 是当前 release tag，`latest` 跟随最新 release。如果需要不可变引用，请改用
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1) 中
+`v0.1.1` 对应的多架构 index digest，而不是 tag：
 
 ```sh
 docker run --rm --read-only --cap-drop ALL \

@@ -4,7 +4,7 @@
 #     docker compose -f examples/docker-compose.caddy.yml up -d
 #
 # This pulls the published relay image (default
-# `ghcr.io/kfxhjz/paseo-relay:v0.1.0`; `latest` follows the newest release).
+# `ghcr.io/kfxhjz/paseo-relay:v0.1.1`; `latest` follows the newest release).
 # Override with PASEO_RELAY_IMAGE, ideally by digest. For a local source build
 # use the build override:
 #   docker compose -f examples/docker-compose.caddy.yml \
@@ -16,7 +16,7 @@
 
 services:
   relay:
-    image: "${PASEO_RELAY_IMAGE:-ghcr.io/kfxhjz/paseo-relay:v0.1.0}"
+    image: "${PASEO_RELAY_IMAGE:-ghcr.io/kfxhjz/paseo-relay:v0.1.1}"
     restart: unless-stopped
     read_only: true
     cap_drop: ["ALL"]
