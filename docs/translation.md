@@ -41,9 +41,10 @@ first.
 python3 scripts/check-docs.py
 ```
 
-The script verifies relative Markdown links and flags Chinese documents that
-link a known English canonical document without linking the Chinese
-counterpart or labelling the link English/英文. CI runs it.
+The script verifies relative Markdown links, flags Chinese documents that link
+a known English canonical document without linking the Chinese counterpart or
+labelling the link English/英文, and checks that framed ASCII box diagrams line
+up (East Asian characters count as two display columns). CI runs it.
 
 ## Current coverage
 
