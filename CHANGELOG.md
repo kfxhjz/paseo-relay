@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The release workflow builds `linux/amd64` and `linux/arm64` natively on
+  matching GitHub runners in parallel, with GitHub Actions layer caching and a
+  post-publish smoke test. This replaces the single QEMU multi-arch build and
+  cuts the image stage from ~25 minutes to a few minutes. Manual
+  `workflow_dispatch` runs are build-only validation runs; publishing remains
+  restricted to `v*` tag pushes.
+
 ## [0.1.1] - 2026-11-07
 
 ### Added
