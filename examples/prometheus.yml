@@ -1,0 +1,11 @@
+# Example Prometheus scrape configuration. Keep /metrics on an internal
+# network; the relay's ops endpoints have no authentication.
+scrape_configs:
+  - job_name: paseo-relay
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - paseo-relay-1.internal:4000
+          - paseo-relay-2.internal:4000
+        labels:
+          service: paseo-relay

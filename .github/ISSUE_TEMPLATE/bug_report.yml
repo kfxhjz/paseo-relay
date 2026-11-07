@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible relay or protocol defect
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include live `serverId`s, pairing links, credentials, or payloads.
+        For security issues, follow SECURITY.md instead of opening a public issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Expected vs actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal commands/protocol sequence, versions, deployment topology.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Relay version/commit
+      placeholder: output of `paseo-relay --version` or image digest
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / metrics
+      description: Redact serverId, connection IDs, pairing links, and payloads.
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Binary directly
+        - Container
+        - Behind edge LB/proxy
+        - Kubernetes
+        - Other

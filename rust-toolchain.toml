@@ -1,0 +1,9 @@
+# Toolchain pinned for local development and CI.
+#
+# Keep this in sync with the `toolchain` input of dtolnay/rust-toolchain in
+# .github/workflows/ci.yml. The relay requires stable Rust (see rust-version in
+# Cargo.toml); upgrading is a deliberate, reviewed change.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

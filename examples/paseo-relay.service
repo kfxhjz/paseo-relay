@@ -1,0 +1,29 @@
+# Example systemd unit. Add an EnvironmentFile with your runtime contract.
+[Unit]
+Description=Paseo Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/paseo-relay
+EnvironmentFile=/etc/paseo-relay.env
+User=paseo-relay
+Group=paseo-relay
+Restart=always
+RestartSec=2
+# Must exceed PASEO_RELAY_SHUTDOWN_GRACE_MS.
+TimeoutStopSec=30
+# Optional hardening when running on a dedicated host:
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

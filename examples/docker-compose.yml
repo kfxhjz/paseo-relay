@@ -1,0 +1,35 @@
+# Single-node quickstart with a read-only, non-root container.
+#
+# For anything public, terminate TLS at a reverse proxy / load balancer and
+# hash on the `serverId` query parameter (see examples/nginx.conf and
+# examples/haproxy.cfg). Expose the relay only on a private interface.
+services:
+  paseo-relay:
+    build: .
+    image: paseo-relay:local
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      PASEO_RELAY_HOST: "0.0.0.0"
+      PASEO_RELAY_PORT: "4000"
+      PASEO_RELAY_LOG: "info"
+      PASEO_RELAY_LOG_FORMAT: "json"
+      # PUBLIC DEPLOYMENTS: terminate TLS at the edge and leave these unset.
+      # For a private network with native TLS, mount PEM files and set both:
+      # PASEO_RELAY_TLS_CERT: "/tls/cert.pem"
+      # PASEO_RELAY_TLS_KEY: "/tls/key.pem"
+      # For direct exposure set a per-IP cap; behind a proxy leave it at 0:
+      PASEO_RELAY_PER_IP_MAX_CONNECTIONS: "0"
+    # The binary is its own healthcheck client (scratch image has no shell).
+    healthcheck:
+      test: ["CMD", "/paseo-relay", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3s
+    stop_grace_period: 30s

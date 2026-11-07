@@ -1,0 +1,24 @@
+# Single-node deployment: automatic HTTPS + WebSocket reverse proxy.
+#
+# Caddy obtains and renews the certificate for {$RELAY_DOMAIN}. This is the
+# recommended setup when you run exactly one relay node. For multiple nodes you
+# need an edge that hashes the `serverId` query parameter (see nginx.conf /
+# haproxy.cfg); Caddy's generic reverse_proxy does not provide that.
+#
+# /metrics is intentionally blocked from the public listener. Scrape the relay
+# directly on the private Docker network if you need Prometheus metrics.
+
+{$RELAY_DOMAIN} {
+	encode zstd gzip
+
+	# Keep operations surfaces off the public listener. /health remains public
+	# for simple liveness checks; readiness is available on the relay network.
+	@operations path /metrics /ready
+	handle @operations {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy relay:4000
+	}
+}

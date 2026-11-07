@@ -1,0 +1,15 @@
+target
+
+# Local build/test artifacts
+*.profraw
+coverage/
+
+# Local configuration and TLS material (never commit keys)
+.env
+.env.*
+local/
+*.pem
+*.key
+
+# Editor/OS noise
+.DS_Store

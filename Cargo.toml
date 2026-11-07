@@ -1,0 +1,46 @@
+[package]
+name = "paseo-relay"
+version = "0.1.0"
+edition = "2021"
+description = "A single-node, wire-compatible WebSocket relay for Paseo"
+license = "Apache-2.0"
+repository = "https://github.com/kfxhjz/paseo-relay"
+homepage = "https://github.com/kfxhjz/paseo-relay"
+readme = "README.md"
+keywords = ["paseo", "relay", "websocket", "self-hosted", "tunnel"]
+categories = ["network-programming", "web-programming::websocket"]
+rust-version = "1.99.1"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+dashmap = "6"
+http = "1"
+http-body-util = "0.1"
+futures-util = "0.3"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
+socket2 = "0.6"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2"
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"

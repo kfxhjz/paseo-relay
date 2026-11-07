@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest a change that does not fit the non-goals
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Could this be solved at the edge, in Paseo itself, or by configuration?
+  - type: checkboxes
+    id: non-goals
+    attributes:
+      label: Scope
+      options:
+        - label: I have read the non-goals in DESIGN.md (no built-in clustering, no relay auth, no payload inspection)
+          required: true

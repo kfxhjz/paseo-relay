@@ -1,0 +1,62 @@
+# Single-node VPS quickstart: Caddy terminates TLS and proxies to the relay.
+#
+#   RELAY_DOMAIN=relay.example.com \
+#     docker compose -f examples/docker-compose.caddy.yml up -d
+#
+# This pulls the published relay image (override with PASEO_RELAY_IMAGE, ideally
+# by digest). For a local source build use the build override:
+#   docker compose -f examples/docker-compose.caddy.yml \
+#     -f examples/docker-compose.caddy.build.yml up -d --build
+#
+# Requirements: a DNS A/AAAA record for RELAY_DOMAIN, and inbound TCP 80/443
+# (plus UDP 443 for HTTP/3). The relay itself has no host port and is reachable
+# only on the Compose network.
+
+services:
+  relay:
+    image: "${PASEO_RELAY_IMAGE:-ghcr.io/kfxhjz/paseo-relay:0.1.0}"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      PASEO_RELAY_HOST: "0.0.0.0"
+      PASEO_RELAY_PORT: "4000"
+      PASEO_RELAY_LOG: "info"
+      PASEO_RELAY_LOG_FORMAT: "json"
+      # Small VPS default (128 MiB weighted ingress). Raise together with the
+      # container memory limit; the built-in default is 512 MiB.
+      PASEO_RELAY_INGRESS_BUDGET_BYTES: "${PASEO_RELAY_INGRESS_BUDGET_BYTES:-134217728}"
+      # Behind Caddy every client appears as the Caddy IP; keep 0 and limit at
+      # the edge.
+      PASEO_RELAY_PER_IP_MAX_CONNECTIONS: "0"
+    healthcheck:
+      test: ["CMD", "/paseo-relay", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3s
+    stop_grace_period: 30s
+
+  caddy:
+    # Pinned multi-arch manifest for caddy:2.10-alpine.
+    image: "caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d"
+    restart: unless-stopped
+    depends_on:
+      relay:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      RELAY_DOMAIN: "${RELAY_DOMAIN:?set RELAY_DOMAIN to your public hostname}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

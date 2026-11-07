@@ -1,0 +1,110 @@
+# Example Kubernetes resources for a 2-replica relay behind an edge/proxy that
+# must hash on the `serverId` query parameter. Do not use a plain round-robin
+# Service without that affinity.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paseo-relay
+  labels:
+    app.kubernetes.io/name: paseo-relay
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: paseo-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: paseo-relay
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: ghcr.io/kfxhjz/paseo-relay:0.1.0 # pin by digest in production
+          imagePullPolicy: IfNotPresent
+          args: []
+          ports:
+            - name: http
+              containerPort: 4000
+          env:
+            - name: PASEO_RELAY_HOST
+              value: "0.0.0.0"
+            - name: PASEO_RELAY_PORT
+              value: "4000"
+            - name: PASEO_RELAY_LOG_FORMAT
+              value: "json"
+            - name: PASEO_RELAY_LOG
+              value: "info"
+            # Behind a proxy, keep the per-IP cap at 0 and limit at the edge:
+            - name: PASEO_RELAY_PER_IP_MAX_CONNECTIONS
+              value: "0"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paseo-relay
+  labels:
+    app.kubernetes.io/name: paseo-relay
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: paseo-relay
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: paseo-relay
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: paseo-relay

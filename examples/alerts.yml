@@ -1,0 +1,32 @@
+# Example alerting rules. Thresholds are starting points; tune to your traffic.
+groups:
+  - name: paseo-relay
+    rules:
+      - alert: PaseoRelayNotReady
+        expr: paseo_relay_ready == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Paseo relay {{ $labels.instance }} is not admitting new work"
+      - alert: PaseoRelayConnectionRejections
+        expr: increase(paseo_relay_connection_rejections_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} is rejecting WebSocket upgrades"
+      - alert: PaseoRelaySlowConsumers
+        expr: increase(paseo_relay_slow_consumer_disconnects_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} is shedding slow destinations"
+      - alert: PaseoRelayIngressSaturated
+        expr: paseo_relay_ingress_reserved_bytes > 0.8 * 536870912
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} ingress budget is >80% reserved"

@@ -1,0 +1,24 @@
+# Build context for the static musl release image. Keep it minimal: the
+# builder only needs the manifests and src/. Never send git history, local
+# build artifacts, TLS material, or docs to the daemon.
+.git
+.github
+target
+scripts
+tests
+
+# Files that must not be baked into a build context or image layer.
+*.md
+*.pem
+*.key
+.env
+.env.*
+local
+
+# Docker metadata itself.
+Dockerfile
+.dockerignore
+
+# Editor/OS noise.
+.DS_Store
+**/*.rs.bk
