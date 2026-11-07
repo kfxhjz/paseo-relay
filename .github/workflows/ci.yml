@@ -111,10 +111,8 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Non-blocking: a RustSec advisory or a registry outage must not hide
-    # fmt/clippy/test/build results. Promote to blocking once advisories are
-    # triaged and the ignore list is documented.
-    continue-on-error: true
+    # Blocking: advisories must be fixed or explicitly triaged in an audit
+    # ignore configuration; do not let a red audit hide behind other jobs.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
