@@ -37,7 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 url = "2"
 
 [dev-dependencies]
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 
 [profile.release]
 lto = "thin"
