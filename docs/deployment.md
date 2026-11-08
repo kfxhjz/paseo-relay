@@ -45,8 +45,8 @@ Public deployments must serve `wss://`. Either:
 - mount a PEM certificate chain and key into the container and set
   `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`. The relay then serves HTTPS/
   WSS directly with rustls. Both settings must be present or startup fails, and
-  the files must be readable by the relay user (UID 65532 in the image);
-  `paseo-relay --check-config` verifies that readability.
+  the files must be regular, readable files for the relay user (UID 65532 in
+  the image); `paseo-relay --check-config` verifies that.
 
 TLS is not optional for the public internet: although Paseo payloads are
 end-to-end encrypted, `serverId`, connection metadata, and availability are
@@ -67,8 +67,9 @@ The LB must:
 Examples:
 
 - Nginx: [examples/nginx.conf](../examples/nginx.conf) — TLS edge, consistent
-  hashing, per-IP connection/rate limits, operations endpoints blocked, and an
-  access log that omits the query string.
+  hashing, per-IP connection/rate limits, `/metrics` and `/version` blocked with
+  `/ready` limited to private ranges, and an access log that omits the query
+  string.
 - HAProxy: [examples/haproxy.cfg](../examples/haproxy.cfg) — consistent hashing,
   `/ready` checks, operations endpoints denied, per-source connection/rate
   limits, and a log format that omits the query string.
@@ -108,6 +109,7 @@ release, then run it detached with a restart policy and a stop timeout longer
 than the drain grace window (`--rm` and `--restart` are mutually exclusive):
 
 ```sh
+# Sized for ~512 MB; raise with RAM (see "Capacity sizing").
 docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
 docker run -d \
   --name paseo-relay \
@@ -116,6 +118,10 @@ docker run -d \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
+  -e PASEO_RELAY_MAX_CONNECTIONS=4000 \
+  -e PASEO_RELAY_MAX_SESSIONS=4000 \
+  -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
+  -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
   ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
@@ -136,6 +142,7 @@ for `v0.1.1` listed in the
 instead of the tag:
 
 ```sh
+# Sized for ~512 MB; raise with RAM (see "Capacity sizing").
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -143,6 +150,10 @@ docker run -d \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
+  -e PASEO_RELAY_MAX_CONNECTIONS=4000 \
+  -e PASEO_RELAY_MAX_SESSIONS=4000 \
+  -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
+  -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
   ghcr.io/kfxhjz/paseo-relay@sha256:<digest>
 ```
 
@@ -186,7 +197,8 @@ Key settings:
 - NetworkPolicy: allow ingress only from the ingress controller/proxy namespace
   on port 4000; keep `/metrics` reachable only by monitoring (NetworkPolicy is
   L3/L4, so filter the operations paths at the ingress or scrape the internal
-  Service);
+  Service). Some CNIs also apply NetworkPolicy to kubelet probe traffic; if
+  probes fail, allow your node CIDR(s) to port 4000 as noted in the example;
 - keep replicas stable. Scale by adding relay nodes and updating the edge's
   consistent-hash ring; do not use an HPA that reshuffles the ring frequently.
 
@@ -241,23 +253,33 @@ contain no `serverId` labels. See
 
 Memory has two parts: idle/pre-upgrade sockets and in-flight payload accounting.
 
-- **Idle sockets.** An accepted socket costs roughly 23 KiB (hyper read/write
-  buffers plus the task), so reserve `MAX_TCP_CONNECTIONS × ~30 KiB` at idle.
-  The built-in defaults (25,000 TCP / 20,000 WebSocket) need roughly
-  700–800 MiB before any payload traffic; a 512 MB container must lower
-  `PASEO_RELAY_MAX_TCP_CONNECTIONS`, `PASEO_RELAY_MAX_CONNECTIONS`, and
-  `PASEO_RELAY_MAX_SESSIONS` (the Compose examples use 5,000 / 4,000 / 4,000).
-  The hyper builder caps pre-upgrade request buffers (`max_buf_size` 16 KiB,
-  `max_header_size` 16 KiB, `max_headers` 64) and
+- **Idle sockets.** An accepted socket costs roughly 23 KiB when the relay is
+  plaintext behind an edge (hyper read/write buffers plus the task), or ~33 KiB
+  with native TLS (rustls buffers), so reserve `MAX_TCP_CONNECTIONS × ~30 KiB`
+  (plaintext) or `× ~35 KiB` (native TLS) at idle. The built-in defaults
+  (25,000 TCP / 20,000 WebSocket) need roughly 700–800 MiB plaintext, or
+  ~850–900 MiB with native TLS, before any payload traffic; a 512 MB container
+  must lower `PASEO_RELAY_MAX_TCP_CONNECTIONS`, `PASEO_RELAY_MAX_CONNECTIONS`,
+  and `PASEO_RELAY_MAX_SESSIONS` (the Compose examples use 5,000 / 4,000 /
+  4,000). The hyper builder caps pre-upgrade request buffers (`max_buf_size`
+  16 KiB, `max_header_size` 16 KiB, `max_headers` 64) and
   `PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS` bounds the header phase, but those limits
   do not make an idle socket free.
 - `PASEO_RELAY_INGRESS_BUDGET_BYTES` (default 512 MiB weighted) bounds
-  in-flight payload accounting; it is charged in 8 KiB chunks as payload bytes
-  arrive, and one connection can hold at most
-  `min(budget, 4 × one-max-message charge)`.
+  in-flight payload accounting; each 8 KiB chunk is charged
+  `chunk_bytes × weight + 192` as it arrives (per-chunk bookkeeping), and one
+  connection can hold at most `min(budget, 4 × one-max-message charge)`. The
+  validator requires the budget to admit one maximum message including that
+  bookkeeping; use `--check-config` for the exact floor (the 129 MiB Compose
+  budget still passes).
 - `PASEO_RELAY_MAX_TCP_CONNECTIONS` is the total OS-socket cap and includes
   upgraded WebSockets (the slot is held for the whole socket lifetime), so
-  `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` matters.
+  `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` must hold. Keep headroom above
+  `MAX_CONNECTIONS` (at least 64–128 spare slots, more for probe bursts):
+  otherwise a full WebSocket load consumes every TCP slot and `/health`,
+  `/ready`, `/metrics`, the image HEALTHCHECK, and k8s probes are rejected at
+  accept. The examples use 4000/5000 and 8000/10000; the built-in defaults are
+  20000/25000.
 - `PASEO_RELAY_MAX_SESSIONS` (default 20,000) bounds idle `serverId` entries.
 - `PASEO_RELAY_CONTROL_QUEUE_BYTES` / writer queues bound per-destination
   buffering.

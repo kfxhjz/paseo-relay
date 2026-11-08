@@ -23,13 +23,16 @@ deployment-compatible with the Elixir relay's cluster/ownership features.
 |---|---|
 | `PASEO_RELAY_HOST` / `PORT` | same |
 | `PASEO_RELAY_ACCEPTORS`, `CONNECTIONS_PER_ACCEPTOR` | `PASEO_RELAY_MAX_CONNECTIONS`, `PASEO_RELAY_MAX_TCP_CONNECTIONS` |
-| `PASEO_RELAY_INGRESS_BUDGET_BYTES`, `INGRESS_WEIGHT` | same |
+| `PASEO_RELAY_INGRESS_BUDGET_BYTES`, `INGRESS_WEIGHT` | same; `INGRESS_WEIGHT` now only accepts `4..=16` |
 | `PASEO_RELAY_DELIVERY_TIMEOUT_MS`, `DATA_ATTACH_TIMEOUT_MS`, `CONTROL_QUEUE_BYTES` | same |
 | `PASEO_RELAY_WEBSOCKET_MAX_HEAP_WORDS`, `MEMORY_WATERMARK_BYTES`, `TCP_RECEIVE_BUFFER_BYTES` | removed (Rust memory model; explicit caps instead) |
 | `PASEO_RELAY_CLUSTER_*`, `OWNERSHIP_TARGET`, `REROUTE_HEADER`, `MIN_CLUSTER_SIZE` | removed (single node; edge hashing) |
 | `RELEASE_NODE`, `RELEASE_COOKIE`, `RELEASE_DISTRIBUTION` | removed (no Erlang) |
 | `PASEO_RELAY_DRAIN` | same boot-time semantics |
 | `PASEO_RELAY_LOG` | same (`tracing` EnvFilter), plus `PASEO_RELAY_LOG_FORMAT=text/json` |
+
+Note: `PASEO_RELAY_INGRESS_WEIGHT` values `1..3` are rejected at startup; the
+accepted range is `4..=16` (default `4`).
 
 ## Migration steps
 

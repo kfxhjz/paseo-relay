@@ -4,8 +4,8 @@
 
 relay 只从环境变量读取配置。启动时会校验；非法值（包括非法的
 `PASEO_RELAY_LOG` filter）会带说明中止启动。可用
-`paseo-relay --check-config` 校验部署环境（包括 TLS 证书/私钥文件对 relay 用户
-是否可读），用 `paseo-relay --dump-config` 打印生效配置（不含秘密）。
+`paseo-relay --check-config` 校验部署环境（包括 TLS 证书/私钥是否为 relay 用户
+可读的常规文件），用 `paseo-relay --dump-config` 打印生效配置（不含秘密）。
 
 ## Runtime contract
 
@@ -14,16 +14,16 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 | `PASEO_RELAY_HOST` | `127.0.0.1` | 监听 IP。容器镜像设为 `0.0.0.0`。 |
 | `PASEO_RELAY_PORT` | `4000` | HTTP/WebSocket/运维端点监听端口。 |
 | `PASEO_RELAY_DRAIN` | `false` | 启动即 draining：`/ready` 返回 503，新 `/ws` upgrade 被拒绝。SIGTERM/SIGINT 总会触发 drain。 |
-| `PASEO_RELAY_MAX_CONNECTIONS` | `20000` | 最大 WebSocket 数。必须 `<= PASEO_RELAY_MAX_TCP_CONNECTIONS`。 |
-| `PASEO_RELAY_MAX_TCP_CONNECTIONS` | `25000` | 最大 OS socket 数，包含 upgrade 前的 HTTP 和 upgrade 后的 WebSocket。slot 在整个 socket 生命周期内持有。 |
+| `PASEO_RELAY_MAX_CONNECTIONS` | `20000` | 最大 WebSocket 数。必须 `<= PASEO_RELAY_MAX_TCP_CONNECTIONS`，并让后者高于它（见下一行）。 |
+| `PASEO_RELAY_MAX_TCP_CONNECTIONS` | `25000` | 最大 OS socket 数，包含 upgrade 前的 HTTP 和 upgrade 后的 WebSocket。slot 在整个 socket 生命周期内持有，因此要比 `PASEO_RELAY_MAX_CONNECTIONS` 留出余量（至少 64–128 个空槽，探针突发时更多），否则满 WebSocket 负载会在 accept 阶段拒绝 `/health`、`/ready`、`/metrics` 和探针。 |
 | `PASEO_RELAY_MAX_SESSIONS` | `20000` | 最大存活 `serverId` session 数。 |
 | `PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION` | `32` | 每个 `connectionId` 的最大 v2 client socket 数。 |
-| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | 节点级加权 in-flight payload 预算。至少为 `(MAX_MESSAGE_BYTES + 256) * INGRESS_WEIGHT`；单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)`。 |
+| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | 节点级加权 in-flight payload 预算。必须能容纳一条最大消息，包括 256 字节每消息开销和每 chunk 记账（每个 8 KiB chunk 192 加权单位，包含 1024 分片最坏情况）；具体下限用 `--check-config` 查看。129 MiB 的 Compose 预算（135,266,304）仍可通过，余量约 64.6 KB。单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)`。 |
 | `PASEO_RELAY_INGRESS_WEIGHT` | `4` | 每 payload 字节的权重，另加每消息固定 256 字节开销。范围 `4..=16`；最小值 `4` 覆盖 2× 临时拷贝的安全余量。 |
-| `PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS` | `5000` | 等待预算的最长时间；超时 source 以 `1013` 关闭。 |
+| `PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS` | `5000` | 等待预算的最长时间；超时 source 以 `1013` 关闭。有效等待为 `min(本值, 剩余 FRAME_READ_TIMEOUT_MS/MESSAGE_READ_TIMEOUT_MS)`；预算耗尽和读超时都以 `1013` 关闭。 |
 | `PASEO_RELAY_MAX_MESSAGE_BYTES` | `33554418` | 最大数据帧/重组消息 payload（`32 MiB - 14`）。 |
 | `PASEO_RELAY_FRAME_READ_TIMEOUT_MS` | `300000` | 帧 header 之后接收 payload 的最长时间；超时 `1013`。 |
-| `PASEO_RELAY_MESSAGE_READ_TIMEOUT_MS` | `600000` | 重组一条分片消息的最长时间；超时 `1013`。 |
+| `PASEO_RELAY_MESSAGE_READ_TIMEOUT_MS` | `600000` | 从第一个分片 header 到达起算，重组一条分片消息的最长时间；超时 `1013`。 |
 | `PASEO_RELAY_DATA_ATTACH_TIMEOUT_MS` | `15000` | v2 client 帧等待 daemon data socket 的最长时间。 |
 | `PASEO_RELAY_DELIVERY_TIMEOUT_MS` | `30000` | 等待 destination writer 权限/写入的最长时间；慢 destination 被 `1013` shed。 |
 | `PASEO_RELAY_CONTROL_QUEUE_BYTES` | `1048576` | 每 destination writer 队列下限；有效队列至少为 `MAX_MESSAGE_BYTES + 64 KiB`。 |
@@ -50,7 +50,7 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 ```mermaid
 flowchart TD
   A["socket 读取"] -->|"PASEO_RELAY_FRAME_READ_TIMEOUT_MS"| B["帧解码"]
-  B -->|"8 KiB chunk + PASEO_RELAY_INGRESS_BUDGET_BYTES"| C["每个 payload chunk 到达后计费"]
+  B -->|"8 KiB chunk + PASEO_RELAY_INGRESS_BUDGET_BYTES"| C["每个 payload chunk 到达后计费（另加记账）"]
   C --> D["router 与 session registry"]
   D -->|"PASEO_RELAY_CONTROL_QUEUE_BYTES"| E["有界 per-destination writer 队列"]
   E -->|"PASEO_RELAY_DELIVERY_TIMEOUT_MS"| F["帧编码与发送"]
@@ -63,26 +63,29 @@ data frame 的 payload 按 8 KiB chunk 读取，每个 chunk 到达后才计费�
 能持有的加权预算（4× 覆盖 reader 最多流水化 4 条消息）。一条消息最多 1024 个分片
 （固定策略，不可配置）；超过时以 `1002` 关闭 source。
 
-source 在 `PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS` 内无法预留时以 `1013` 关闭；
-destination 的 writer 队列或写入超过 `PASEO_RELAY_DELIVERY_TIMEOUT_MS` 时以 `1013`
-shed。session 和 socket 数量分别由 `PASEO_RELAY_MAX_SESSIONS`、
-`PASEO_RELAY_MAX_CONNECTIONS` 限制。
+source 在
+`min(PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS, 剩余 frame/message 读取 deadline)` 内
+无法预留时以 `1013` 关闭；destination 的 writer 队列或写入超过
+`PASEO_RELAY_DELIVERY_TIMEOUT_MS` 时以 `1013` shed。frame/message 读超时同样以
+`1013` 关闭 source；预算等待不会延长读取 deadline。session 和 socket 数量分别由
+`PASEO_RELAY_MAX_SESSIONS`、`PASEO_RELAY_MAX_CONNECTIONS` 限制。
 
 ## 内存规划（upgrade 前 HTTP 与 idle socket）
 
 hyper HTTP/1.1 builder 限制了未认证的 upgrade 前请求路径：`max_buf_size` 16 KiB、
 `max_header_size` 16 KiB、`max_headers` 64；`PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS`
-仍然限制 header 阶段。一个 idle 的已接受 socket 仍约占 23 KiB（hyper 读写缓冲加
-task），因此按以下公式规划：
+仍然限制 header 阶段。relay 在边缘后为明文时一个 idle 已接受 socket 仍约占
+23 KiB，原生 TLS（rustls 缓冲）时约 33 KiB，因此按以下公式规划：
 
 ```text
-PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB ≈ idle 内存
+PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB ≈ idle 内存（明文）
+PASEO_RELAY_MAX_TCP_CONNECTIONS × ~35 KiB ≈ idle 内存（原生 TLS）
 ```
 
 内置默认值（25,000 TCP / 20,000 WebSocket）在没有任何 payload 流量前就需要约
-700–800 MiB 余量：512 MB 主机必须调低 `PASEO_RELAY_MAX_TCP_CONNECTIONS`、
-`PASEO_RELAY_MAX_CONNECTIONS` 和 `PASEO_RELAY_MAX_SESSIONS`（Compose 示例使用
-5,000 / 4,000 / 4,000）。TCP slot 在整个 socket 生命周期内持有（包括 upgrade 后的
+700–800 MiB（明文）或约 850–900 MiB（原生 TLS）：512 MB 主机必须调低
+`PASEO_RELAY_MAX_TCP_CONNECTIONS`、`PASEO_RELAY_MAX_CONNECTIONS` 和
+`PASEO_RELAY_MAX_SESSIONS`（Compose 示例使用 5,000 / 4,000 / 4,000）。TCP slot 在整个 socket 生命周期内持有（包括 upgrade 后的
 WebSocket），因此 `PASEO_RELAY_MAX_TCP_CONNECTIONS` 是文档化的 OS socket 总上限，
 `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` 仍然有意义。
 
@@ -92,7 +95,7 @@ WebSocket），因此 `PASEO_RELAY_MAX_TCP_CONNECTIONS` 是文档化的 OS socke
 paseo-relay                      # 运行
 paseo-relay --help               # 用法
 paseo-relay --version            # 版本 + build revision
-paseo-relay --check-config       # 校验环境与 TLS 文件可读性，退出 0/1
+paseo-relay --check-config       # 校验环境与 TLS 文件（常规且可读），退出 0/1
 paseo-relay --dump-config        # 打印生效配置
 paseo-relay healthcheck          # 容器自检（支持 TLS）
 ```

@@ -43,6 +43,12 @@ session 并破坏可用性。它出现在 WebSocket URL query 中；请在边缘
 query string，并把配对链接和二维码当作秘密。relay 按设计没有 relay-level 认证；
 需要更强隔离的部署应放在 VPN/mTLS 或带认证的边缘之后。
 
+**残余可用性风险。** 能在配置上限内发送真实流量的 peer 仍可占满共享 ingress
+预算：大约 4 个连接各发一条 ~32 MiB 分片消息并停在未完成状态，就能在最长
+`MESSAGE_READ_TIMEOUT_MS` 内持有约 512 MiB 加权预算。这由文档化的预算和读取
+deadline 约束，但不会消失；请用边缘带宽/速率限制缓解。默认 512 MiB 全局预算略小于
+四条最大消息的加权计费，因此最大的 4 消息流水线可能看到正常的 `1013` 预算反压。
+
 范围内：
 
 - 网络输入可触发的内存安全/panic；
@@ -64,6 +70,7 @@ query string，并把配对链接和二维码当作秘密。relay 按设计没�
 见 README 的 hardening checklist 和 [docs/zh-CN/deployment.md](docs/zh-CN/deployment.md)。
 至少：终止 TLS、不要公开 `/metrics` 和 `/ready`、在边缘做 per-IP 限制、用提供的
 非 root 用户以 read-only 运行容器，并保持 relay 和 Rust 工具链更新。连接上限要按
-主机内存设置：一个 idle 已接受 socket 约占 23 KiB，按
-`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 规划（内置 25,000 socket 默认值约需
-700–800 MiB），小节点必须调低上限。
+主机内存设置：relay 在边缘后为明文时一个 idle 已接受 socket 约占 23 KiB，原生 TLS
+时约 33 KiB，按 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB`（明文）或
+`× ~35 KiB`（原生 TLS）规划；内置 25,000 socket 默认值约需 700–800 MiB（明文）或
+约 850–900 MiB（原生 TLS），小节点必须调低上限。

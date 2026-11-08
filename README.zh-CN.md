@@ -46,6 +46,7 @@ curl http://127.0.0.1:4000/ready    # {"status":"ready"}
 宽限期更长的 stop timeout：
 
 ```sh
+# 按约 512 MB 主机设置；提高内存时一起调高（见 docs/zh-CN/deployment.md“容量规划”）。
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -53,6 +54,10 @@ docker run -d \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
+  -e PASEO_RELAY_MAX_CONNECTIONS=4000 \
+  -e PASEO_RELAY_MAX_SESSIONS=4000 \
+  -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
+  -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
   ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
@@ -125,9 +130,9 @@ relay，选这个。如果你不想维护带 `serverId` 亲和性的边缘代理
 - **E2EE payload 不透明**：不解密、不落盘、不记录 payload；唯一的检查是有界的
   `hello`/`e2ee_hello` key 卫生检查。
 - **默认有界**：2 万 WebSocket/session；payload 到达时按 8 KiB chunk 计入加权
-  ingress 预算（每连接最多一个 8 KiB chunk 尚未计费）；每消息固定 256 字节开销只计
-  一次；每连接 in-flight 上限；每条消息最多 1024 个分片；每 destination writer
-  队列有界；帧/消息读取有 deadline。
+  ingress 预算（每连接最多一个 8 KiB chunk 尚未计费，另有每 chunk 记账）；每消息
+  固定 256 字节开销只计一次；每连接 in-flight 上限；每条消息最多 1024 个分片；
+  每 destination writer 队列有界；帧/消息读取有 deadline。
 - **Fail closed**：明确的 HTTP 状态码或 WebSocket close code；不留下半开状态；
   非法 ID 直接 `400`。
 - **运维**：`/health`、`/ready`、`/metrics`、`/version`，文本或 JSON 结构化日志，
@@ -240,16 +245,21 @@ consumer、delivery timeout、拒绝数、handshake 结果、最大帧、uptime�
 ## 内存模型与滥用上限
 
 idle 内存主要由已接受 socket 决定，而不是 payload：hyper 限制了未认证的 upgrade 前
-请求路径（缓冲/header 16 KiB、64 个 header），但一个 idle socket 仍约占 23 KiB，
-因此按 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 规划。内置 25,000 TCP /
-20,000 WebSocket 默认值在没有任何 payload 流量前就需要约 700–800 MiB；512 MB 主机
-必须调低上限（Compose 示例使用 5,000 / 4,000 / 4,000）。
+请求路径（缓冲/header 16 KiB、64 个 header），但 relay 在边缘后为明文时一个 idle
+socket 仍约占 23 KiB，原生 TLS（rustls 缓冲）时约 33 KiB。idle 规划按
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB`（明文）或 `× ~35 KiB`（原生 TLS）。
+内置 25,000 TCP / 20,000 WebSocket 默认值在没有任何 payload 流量前就需要约
+700–800 MiB（明文）或约 850–900 MiB（原生 TLS）；512 MB 主机必须调低上限
+（Compose 示例使用 5,000 / 4,000 / 4,000）。
 
-payload 记账是增量的：data frame payload 按 8 KiB chunk 在字节到达时计费，每消息
-固定 256 字节开销只计一次，单个连接最多持有
+payload 记账是增量的：data frame payload 按 8 KiB chunk 在字节到达时按
+`chunk_bytes × weight + 192` 加权单位计费（192 为每 chunk 记账），每消息固定
+256 字节开销只计一次，单个连接最多持有
 `min(budget, 4 × 一条最大消息的计费)` 的加权 ingress 预算，一条消息最多 1024 个
 分片。因此停滞 header 无法为它从未发送的 payload 预留预算，分片上限也限制了空分片
-洪泛。完整限制见 [docs/zh-CN/configuration.md](docs/zh-CN/configuration.md) 和
+洪泛。让 `PASEO_RELAY_MAX_TCP_CONNECTIONS` 高于 `MAX_CONNECTIONS`（至少 64–128 个
+空槽），保证满 WebSocket 负载下健康/readiness 探针仍能拿到 slot。完整限制见
+[docs/zh-CN/configuration.md](docs/zh-CN/configuration.md) 和
 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)。
 
 ## 性能基准

@@ -60,18 +60,25 @@ cluster ownership; the edge provides affinity. See
 
 Default: 20,000 WebSockets, 20,000 sessions, 512 MiB weighted ingress, 32 MiB−14
 per message, 64 KiB v2 control frames, 30 s delivery timeout, and at most 1024
-fragments per message. Payload bytes are charged in 8 KiB chunks as they arrive;
+fragments per message. Payload bytes are charged in 8 KiB chunks as they arrive
+as `chunk_bytes × weight + 192` weighted units (192 is per-chunk bookkeeping);
 the 256-byte per-message overhead is charged once, and one connection can hold
 at most `min(budget, 4 × one-max-message charge)` of the ingress budget.
-Everything is configurable except the fragment cap; see the runtime contract in
-[configuration.md](configuration.md).
+
+Some policies are fixed rather than configurable: the 1024-fragment cap per
+message, the 64 KiB v2 control-frame cap, the 64 KiB handshake-hygiene cap, the
+per-connection 4× ingress cap, and the pre-upgrade HTTP caps (16 KiB read
+buffer, 16 KiB headers, 64 header fields). Everything else is configurable; see
+the runtime contract in [configuration.md](configuration.md).
 
 ## How much memory do I need?
 
-Idle accepted sockets dominate: each costs roughly 23 KiB (hyper read/write
-buffers plus the task), so plan for `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB`
-plus the in-flight ingress budget. The built-in 25,000 TCP / 20,000 WebSocket
-defaults need roughly 700–800 MiB before payload traffic; a 512 MB host must
-lower the caps (the Compose examples use 5,000 / 4,000 / 4,000). The
-pre-upgrade HTTP path is additionally capped by hyper at 16 KiB buffers/headers
-and 64 headers.
+Idle accepted sockets dominate: each costs roughly 23 KiB when the relay is
+plaintext behind an edge (hyper read/write buffers plus the task), or ~33 KiB
+with native TLS (rustls buffers), so plan for
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB` (native
+TLS) plus the in-flight ingress budget. The built-in 25,000 TCP / 20,000
+WebSocket defaults need roughly 700–800 MiB plaintext, or ~850–900 MiB with
+native TLS, before payload traffic; a 512 MB host must lower the caps (the
+Compose examples use 5,000 / 4,000 / 4,000). The pre-upgrade HTTP path is
+additionally capped by hyper at 16 KiB buffers/headers and 64 headers.

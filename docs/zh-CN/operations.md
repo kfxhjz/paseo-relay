@@ -36,6 +36,17 @@ Counter：`paseo_relay_frames_forwarded_total`、`paseo_relay_bytes_forwarded_to
 `paseo_relay_per_ip_rejections_total`、`paseo_relay_handshake_accepted_total`、
 `paseo_relay_handshake_rejected_total`。
 
+拒绝类 counter 按原因拆分：
+
+- `paseo_relay_connection_rejections_total` 统计因 WebSocket 容量、draining、非法
+  upgrade/handshake、Origin 不允许/无法解析，或 upgrade 失败/超时而拒绝的请求；
+- `paseo_relay_per_ip_rejections_total` 统计 per-IP WebSocket 上限（**不**计入
+  `connection_rejections_total`）；
+- `paseo_relay_session_rejections_total` 统计 `MAX_SESSIONS` 上限。
+
+在 admission 之前因 query 参数校验返回 `400` 的失败不计入
+`connection_rejections_total`；upgrade/handshake 校验返回 `400`/`426` 的会计入。
+
 Gauge：`paseo_relay_ready`、`paseo_relay_draining`、
 `paseo_relay_active_websockets`、`paseo_relay_active_sessions`、
 `paseo_relay_ingress_reserved_bytes`、`paseo_relay_ingress_budget_bytes`、
@@ -53,12 +64,18 @@ ingress 预留超过配置预算约 80%（用
 - `paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes` 接近
   `0.8` 说明有大消息 in-flight 或慢 destination；查看 slow-consumer/delivery
   指标。该比率对任意配置预算都适用，不像绝对字节阈值那样依赖默认值。
-- idle 内存主要由已接受 socket 决定，而不是 payload：一个 idle socket 约占
-  23 KiB，因此 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 是下限。内置
-  25,000 socket 默认值在无流量时就要约 700–800 MiB；小节点请调低这些上限。
+- idle 内存主要由已接受 socket 决定，而不是 payload：明文时一个 idle socket 约占
+  23 KiB，原生 TLS 时约 33 KiB，因此 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB`
+  （明文）或 `× ~35 KiB`（原生 TLS）是下限。内置 25,000 socket 默认值在无流量时
+  就需约 700–800 MiB（明文）或约 850–900 MiB（原生 TLS）；小节点请调低这些上限。
+- 因为 TCP slot 在整个 socket 生命周期内持有，`PASEO_RELAY_MAX_TCP_CONNECTIONS`
+  要比 `PASEO_RELAY_MAX_CONNECTIONS` 留出余量（至少 64–128 个 slot，探针突发时
+  更多）。两者相等时，满 WebSocket 负载可能在 accept 阶段拒绝 `/health`、
+  `/ready`、`/metrics` 和探针，即使进程本身健康。
 - `active_sessions` 包含空 session，直到 idle sweep 清理；重连风暴后这是正常的。
-- `connection_rejections_total` 包含非法 upgrade、draining、per-IP 限制和容量；
-  需结合边缘日志归因。
+- `connection_rejections_total` 覆盖 WebSocket 容量、draining、非法 upgrade/Origin
+  以及 upgrade 失败/超时；per-IP 拒绝由 `per_ip_rejections_total` 单独统计。需结合
+  边缘日志归因。
 - relay 不记录 `serverId`、`connectionId` 或 payload。需要按用户归因时使用边缘日志
   （尽量脱敏 query string）。
 - `/version` 和 `build_info` 标识实际部署的 commit。如果 checkout 没有 `.git`，

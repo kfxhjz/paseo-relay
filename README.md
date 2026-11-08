@@ -50,6 +50,7 @@ For an actual deployment, run it detached with a restart policy (`--rm` and
 grace window:
 
 ```sh
+# Sized for ~512 MB; raise with RAM (see docs/deployment.md "Capacity sizing").
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -57,6 +58,10 @@ docker run -d \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
+  -e PASEO_RELAY_MAX_CONNECTIONS=4000 \
+  -e PASEO_RELAY_MAX_SESSIONS=4000 \
+  -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
+  -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
   ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
@@ -138,9 +143,10 @@ the Elixir relay if you need its built-in cluster/ownership/reroute behavior.
   inspection is a bounded `hello`/`e2ee_hello` key-hygiene check.
 - **Bounded by default**: 20k WebSockets/sessions, weighted ingress budget
   charged chunk-by-chunk as payload arrives (at most one 8 KiB chunk per
-  connection uncharged), a fixed 256-byte per-message overhead charged once, a
-  per-connection in-flight cap, a 1024-fragment message limit, bounded
-  per-destination writer queues, frame/message read deadlines.
+  connection uncharged, plus per-chunk bookkeeping), a fixed 256-byte
+  per-message overhead charged once, a per-connection in-flight cap, a
+  1024-fragment message limit, bounded per-destination writer queues,
+  frame/message read deadlines.
 - **Fail closed**: explicit HTTP status or WebSocket close codes; no half-open
   state; invalid IDs are rejected with `400`.
 - **Operations**: `/health`, `/ready`, `/metrics`, `/version`, structured text
@@ -265,20 +271,25 @@ authentication on ops endpoints.
 
 Idle memory is dominated by accepted sockets, not by payload: hyper caps the
 unauthenticated pre-upgrade request path (16 KiB buffers/headers, 64 headers),
-but an idle socket still costs roughly 23 KiB, so plan for
-`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB`. The built-in 25,000 TCP / 20,000
-WebSocket defaults need roughly 700–800 MiB before any payload traffic; a
-512 MB host must lower the caps (the Compose examples use 5,000 / 4,000 /
-4,000).
+but an idle socket still costs roughly 23 KiB when the relay is plaintext behind
+an edge, or ~33 KiB with native TLS (rustls buffers). Plan for
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB` (native
+TLS) at idle. The built-in 25,000 TCP / 20,000 WebSocket defaults need roughly
+700–800 MiB plaintext, or ~850–900 MiB with native TLS, before any payload
+traffic; a 512 MB host must lower the caps (the Compose examples use 5,000 /
+4,000 / 4,000).
 
 Payload accounting is incremental: a data-frame payload is charged in 8 KiB
-chunks as bytes arrive, the 256-byte per-message overhead is charged once per
+chunks as bytes arrive as `chunk_bytes × weight + 192` weighted units (the 192
+is per-chunk bookkeeping), the 256-byte per-message overhead is charged once per
 message, one connection can hold at most `min(budget, 4 × one-max-message
 charge)` of the weighted ingress budget, and one message may contain at most
 1024 fragments. A stalled header therefore cannot reserve budget for a payload
-it never sends, and the fragment cap bounds empty-fragment floods. See
-[docs/configuration.md](docs/configuration.md) and [DESIGN.md](DESIGN.md) for
-the full limits.
+it never sends, and the fragment cap bounds empty-fragment floods. Keep
+`PASEO_RELAY_MAX_TCP_CONNECTIONS` above `MAX_CONNECTIONS` (at least 64–128
+spare slots) so health/readiness probes still get a slot under a full WebSocket
+load. See [docs/configuration.md](docs/configuration.md) and
+[DESIGN.md](DESIGN.md) for the full limits.
 
 ## Benchmarks
 

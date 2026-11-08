@@ -132,9 +132,10 @@ sequenceDiagram
 | Invalid UTF-8 in a text message | Closes `1007` |
 | Fragmented messages | Reassembled and forwarded as one message; opcode preserved |
 | Frame payload read | Must complete within `FRAME_READ_TIMEOUT_MS`; closes `1013` |
-| Fragmented message | Must complete within `MESSAGE_READ_TIMEOUT_MS`; closes `1013` |
+| Fragmented message | Must complete within `MESSAGE_READ_TIMEOUT_MS` of the first fragment header (the clock starts when that header arrives); closes `1013` |
 | Idle/header timeout between frames | None between WebSocket frames; idle connections hold their slots by design, so enforce idle limits at the edge |
-| Source payload accounting | Data payload is read in 8 KiB chunks and each chunk is charged after it arrives; at most one 8 KiB chunk per connection is allocated before charging |
+| Source payload accounting | Data payload is read in 8 KiB chunks and each chunk is charged after it arrives as `chunk_bytes × weight + 192` (per-chunk bookkeeping); at most one 8 KiB chunk per connection is allocated before charging |
+| Ingress budget wait | Limited to `min(INGRESS_WAIT_TIMEOUT_MS, remaining frame/message read deadline)`; budget exhaustion and a read timeout both close the source `1013` |
 | Per-connection in-flight cap | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)` |
 | Slow destination | Bounded writer queue + deadline; destination sheds `1013` |
 
@@ -144,9 +145,11 @@ Ingress accounting has two refinements that matter for abuse limits:
   once per fragment, so a fragmented message is not billed thousands of times
   for its headers;
 - a data-frame payload is read in 8 KiB chunks and each chunk is charged after
-  it arrives, so at most one 8 KiB chunk per connection is allocated before it
-  is accounted. A stalled frame therefore cannot reserve budget for bytes it
-  never sends.
+  it arrives as `chunk_bytes × weight + 192` weighted units (192 is per-chunk
+  bookkeeping, so many tiny chunks cannot bypass the budget with a small
+  unaccounted guard heap), so at most one 8 KiB chunk per connection is
+  allocated before it is accounted. A stalled frame therefore cannot reserve
+  budget for bytes it never sends.
 
 ## Handshake key hygiene
 
@@ -192,5 +195,11 @@ contract; the relay closes the socket and does not retry.
 - Anything else — 404.
 
 Admission failures for the upgrade: `400` invalid query/handshake, `403`
-disallowed Origin, `426` not an upgrade, `429` per-IP WebSocket limit, `503`
+disallowed Origin, `414` request target too long, `426` not an upgrade, `429`
+per-IP WebSocket limit, `431` request headers too large, `503`
 draining/capacity.
+
+The `414`/`431` responses come from the HTTP parser before the relay sees the
+request: request headers are capped at 16 KiB and 64 fields (hyper
+`max_header_size` / `max_headers`), and oversize request targets are rejected
+with `414`.

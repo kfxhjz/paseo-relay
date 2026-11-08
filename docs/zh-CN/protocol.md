@@ -123,9 +123,10 @@ sequenceDiagram
 | Text 消息非法 UTF-8 | close `1007` |
 | 分片消息 | 重组后作为一个消息转发；保留 opcode |
 | 帧 payload 读取 | 必须在 `FRAME_READ_TIMEOUT_MS` 内完成；否则 `1013` |
-| 分片消息 | 必须在 `MESSAGE_READ_TIMEOUT_MS` 内完成；否则 `1013` |
+| 分片消息 | 必须在第一个分片 header 到达后的 `MESSAGE_READ_TIMEOUT_MS` 内完成；否则 `1013` |
 | 帧之间的 idle/header timeout | WebSocket 帧之间没有 timeout；idle 连接按设计继续占用 slot，需在边缘做 idle 限制 |
-| 源端 payload 记账 | data payload 按 8 KiB chunk 读取，每个 chunk 到达后才计费；每个连接在计费前最多分配一个 8 KiB chunk |
+| 源端 payload 记账 | data payload 按 8 KiB chunk 读取，每个 chunk 到达后按 `chunk_bytes × weight + 192` 计费（192 为每 chunk 记账）；每个连接在计费前最多分配一个 8 KiB chunk |
+| Ingress 预算等待 | 限制为 `min(INGRESS_WAIT_TIMEOUT_MS, 剩余 frame/message 读取 deadline)`；预算耗尽和读超时都以 `1013` 关闭 source |
 | 每连接 in-flight 上限 | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × 一条最大消息的计费)` |
 | 慢 destination | 有界 writer 队列 + deadline；destination 被 `1013` shed |
 
@@ -133,8 +134,10 @@ Ingress 记账有两个对滥用上限很重要的细节：
 
 - 每消息固定 256 字节开销 **每条消息只计一次**，不按分片重复计费，因此一条分片
   消息不会因为 header 被计上千次；
-- data frame 的 payload 按 8 KiB chunk 读取，每个 chunk 到达后才计费，因此每个
-  连接在计费前最多分配一个 8 KiB chunk。停滞帧无法为它从未发送的字节预留预算。
+- data frame 的 payload 按 8 KiB chunk 读取，每个 chunk 到达后按
+  `chunk_bytes × weight + 192` 加权单位计费（192 为每 chunk 记账，大量微小 chunk
+  无法用很小的未记账 guard 堆绕过预算），因此每个连接在计费前最多分配一个 8 KiB
+  chunk。停滞帧无法为它从未发送的字节预留预算。
 
 ## 握手 key 卫生检查
 
@@ -170,11 +173,16 @@ payload 允许；单字节 payload 不允许。`1005`/`1006`/`1015` 保留给本
 
 - `GET /health` — 存活探针，进程存活期间 200。
 - `GET /ready` — 仅在愿意接受新工作时 200；draining、shutting down、WebSocket/session
-  WebSocket/session 容量满时 503。
+  容量满时 503。
 - `GET /metrics` — Prometheus 文本，只有聚合值，无 ID。
 - `GET /version` — `{"version":"...","revision":"..."}`。
 - `GET /ws` — WebSocket upgrade。
 - 其他路径 — 404。
 
-upgrade admission 失败：`400` query/handshake 非法，`403` Origin 不允许，`426` 不是
-upgrade，`429` per-IP WebSocket 超限，`503` draining/容量不足。
+upgrade admission 失败：`400` query/handshake 非法，`403` Origin 不允许，`414`
+request target 过长，`426` 不是 upgrade，`429` per-IP WebSocket 超限，`431`
+request header 过大，`503` draining/容量不足。
+
+`414`/`431` 由 HTTP parser 在 relay 看到请求之前返回：request header 上限为
+16 KiB 和 64 个字段（hyper `max_header_size` / `max_headers`），过长的 request
+target 以 `414` 拒绝。

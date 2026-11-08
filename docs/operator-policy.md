@@ -26,16 +26,21 @@ That has consequences:
 - Terminate TLS; do not serve plaintext `ws://` publicly.
 - Put a rate-limiting edge (CDN/WAF/LB) in front: per-IP connection count,
   connect rate, message rate, and bandwidth. The provided Nginx and HAProxy
-  examples include per-client connection/rate limits, deny the operations
-  endpoints, and log without query strings; size their thresholds for your
-  traffic. The Caddy example has no in-process per-IP limiting, so pair it with
-  an external CDN/WAF. In-process `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` sees the
-  proxy IP when an LB terminates connections; leave it at `0` behind a proxy and
-  limit at the edge.
+  examples include per-client connection/rate limits, block `/metrics` and
+  `/version`, keep `/ready` private, and log without query strings; size their
+  thresholds for your traffic. The Caddy example has no in-process per-IP
+  limiting, so pair it with an external CDN/WAF. In-process
+  `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` sees the proxy IP when an LB terminates
+  connections; leave it at `0` behind a proxy and limit at the edge.
 - Set `PASEO_RELAY_MAX_CONNECTIONS`, `MAX_TCP_CONNECTIONS`, `MAX_SESSIONS`, and
   the ingress budget for your host size; monitor `/ready` and `/metrics`. An idle
-  accepted socket still costs ~23 KiB, so `MAX_TCP_CONNECTIONS × ~30 KiB` is the
-  memory floor and a 512 MB host cannot use the built-in 25,000 default.
+  accepted socket costs ~23 KiB plaintext or ~33 KiB with native TLS, so
+  `MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB` (native TLS) is the
+  memory floor and a 512 MB host cannot use the built-in 25,000 default. Keep
+  `MAX_TCP_CONNECTIONS` above `MAX_CONNECTIONS` (at least 64–128 spare slots,
+  more for probe bursts): the TCP slot is held for the whole socket lifetime, so
+  a full WebSocket load at equal caps would reject `/health`, `/ready`,
+  `/metrics`, the image HEALTHCHECK, and k8s probes at accept.
 - Clients should send exactly one unencoded `serverId`. Duplicate query keys are
   last-wins at the relay, while edge consistent hashing normally uses the raw
   query value, so duplicate or percent-encoded values can route the two sides of
@@ -73,10 +78,13 @@ That has consequences:
 ## Capacity and availability
 
 - A relay node is small, but bandwidth and connection counts are the real
-  limits. Idle memory is dominated by accepted sockets (each ~23 KiB), so plan
-  for `MAX_TCP_CONNECTIONS × ~30 KiB` plus the ingress budget and leave headroom
-  for bursts and Caddy/proxy. Size `PASEO_RELAY_MAX_CONNECTIONS`,
-  `MAX_SESSIONS`, and the ingress budget for the host.
+  limits. Idle memory is dominated by accepted sockets (each ~23 KiB plaintext
+  or ~33 KiB with native TLS), so plan for `MAX_TCP_CONNECTIONS × ~30 KiB`
+  (plaintext) or `× ~35 KiB` (native TLS) plus the ingress budget and leave
+  headroom for bursts and Caddy/proxy. Size `PASEO_RELAY_MAX_CONNECTIONS`,
+  `MAX_SESSIONS`, and the ingress budget for the host, and keep
+  `MAX_TCP_CONNECTIONS` above `MAX_CONNECTIONS` so health probes still get a
+  slot under full WebSocket load.
 - For multiple nodes, use an edge that hashes the `serverId` query parameter and
   removes draining nodes using `/ready`. Plain round-robin will split sessions.
 - Drain a node with SIGTERM, wait the grace window, then remove it. Do not

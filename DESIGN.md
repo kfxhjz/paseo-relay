@@ -80,7 +80,7 @@ detail.
 ```mermaid
 flowchart TD
   A["TCP accept: acquire TCP slot and start header timeout"] --> B["Pre-upgrade validation: method path upgrade headers key query Origin"]
-  B -->|fail| C["Fail closed 400 403 404 426 without allocating state"]
+  B -->|fail| C["Fail closed 400 403 404 426 without session/writer/WS/per-IP state"]
   B -->|pass| D["Admission: WS slot then session slot then per-IP slot"]
   D --> E["101 upgrade"]
   E --> F["Split reader and writer tasks over a bounded queue"]
@@ -95,11 +95,16 @@ flowchart TD
    hyper's request limits (`max_buf_size` 16 KiB, `max_header_size` 16 KiB,
    `max_headers` 64), so a slow client cannot hold a slot indefinitely or make
    the pre-upgrade path allocate without bound. Each idle accepted socket still
-   costs roughly 23 KiB (hyper read/write buffers plus the task); plan for
-   `MAX_TCP_CONNECTIONS × ~30 KiB` at idle, which is ~700–800 MiB at the 25,000
-   default, so a 512 MB node must lower the caps. The per-IP WebSocket slot
-   (`PER_IP_MAX_CONNECTIONS`, 0 = unlimited) is acquired during admission,
-   before the upgrade is completed.
+   costs roughly 23 KiB when the relay is plaintext behind an edge (hyper
+   read/write buffers plus the task), or ~33 KiB with native TLS (rustls
+   buffers); plan for `MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB`
+   (native TLS) at idle, which is ~700–800 MiB plaintext or ~850–900 MiB with
+   native TLS at the 25,000 default, so a 512 MB node must lower the caps. Keep
+   `MAX_TCP_CONNECTIONS` above `MAX_CONNECTIONS` (at least 64–128 spare slots,
+   more for probe bursts) so a full WebSocket load cannot consume every TCP slot
+   and reject `/health`, `/ready`, `/metrics`, and k8s probes at accept. The
+   per-IP WebSocket slot (`PER_IP_MAX_CONNECTIONS`, 0 = unlimited) is acquired
+   during admission, before the upgrade is completed.
 2. **Request classification.** `GET /ws` is the only upgradeable route; other
    paths return `404`, and operations endpoints are read-only. `/health` is
    independent of readiness so liveness probes cannot cause restarts during a
@@ -114,7 +119,9 @@ flowchart TD
    - the optional Origin allowlist.
    Failures return `426` when the request is not an upgrade, `400` for an
    invalid upgrade/query, `403` for a disallowed Origin, or `404` for an unknown
-   path — **without creating a session, writer, or capacity reservation**.
+   path — **without creating a session, writer, WebSocket slot, or per-IP
+   state**; the pre-upgrade TCP slot and bounded hyper HTTP buffers are
+   allocated before validation.
 4. **Admission.** Only after validation does the relay acquire a WebSocket slot
    (`MAX_CONNECTIONS`), reserve a session slot (`MAX_SESSIONS`), acquire the
    per-IP slot, attach the socket to the session registry, and spawn its writer
@@ -166,8 +173,9 @@ The relay's core reliability rule is **source backpressure, not buffering**:
 
 1. The reader parses one frame at a time. A data-frame payload is read in 8 KiB
    chunks and each chunk is charged to the weighted ingress budget after it
-   arrives, so at most one 8 KiB chunk per connection is allocated before it is
-   accounted. The fixed 256-byte per-message overhead is charged once per
+   arrives: `chunk_bytes × ingress_weight + 192` weighted units for chunk
+   bookkeeping, so at most one 8 KiB chunk per connection is allocated before it
+   is accounted. The fixed 256-byte per-message overhead is charged once per
    message, not per fragment, and a message may contain at most 1024 fragments
    (fixed policy; exceeding it closes `1002`). A per-connection in-flight cap of
    `min(global budget, 4 × one-max-message charge)` bounds how much of the budget
@@ -180,9 +188,12 @@ The relay's core reliability rule is **source backpressure, not buffering**:
    two-message read-ahead hand-off blocks the reader while it waits. Kernel TCP
    send pressure therefore reaches the producer as TCP receive-window pressure
    instead of being absorbed into relay memory.
-4. If the budget cannot be reserved within the ingress wait timeout, or the
-   writer queue/write does not make progress within the delivery deadline, the
-   source (or the slow destination) is closed with retryable `1013`.
+4. If the budget cannot be reserved within the effective ingress wait
+   (`min(INGRESS_WAIT_TIMEOUT_MS, remaining frame/message read deadline)`), or
+   the writer queue/write does not make progress within the delivery deadline,
+   the source (or the slow destination) is closed with retryable `1013`. A
+   frame/message read timeout also closes the source with `1013`; waiting for
+   budget never extends the read deadline.
 
 Per-destination writer queues are bounded twice: a 1024-message mpsc cap plus a
 byte semaphore whose size is `max(control_queue_bytes, max_message_bytes +
@@ -195,17 +206,21 @@ control socket has its own 64 KiB frame cap.
 ### 2.5 Ingress budget
 
 A node-wide semaphore bounds *in-flight* payload bytes across all connections.
-The charge for a message is `(payload_len + 256) * ingress_weight`: the fixed
-256-byte overhead makes empty and tiny frames non-free (charged once per
-message), and the weight models the fact that a buffered payload may be retained
-more than once (read buffer, writer queue, kernel). Reservations are RAII
-guards, so cancellation, panic, or socket death always returns the bytes.
+The charge for a message is the weighted payload plus fixed bookkeeping: each
+payload chunk pays `chunk_bytes × ingress_weight + 192` (192 weighted units for
+the connection-scoped guard and vector slack), and the 256-byte per-message
+overhead pays `256 × ingress_weight` once per message. The weight models the
+fact that a buffered payload may be retained more than once (read buffer, writer
+queue, kernel); the per-chunk charge keeps many tiny chunks from bypassing the
+budget with a small unaccounted guard heap. Reservations are RAII guards, so
+cancellation, panic, or socket death always returns the bytes.
 
 Charging is incremental, not one up-front reservation for a declared frame
 length. The reader consumes a data-frame payload in 8 KiB chunks; each chunk is
 charged after it arrives and released when the frame is delivered or the
 connection dies, so at most one 8 KiB chunk per connection is allocated before
-it is charged. A per-connection in-flight cap of
+it is charged (the payload vector is not preallocated to the declared length). A
+per-connection in-flight cap of
 `min(global budget, 4 × one-max-message charge)` applies: one connection can
 hold at most that much of the weighted budget, and the 4× factor covers the
 reader's pipelining of up to four messages per connection. Together
@@ -213,9 +228,15 @@ with the fixed maximum of 1024 fragments per message, these bounds limit what a
 stalled frame or a flood of empty fragments can reserve: the declared length of
 a frame is not charged until its bytes actually arrive.
 
+`PASEO_RELAY_MAX_MESSAGE_BYTES` validation uses the worst-case weighted charge
+for one maximum-size message: payload weight plus the 256-byte per-message
+overhead plus 192 per chunk, including the 1024-fragment worst case. The
+validator requires `PASEO_RELAY_INGRESS_BUDGET_BYTES` to admit that charge; use
+`paseo-relay --check-config` for the exact value at your settings.
+
 `PASEO_RELAY_INGRESS_WEIGHT` is constrained to `4..=16`. The minimum `4` leaves
 room for the 2× transient copy (sender read buffer plus destination writer
-queue) while keeping the accounting conservative; `256` and `4` are
+queue) while keeping the accounting conservative; `256`, `192`, and `4` are
 configuration-reviewable constants, not measured allocator costs.
 
 ### 2.6 Lifecycle and graceful shutdown
@@ -279,10 +300,10 @@ session topology is unaffected).
 | # | Invariant | Enforcement |
 |---|---|---|
 | I1 | Payloads are opaque and never logged or persisted. | No payload parsing except the bounded handshake-hygiene check; metrics count bytes, never content; `serverId` and payload bytes are never logged. |
-| I2 | Memory is bounded by configuration, not by peer behavior. | Frame/message caps, 1024-fragment policy, control-frame cap, writer byte semaphore for data frames, bounded mpsc, chunked ingress charging with a per-connection in-flight cap, pre-upgrade HTTP buffer/header caps, connection/session/per-IP caps, HTTP header timeout; ping/pong frames are additionally bounded by the mpsc count and 125-byte RFC limit. |
+| I2 | Memory is bounded by configuration, not by peer behavior. | Frame/message caps, 1024-fragment policy, control-frame cap, writer byte semaphore for data frames, bounded mpsc, chunked ingress charging (payload weight plus per-chunk bookkeeping) with a per-connection in-flight cap, pre-upgrade HTTP buffer/header caps, connection/session/per-IP caps, HTTP header timeout; ping/pong frames are additionally bounded by the mpsc count and 125-byte RFC limit. |
 | I3 | A slow destination applies backpressure to its source; it never grows an unbounded queue. | Source waits for ingress budget and writer ack; delivery deadline sheds instead of buffering. |
 | I4 | A connection failure only affects that connection and its protocol-defined peers. | Detach removes only its own handle; writer ack is independent of source liveness; the only cross-socket closes are replacement (`1008`), v2 data death (`1012`), and last-client detach (`1001`). |
-| I5 | Fail closed: no half-open or silently dropped state transition. | Handshake/query errors return HTTP errors with no state; framing errors close with an explicit code; shutdown closes with `1012`. |
+| I5 | Fail closed: no half-open or silently dropped state transition. | Handshake/query errors return HTTP errors without session/writer/WebSocket/per-IP state; framing errors close with an explicit code; shutdown closes with `1012`. |
 | I6 | One relay node is the sole authority for its sessions; there is no split-brain. | No cluster membership, no shared ownership, no cross-node session state; the edge is responsible for `serverId` affinity. |
 | I7 | Drain is observable and bounded. | Readiness flips to `503` as soon as the drain starts, upgrades are rejected, the grace window is bounded, and remaining sockets close with `1012`. |
 | I8 | Topology races cannot remove a newer socket. | Per-session mutex with no awaits; socket IDs checked on detach; replacement closes are performed outside the lock. |
@@ -295,8 +316,8 @@ session topology is unaffected).
 |---|---|
 | Unknown path or unsupported method | HTTP `404` |
 | Non-upgrade request to `/ws` | HTTP `426` |
-| Invalid `serverId`, `role`, `v`, `connectionId`, or invalid upgrade headers | HTTP `400`, no state created |
-| Origin not in `PASEO_RELAY_ALLOWED_ORIGINS`, or Origin present but unparseable | HTTP `403`, no state created |
+| Invalid `serverId`, `role`, `v`, `connectionId`, or invalid upgrade headers | HTTP `400`, no session/writer/WebSocket/per-IP state created |
+| Origin not in `PASEO_RELAY_ALLOWED_ORIGINS`, or Origin present but unparseable | HTTP `403`, no session/writer/WebSocket/per-IP state created |
 | WS capacity full, session cap reached, or draining | HTTP `503` (no upgrade) |
 | Per-IP connection cap exceeded | HTTP `429` (no upgrade) |
 | TLS handshake failure (native TLS mode) | TCP connection dropped before HTTP |
@@ -305,7 +326,7 @@ session topology is unaffected).
 | Invalid UTF-8 in a text frame | WebSocket close `1007` |
 | Replaced by a newer socket | WebSocket close `1008` |
 | Invalid Paseo handshake key | WebSocket close `1008` |
-| Ingress budget exhausted past the wait timeout | WebSocket close `1013`, "Relay ingress capacity" |
+| Ingress budget exhausted past the effective wait (budget wait or remaining read deadline) | WebSocket close `1013`, "Relay ingress capacity" |
 | Delivery deadline exceeded / slow destination | WebSocket close `1013`, "Slow consumer" / "Delivery unavailable" |
 | v2 client has no data socket within the attach timeout | WebSocket close `1013`, "Data route unavailable" |
 | Graceful drain / server restart | WebSocket close `1012`, "Relay shutting down" |
@@ -347,8 +368,8 @@ implementation.
 
 | Area | Decision |
 |---|---|
-| Upgrade | Validate method/path, upgrade headers, key encoding, and query parameters before any session, writer, or capacity state; rejected requests allocate nothing. Pre-upgrade HTTP is additionally capped by hyper (`max_buf_size` 16 KiB, `max_header_size` 16 KiB, `max_headers` 64) and the header timeout. |
-| Message accounting | Charge every message a fixed overhead plus weighted payload; charge payload in 8 KiB chunks as it arrives (at most one uncharged chunk per connection); cap per-connection in-flight bytes and fragments; bound queues and read deadlines. |
+| Upgrade | Validate method/path, upgrade headers, key encoding, and query parameters before any session, writer, WebSocket, or per-IP state; rejected requests create none of those (the pre-upgrade TCP slot and bounded hyper HTTP buffers are allocated before validation). Pre-upgrade HTTP is additionally capped by hyper (`max_buf_size` 16 KiB, `max_header_size` 16 KiB, `max_headers` 64) and the header timeout. |
+| Message accounting | Charge every message a fixed overhead plus weighted payload and per-chunk bookkeeping (192 weighted units per 8 KiB chunk); charge payload in 8 KiB chunks as it arrives (at most one uncharged chunk per connection); cap per-connection in-flight bytes and fragments; bound queues and read deadlines. |
 | Isolation | No shared owner process; per-session topology lock only; source detach never closes the destination; slow consumers are shed at their own deadline. |
 | Failure | Fail closed with an explicit HTTP status or WebSocket close code; no half-open state. |
 | Scaling | Single-node only; edge `serverId` affinity; no ownership registry, reroute, or split-brain arbitration. |
@@ -381,12 +402,21 @@ implementation.
   removal.
 - **Availability is the residual risk.** With no authentication, anyone who
   learns a `serverId` can disrupt that session. This is accepted and mitigated
-  by keeping `serverId`s secret and rate-limiting at the edge.
+  by keeping `serverId`s secret and rate-limiting at the edge. A peer that can
+  send real traffic within the configured caps can also saturate the shared
+  ingress budget: roughly four connections each sending a ~32 MiB fragmented
+  message and leaving it unfinished can hold about 512 MiB weighted for up to
+  `MESSAGE_READ_TIMEOUT_MS`. This is bounded by the documented budget and read
+  deadlines, not eliminated; mitigate with edge bandwidth/rate limits. The
+  default 512 MiB global budget is slightly smaller than four maximum messages'
+  weighted charge, so a maximal four-message pipeline can see normal `1013`
+  budget backpressure.
 - **Per-IP limits are coarse.** NATed users share an IP, so the limit must be
   sized for the deployment (or disabled with `0`). Per-`serverId` quotas and
   connect-rate limits are intentionally not implemented in-process.
-- **Fixed overhead and weight are heuristics.** The 256-byte overhead and weight
-  4 are conservative rather than measured for every allocator; the weight is
+- **Fixed overhead and weight are heuristics.** The 256-byte per-message
+  overhead, the 192-unit per-chunk bookkeeping charge, and weight 4 are
+  conservative rather than measured for every allocator; the weight is
   configurable in `4..=16`, and the floor of 4 leaves room for the 2× transient
   copy. They are configuration-reviewable constants.
 - **HTTP status mapping** for admission rejections is documented in README;

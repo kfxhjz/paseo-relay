@@ -40,8 +40,8 @@ flowchart TD
 - 在边缘终止 TLS（推荐），relay 只监听私网，并转发 WebSocket upgrade；或
 - 挂载 PEM 证书链和私钥，设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`，
   由 relay 用 rustls 直接提供 HTTPS/WSS。两者必须同时设置，否则启动失败；文件必须
-  对 relay 用户（镜像内 UID 65532）可读，`paseo-relay --check-config` 会校验
-  可读性。
+  是 relay 用户（镜像内 UID 65532）可读的常规文件，`paseo-relay --check-config`
+  会校验。
 
 Paseo payload 虽然 E2EE，但 `serverId`、连接元数据和可用性仍会暴露给明文网络上的
 被动/主动攻击者，所以公网不能只跑 `ws://`。
@@ -60,7 +60,8 @@ LB 必须：
 示例：
 
 - Nginx：[examples/nginx.conf](../../examples/nginx.conf) —— TLS 边缘、一致性哈希、
-  per-IP 连接/速率限制、屏蔽运维端点，访问日志不记录 query string。
+  per-IP 连接/速率限制、屏蔽 `/metrics` 与 `/version` 且 `/ready` 只允许私网范围，
+  访问日志不记录 query string。
 - HAProxy：[examples/haproxy.cfg](../../examples/haproxy.cfg) —— 一致性哈希、
   `/ready` 检查、拒绝运维端点、per-source 连接/速率限制，日志格式不记录 query string。
 - Kubernetes + ingress-nginx：Ingress annotation 设为
@@ -91,6 +92,7 @@ LB 终止连接后，relay 看到的每个连接都来自代理 IP。此时
 策略和比 drain 宽限期更长的 stop timeout（`--rm` 与 `--restart` 互斥）：
 
 ```sh
+# 按约 512 MB 主机设置；提高内存时一起调高（见“容量规划”）。
 docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
 docker run -d \
   --name paseo-relay \
@@ -99,6 +101,10 @@ docker run -d \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
+  -e PASEO_RELAY_MAX_CONNECTIONS=4000 \
+  -e PASEO_RELAY_MAX_SESSIONS=4000 \
+  -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
+  -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
   ghcr.io/kfxhjz/paseo-relay:v0.1.1
 ```
 
@@ -116,6 +122,7 @@ TLS 端口（例如 `-p 0.0.0.0:443:4000`）。
 `v0.1.1` 对应的多架构 index digest，而不是 tag：
 
 ```sh
+# 按约 512 MB 主机设置；提高内存时一起调高（见“容量规划”）。
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -123,6 +130,10 @@ docker run -d \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   -p 127.0.0.1:4000:4000 \
+  -e PASEO_RELAY_MAX_CONNECTIONS=4000 \
+  -e PASEO_RELAY_MAX_SESSIONS=4000 \
+  -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
+  -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
   ghcr.io/kfxhjz/paseo-relay@sha256:<digest>
 ```
 
@@ -159,7 +170,8 @@ docker compose -f examples/docker-compose.yml \
   `MAX_SESSIONS=8000`、`MAX_TCP_CONNECTIONS=10000`，ingress 预算 129 MiB）；
 - NetworkPolicy：只允许 ingress controller/proxy namespace 访问 4000 端口；
   `/metrics` 只给监控（NetworkPolicy 只到 L3/L4，运维路径要在 ingress 过滤，或从
-  内网 Service 抓取）；
+  内网 Service 抓取）。部分 CNI 也会把 NetworkPolicy 应用到 kubelet 探针流量；如果
+  探针失败，按示例注释允许 node CIDR 访问 4000；
 - 保持 replicas 稳定。扩容时增加 relay 节点并更新边缘一致性哈希环；不要用会让
   环频繁重排的 HPA。
 
@@ -209,21 +221,27 @@ sequenceDiagram
 
 内存分两部分：idle/upgrade 前 socket 与 in-flight payload 记账。
 
-- **Idle socket。** 一个已接受 socket 约占 23 KiB（hyper 读写缓冲加 task），因此
-  idle 时按 `MAX_TCP_CONNECTIONS × ~30 KiB` 预留。内置默认值
+- **Idle socket。** relay 在边缘后为明文时（hyper 读写缓冲加 task）一个已接受
+  socket 约占 23 KiB，原生 TLS（rustls 缓冲）时约 33 KiB，因此 idle 时按
+  `MAX_TCP_CONNECTIONS × ~30 KiB`（明文）或 `× ~35 KiB`（原生 TLS）预留。内置默认值
   （25,000 TCP / 20,000 WebSocket）在没有任何 payload 流量前就需要约
-  700–800 MiB；512 MB 容器必须调低 `PASEO_RELAY_MAX_TCP_CONNECTIONS`、
-  `PASEO_RELAY_MAX_CONNECTIONS` 和 `PASEO_RELAY_MAX_SESSIONS`（Compose 示例使用
-  5,000 / 4,000 / 4,000）。hyper builder 限制了 upgrade 前请求缓冲
-  （`max_buf_size` 16 KiB、`max_header_size` 16 KiB、`max_headers` 64），
-  `PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS` 限制 header 阶段，但这些限制不会让 idle
-  socket 变得免费。
+  700–800 MiB（明文）或约 850–900 MiB（原生 TLS）；512 MB 容器必须调低
+  `PASEO_RELAY_MAX_TCP_CONNECTIONS`、`PASEO_RELAY_MAX_CONNECTIONS` 和
+  `PASEO_RELAY_MAX_SESSIONS`（Compose 示例使用 5,000 / 4,000 / 4,000）。hyper
+  builder 限制了 upgrade 前请求缓冲（`max_buf_size` 16 KiB、`max_header_size`
+  16 KiB、`max_headers` 64），`PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS` 限制 header
+  阶段，但这些限制不会让 idle socket 变得免费。
 - `PASEO_RELAY_INGRESS_BUDGET_BYTES`（默认 512 MiB 加权）限制 in-flight payload
-  记账；它按 8 KiB chunk 随 payload 字节到达计费，单个连接最多持有
-  `min(budget, 4 × 一条最大消息的计费)`。
+  记账；每个 8 KiB chunk 到达时按 `chunk_bytes × weight + 192` 计费（每 chunk
+  记账），单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)`。校验器要求预算
+  能容纳一条最大消息及这些记账；具体下限用 `--check-config` 查看（129 MiB 的
+  Compose 预算仍然通过）。
 - `PASEO_RELAY_MAX_TCP_CONNECTIONS` 是 OS socket 总上限，包含 upgrade 后的
-  WebSocket（slot 在整个 socket 生命周期内持有），因此
-  `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` 有意义。
+  WebSocket（slot 在整个 socket 生命周期内持有），因此必须满足
+  `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS`。同时要在 `MAX_CONNECTIONS` 之上留出
+  余量（至少 64–128 个空槽，探针突发时更多）：否则满 WebSocket 负载会占满 TCP
+  slot，`/health`、`/ready`、`/metrics`、镜像 HEALTHCHECK 和 k8s 探针都会在 accept
+  阶段被拒绝。仓库示例使用 4000/5000 和 8000/10000；内置默认值是 20000/25000。
 - `PASEO_RELAY_MAX_SESSIONS`（默认 20,000）限制 idle `serverId` 条目。
 - `PASEO_RELAY_CONTROL_QUEUE_BYTES` / writer 队列限制每 destination 缓冲。
 

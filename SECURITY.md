@@ -53,6 +53,15 @@ treat pairing links and QR codes as secrets. There is no relay-level
 authentication by design; deployments that need stronger isolation should put
 the relay behind a VPN/mTLS or an authenticated edge.
 
+**Residual availability risk.** A peer that can send real traffic within the
+configured caps can still saturate the shared ingress budget: roughly four
+connections each sending a ~32 MiB fragmented message and leaving it unfinished
+can hold about 512 MiB weighted for up to `MESSAGE_READ_TIMEOUT_MS`. This is
+bounded by the documented budget and read deadlines, not eliminated; mitigate
+with edge bandwidth/rate limits. The default 512 MiB global budget is slightly
+smaller than four maximum messages' weighted charge, so a maximal four-message
+pipeline can see normal `1013` budget backpressure.
+
 In scope:
 
 - memory-safety or panic bugs reachable from network input;
@@ -78,6 +87,8 @@ examples in [docs/deployment.md](docs/deployment.md). At minimum: terminate TLS,
 do not expose `/metrics` or `/ready` publicly, apply per-IP limits at the edge,
 run the container read-only as the provided non-root user, and keep the relay
 and Rust toolchain up to date. Size the connection caps to host memory: an idle
-accepted socket costs roughly 23 KiB, so plan for
-`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` (the built-in 25,000-socket default
-needs ~700–800 MiB) and lower the caps on small nodes.
+accepted socket costs roughly 23 KiB when the relay is plaintext behind an edge,
+or ~33 KiB with native TLS, so plan for
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB` (native
+TLS); the built-in 25,000-socket default needs ~700–800 MiB plaintext or
+~850–900 MiB with native TLS, so lower the caps on small nodes.

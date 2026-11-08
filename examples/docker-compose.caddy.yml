@@ -35,11 +35,13 @@ services:
       PASEO_RELAY_PORT: "4000"
       PASEO_RELAY_LOG: "info"
       PASEO_RELAY_LOG_FORMAT: "json"
-      # 129 MiB weighted ingress for a small VPS. The validator requires
-      # >= (MAX_MESSAGE_BYTES + 256) * INGRESS_WEIGHT = 134,218,696 bytes, and
-      # 128 MiB (134,217,728) is just below that floor, so the container would
-      # refuse to start. 135,266,304 = 129 MiB clears it. The built-in default
-      # is 512 MiB; raise this together with the memory limit.
+      # 129 MiB weighted ingress for a small VPS. The validator requires room
+      # for one maximum message including the 256-byte per-message overhead and
+      # 192-per-chunk bookkeeping (135,201,736 bytes at the defaults), and the
+      # old 128 MiB (134,217,728) was below that floor, so the container
+      # refused to start. 135,266,304 = 129 MiB clears it with ~64.6 KB
+      # headroom; use `paseo-relay --check-config` for your settings. The
+      # built-in default is 512 MiB; raise this together with the memory limit.
       PASEO_RELAY_INGRESS_BUDGET_BYTES: "${PASEO_RELAY_INGRESS_BUDGET_BYTES:-135266304}"
       # Sized for a 512 MB container; raise together with PASEO_RELAY_MEM_LIMIT.
       # An idle accepted socket costs ~23 KiB, so keep MAX_TCP_CONNECTIONS well
