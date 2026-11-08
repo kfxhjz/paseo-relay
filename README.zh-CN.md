@@ -33,10 +33,10 @@
 先在前台试跑已发布的多架构镜像（不需要 Rust 工具链）：
 
 ```sh
-# GHCR tag：v0.1.1 和 latest
+# GHCR tag：v0.1.2 和 latest
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.1
+  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.2
 
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
@@ -58,7 +58,7 @@ docker run -d \
   -e PASEO_RELAY_MAX_SESSIONS=4000 \
   -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
   -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.1
+  ghcr.io/kfxhjz/paseo-relay:v0.1.2
 ```
 
 这条命令只监听 loopback；公网流量请在前面终止 TLS
@@ -82,7 +82,7 @@ docker run --rm --read-only --cap-drop ALL \
 单节点故障模型简单，并且不想维护 Erlang 运行时。**不适合：** 需要内置集群、
 ownership failover 或 relay 级认证的部署（见[限制与非目标](#限制与非目标)）。
 
-项目状态：`v0.1.1` —— 已通过 Paseo 官方 relay 传输 E2E；`1.0` 之前接口仍可能演进。
+项目状态：`v0.1.2` —— 已通过 Paseo 官方 relay 传输 E2E；`1.0` 之前接口仍可能演进。
 
 ## 与 Paseo 配合使用
 
@@ -178,22 +178,22 @@ probe 脚本和输出未提交，因此只作为补充材料，不是可复现�
 
 ## 部署
 
-发布 `v0.1.1` 会把多架构（`linux/amd64`、`linux/arm64`）镜像发布到 GHCR，
+发布 `v0.1.2` 会把多架构（`linux/amd64`、`linux/arm64`）镜像发布到 GHCR，
 附带 **每个平台独立** 的 provenance 和 SBOM attestation（多架构 index 本身没有
 index 级 attestation）。直接用短版本 tag 即可；tag 带前导 `v`（不带 `v` 的
-`0.1.1` 没有发布）：
+`0.1.2` 没有发布）：
 
-- **镜像 tag：** `ghcr.io/kfxhjz/paseo-relay:v0.1.1`（同时打 `latest`；只有
+- **镜像 tag：** `ghcr.io/kfxhjz/paseo-relay:v0.1.2`（同时打 `latest`；只有
   stable release tag 会移动 `latest`，预发布 tag 不会）。
 
 可以用以下命令检查已发布镜像：
 
 ```sh
-docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.1
+docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.2
 ```
 
-如果部署策略要求不可变引用，请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
-中 `v0.1.1` 对应的多架构 index digest，而不是 tag。
+如果部署策略要求不可变引用，请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2)
+中 `v0.1.2` 对应的多架构 index digest，而不是 tag。
 
 两种拓扑使用同一个镜像；区别在于前置的边缘如何做路由亲和：
 
@@ -291,7 +291,7 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 - **没有 per-user 配额/relay 认证**：公共运营者必须在边缘做限制并提供隐私/滥用
   政策；见 [operator-policy.md](docs/zh-CN/operator-policy.md)。
 - **没有第三方安全审计**：这里的证据是代码评审、真实 socket 测试、fuzz scaffold
-  和 Paseo 兼容性套件。v0.1.1 是早期软件，依赖前请先阅读威胁模型。
+  和 Paseo 兼容性套件。v0.1.2 是早期软件，依赖前请先阅读威胁模型。
 - **尚未在互联网规模验证**：仓库 benchmark 是 loopback；大规模公开部署前请自己
   做容量测试并持续监控。
 

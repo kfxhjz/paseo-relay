@@ -36,10 +36,10 @@ forwarded opaquely.
 Try the published multi-arch image in the foreground (no Rust toolchain needed):
 
 ```sh
-# GHCR tags: v0.1.1 and latest
+# GHCR tags: v0.1.2 and latest
 docker run --rm --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
-  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.1
+  -p 127.0.0.1:4000:4000 ghcr.io/kfxhjz/paseo-relay:v0.1.2
 
 curl http://127.0.0.1:4000/health   # {"status":"ok"}
 curl http://127.0.0.1:4000/ready    # {"status":"ready"}
@@ -62,7 +62,7 @@ docker run -d \
   -e PASEO_RELAY_MAX_SESSIONS=4000 \
   -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
   -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.1
+  ghcr.io/kfxhjz/paseo-relay:v0.1.2
 ```
 
 This keeps the relay on loopback. For public traffic terminate TLS in front of
@@ -89,7 +89,7 @@ small, auditable relay with a simple single-node failure model and no Erlang
 operational surface. **Not for:** deployments that need built-in clustering,
 ownership failover, or relay-level authentication (see [Limitations](#limitations-and-non-goals)).
 
-Project status: `v0.1.1` — wire-compatible and already passing Paseo's own relay
+Project status: `v0.1.2` — wire-compatible and already passing Paseo's own relay
 transport E2E; interfaces may still evolve before `1.0`.
 
 ## Use it with Paseo
@@ -196,23 +196,23 @@ codes, and known differences from the Elixir relay.
 
 ## Deployment
 
-Release `v0.1.1` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+Release `v0.1.2` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
 GHCR with per-platform provenance and SBOM attestations (the multi-arch index
 itself has no index-level attestation). Use the short version tag; the tag
-includes the leading `v` (`0.1.1` without it is not published):
+includes the leading `v` (`0.1.2` without it is not published):
 
-- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.1` (also tagged `latest`; only
+- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.2` (also tagged `latest`; only
   stable release tags move `latest`, so prerelease tags do not).
 
 Inspect the published image with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.1
+docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.2
 ```
 
 If your policy requires an immutable reference, pin the multi-arch index digest
-for `v0.1.1` from the
-[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
+for `v0.1.2` from the
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2)
 instead of the tag.
 
 Both topologies use the same image; the edge in front of it does the routing
@@ -327,7 +327,7 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
   limits and a privacy/abuse policy; see [operator-policy.md](docs/operator-policy.md).
 - **No third-party security audit**: the evidence here is code review,
   real-socket tests, fuzzing scaffolds, and the Paseo compatibility suite. Treat
-  v0.1.1 as early software and review the threat model before relying on it.
+  v0.1.2 as early software and review the threat model before relying on it.
 - **Not proven at internet scale**: the included benchmark is loopback; run your
   own capacity tests and monitor before a large public deployment.
 

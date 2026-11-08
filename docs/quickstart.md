@@ -34,7 +34,7 @@ docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
 The Compose file pulls the current release,
-`ghcr.io/kfxhjz/paseo-relay:v0.1.1`; `latest` follows the newest stable release
+`ghcr.io/kfxhjz/paseo-relay:v0.1.2`; `latest` follows the newest stable release
 (prerelease tags do not move it). Set `PASEO_RELAY_IMAGE` to override the
 version, and see [deployment.md](deployment.md) if you need an immutable digest
 pin. The example also caps `PASEO_RELAY_MAX_CONNECTIONS` (4,000),

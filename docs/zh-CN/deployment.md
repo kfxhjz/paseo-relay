@@ -93,7 +93,7 @@ LB 终止连接后，relay 看到的每个连接都来自代理 IP。此时
 
 ```sh
 # 按约 512 MB 主机设置；提高内存时一起调高（见“容量规划”）。
-docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.2
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -105,7 +105,7 @@ docker run -d \
   -e PASEO_RELAY_MAX_SESSIONS=4000 \
   -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
   -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.1
+  ghcr.io/kfxhjz/paseo-relay:v0.1.2
 ```
 
 只想临时前台试跑时，去掉 `-d`/`--restart`/`--stop-timeout`、加上 `--rm`，再用
@@ -116,10 +116,10 @@ docker run -d \
 TLS，请挂载 PEM 证书、设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`，并发布
 TLS 端口（例如 `-p 0.0.0.0:443:4000`）。
 
-`v0.1.1` 是当前 release tag，`latest` 跟随最新 **stable** release。预发布 tag
+`v0.1.2` 是当前 release tag，`latest` 跟随最新 **stable** release。预发布 tag
 （任何包含 `-` 的 tag，例如 `v0.2.0-rc1`）不会移动 `latest`。如果需要不可变引用，
-请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1) 中
-`v0.1.1` 对应的多架构 index digest，而不是 tag：
+请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2) 中
+`v0.1.2` 对应的多架构 index digest，而不是 tag：
 
 ```sh
 # 按约 512 MB 主机设置；提高内存时一起调高（见“容量规划”）。

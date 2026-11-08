@@ -110,7 +110,7 @@ than the drain grace window (`--rm` and `--restart` are mutually exclusive):
 
 ```sh
 # Sized for ~512 MB; raise with RAM (see "Capacity sizing").
-docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.1
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.2
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -122,7 +122,7 @@ docker run -d \
   -e PASEO_RELAY_MAX_SESSIONS=4000 \
   -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
   -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.1
+  ghcr.io/kfxhjz/paseo-relay:v0.1.2
 ```
 
 For a one-off foreground check, drop `-d`/`--restart`/`--stop-timeout`, add
@@ -134,11 +134,11 @@ an edge proxy. To serve TLS directly from the relay, mount the PEM files, set
 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`, and publish the TLS port (for
 example `-p 0.0.0.0:443:4000`).
 
-`v0.1.1` is the current release tag and `latest` follows the newest **stable**
+`v0.1.2` is the current release tag and `latest` follows the newest **stable**
 release. Prerelease tags (any tag containing `-`, for example `v0.2.0-rc1`) do
 not move `latest`. For an immutable reference, pin the multi-arch index digest
-for `v0.1.1` listed in the
-[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
+for `v0.1.2` listed in the
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2)
 instead of the tag:
 
 ```sh

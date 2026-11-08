@@ -31,7 +31,7 @@ RELAY_DOMAIN=relay.example.com \
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
-Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.1`；`latest` 跟随
+Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.2`；`latest` 跟随
 最新 **stable** release（预发布 tag 不会移动它）。可用 `PASEO_RELAY_IMAGE`
 覆盖版本；如果需要固定不可变的 digest，见[部署指南](deployment.md)。示例还把
 `PASEO_RELAY_MAX_CONNECTIONS`（4,000）、`PASEO_RELAY_MAX_SESSIONS`（4,000）、

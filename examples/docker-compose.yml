@@ -11,7 +11,7 @@
 # examples/haproxy.cfg). Expose the relay only on a private interface.
 services:
   paseo-relay:
-    image: "${PASEO_RELAY_IMAGE:-ghcr.io/kfxhjz/paseo-relay:v0.1.1}"
+    image: "${PASEO_RELAY_IMAGE:-ghcr.io/kfxhjz/paseo-relay:v0.1.2}"
     restart: unless-stopped
     read_only: true
     cap_drop: ["ALL"]
