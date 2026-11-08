@@ -4,9 +4,11 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege by default: reading the repository is enough for checkout
+# and verification. The image and publish jobs opt in to `packages: write`
+# below because only they push to GHCR.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 # Serialise releases so two tags pushed close together cannot race `latest`.
 concurrency:
@@ -41,6 +43,10 @@ jobs:
   image:
     name: Build ${{ matrix.platform }} image
     needs: verify
+    # Push per-platform digests to GHCR; no repository write access is needed.
+    permissions:
+      contents: read
+      packages: write
     # Build each architecture on a matching native runner. This avoids the
     # slow QEMU emulation that dominated the previous single-job build.
     runs-on: ${{ matrix.runner }}
@@ -102,6 +108,11 @@ jobs:
   publish:
     name: Publish multi-arch image and release
     needs: image
+    # Assemble the GHCR manifest (`packages: write`) and create the GitHub
+    # release (`contents: write`).
+    permissions:
+      contents: write
+      packages: write
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -130,9 +141,17 @@ jobs:
             echo "expected 2 platform digests, found ${#sources[@]}" >&2
             exit 1
           fi
+          # Move the floating `latest` tag only for stable releases. Prerelease
+          # tags such as `v1.0.0-rc1` or `v1.0.0-beta.1` contain a '-' and must
+          # not become `latest`, otherwise a pre-release would silently replace
+          # the current stable image. Every tag (including prereleases) still
+          # gets its own immutable version tag.
+          tag_args=(--tag "${name}:${tag}")
+          if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
+            tag_args+=(--tag "${name}:latest")
+          fi
           docker buildx imagetools create \
-            --tag "${name}:${tag}" \
-            --tag "${name}:latest" \
+            "${tag_args[@]}" \
             "${sources[@]}"
           digest="$(docker buildx imagetools inspect "${name}:${tag}" | awk '/^Digest:/ {print $NF; exit}')"
           test -n "${digest}"

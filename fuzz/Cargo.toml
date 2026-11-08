@@ -8,8 +8,16 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
+futures = "0.3"
+http = "1"
 libfuzzer-sys = "0.4"
 paseo-relay = { path = ".." }
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "handshake"
@@ -20,5 +28,11 @@ doc = false
 [[bin]]
 name = "protocol"
 path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "upgrade"
+path = "fuzz_targets/upgrade.rs"
 test = false
 doc = false
