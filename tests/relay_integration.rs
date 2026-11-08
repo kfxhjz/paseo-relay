@@ -84,6 +84,81 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
     (status, body)
 }
 
+async fn raw_bytes_http(addr: std::net::SocketAddr, request: &[u8]) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect http");
+    stream.write_all(request).await.unwrap();
+    let mut buffer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buffer)).await;
+    let text = String::from_utf8_lossy(&buffer).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+/// Raw WebSocket upgrade returning the underlying stream (used to send
+/// hand-crafted frames that tungstenite cannot express).
+async fn raw_ws(addr: std::net::SocketAddr, query: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.expect("connect ws");
+    let request = upgrade_request(
+        addr,
+        &format!("/ws?{query}"),
+        Some("dGhlIHNhbXBsZSBub25jZQ=="),
+    )
+    .await;
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buffer = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .expect("read upgrade response");
+        assert!(read > 0, "upgrade response ended early");
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    assert!(text.starts_with("HTTP/1.1 101"), "upgrade failed: {text}");
+    stream
+}
+
+/// Masked client frame header without a payload (client frames must be masked).
+fn masked_frame_header(opcode: u8, length: usize, mask: [u8; 4]) -> Vec<u8> {
+    let mut out = vec![0x80 | opcode];
+    if length <= 125 {
+        out.push(0x80 | length as u8);
+    } else if length <= usize::from(u16::MAX) {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+    } else {
+        out.push(0x80 | 127);
+        out.extend_from_slice(&(length as u64).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    out
+}
+
+/// Like http_get, but tolerates a connection reset: the TCP-capacity path writes
+/// a 503 and closes without draining the request, which can produce an RST.
+async fn lenient_http_status(addr: std::net::SocketAddr, path: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut buffer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buffer)).await;
+    let text = String::from_utf8_lossy(&buffer);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+}
+
 async fn raw_http(addr: std::net::SocketAddr, request: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect http");
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -121,6 +196,7 @@ async fn health_ready_and_metrics() {
     assert_eq!(status, 200);
     assert!(body.contains("paseo_relay_ready 1"));
     assert!(body.contains("paseo_relay_active_websockets 0"));
+    assert!(body.contains("paseo_relay_ingress_budget_bytes 536870912"));
     let (status, _) = http_get(addr, "/nope").await;
     assert_eq!(status, 404);
     server.shutdown().await;
@@ -427,7 +503,6 @@ async fn ingress_budget_rejects_excess_sources() {
     let mut config = test_config();
     config.max_message_bytes = 1024;
     config.ingress_budget_bytes = 6 * 1024;
-    config.ingress_weight = 1;
     config.ingress_wait_timeout = Duration::from_millis(50);
     config.data_attach_timeout = Duration::from_millis(500);
     let (server, addr) = start(config).await;
@@ -813,5 +888,103 @@ async fn version_endpoint_reports_build() {
     let value: Value = serde_json::from_str(&body).unwrap();
     assert!(!value["version"].as_str().unwrap().is_empty());
     assert!(!value["revision"].as_str().unwrap().is_empty());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_frame_header_does_not_reserve_the_whole_budget() {
+    // Regression for the audit finding: a frame header declaring a maximum
+    // payload must not reserve the full message before payload bytes arrive.
+    let mut config = test_config();
+    config.max_message_bytes = 32 * 1024;
+    config.ingress_budget_bytes = 256 * 1024;
+    config.ingress_wait_timeout = Duration::from_millis(200);
+    let (server, addr) = start(config).await;
+
+    let mut attacker = raw_ws(addr, "serverId=srv_stalled&role=client&v=1").await;
+    attacker
+        .write_all(&masked_frame_header(
+            0x2,
+            32 * 1024,
+            [0x11, 0x22, 0x33, 0x44],
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut daemon = connect(addr, "serverId=srv_legit&role=server&v=1").await;
+    let mut client = connect(addr, "serverId=srv_legit&role=client&v=1").await;
+    client
+        .send(Message::Text("still-works".into()))
+        .await
+        .unwrap();
+    let received = next(&mut daemon).await;
+    assert_eq!(received, Message::Text("still-works".into()));
+
+    drop(attacker);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_preupgrade_headers_are_rejected() {
+    let (server, addr) = start(test_config()).await;
+    let mut request = b"GET /health HTTP/1.1\r\nHost: x\r\nX-Fill: ".to_vec();
+    request.extend(std::iter::repeat_n(b'a', 20 * 1024));
+    let (status, text) = raw_bytes_http(addr, &request).await;
+    assert_eq!(status, 431, "expected 431, got {text:?}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn unparseable_origin_is_rejected_when_allowlist_configured() {
+    let mut config = test_config();
+    config.allowed_origins = vec!["https://app.example".to_owned()];
+    let (server, addr) = start(config).await;
+
+    let mut request = b"GET /ws?serverId=srv_origin&role=client HTTP/1.1\r\nHost: x\r\n\
+        Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: "
+        .to_vec();
+    request.push(0xFF);
+    request.extend_from_slice(b"\r\n\r\n");
+    let (status, _text) = raw_bytes_http(addr, &request).await;
+    assert_eq!(status, 403);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_slot_is_held_for_upgraded_sockets() {
+    // Regression for the audit finding: upgrading a connection must not release
+    // the TCP slot, so MAX_TCP_CONNECTIONS bounds all open sockets.
+    let mut config = test_config();
+    config.max_connections = 1;
+    config.max_sessions = 4;
+    config.max_tcp_connections = 1;
+    let (server, addr) = start(config).await;
+
+    let ws = connect(addr, "serverId=srv_slot&role=server&v=1").await;
+    let denied = lenient_http_status(addr, "/health").await;
+    assert_ne!(
+        denied,
+        Some(200),
+        "an upgraded socket must still hold its TCP slot (got {denied:?})"
+    );
+
+    drop(ws);
+    let mut status = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(value) = lenient_http_status(addr, "/health").await {
+            status = Some(value);
+            if value == 200 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        status,
+        Some(200),
+        "TCP slot must be released when the socket ends"
+    );
     server.shutdown().await;
 }

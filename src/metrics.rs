@@ -55,11 +55,13 @@ impl Metrics {
         let _ = self.max_frame_bytes.fetch_max(bytes, Ordering::Relaxed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         active_websockets: u64,
         active_sessions: u64,
         ingress_reserved_bytes: u64,
+        ingress_budget_bytes: u64,
         ready: bool,
         draining: bool,
     ) -> String {
@@ -100,6 +102,13 @@ impl Metrics {
             "gauge",
             "Weighted ingress bytes currently reserved.",
             ingress_reserved_bytes,
+        );
+        metric(
+            &mut out,
+            "paseo_relay_ingress_budget_bytes",
+            "gauge",
+            "Configured weighted ingress budget for this node.",
+            ingress_budget_bytes,
         );
         counter(
             &mut out,
@@ -203,12 +212,13 @@ mod tests {
     fn renders_prometheus_lines() {
         let metrics = Metrics::new();
         Metrics::inc(&metrics.handshake_rejected);
-        let text = metrics.render(2, 1, 3, true, false);
+        let text = metrics.render(2, 1, 3, 1024, true, false);
         assert!(text.contains("paseo_relay_ready 1"));
         assert!(text.contains("paseo_relay_draining 0"));
         assert!(text.contains("paseo_relay_active_websockets 2"));
         assert!(text.contains("paseo_relay_active_sessions 1"));
         assert!(text.contains("paseo_relay_ingress_reserved_bytes 3"));
+        assert!(text.contains("paseo_relay_ingress_budget_bytes 1024"));
         assert!(text.contains("paseo_relay_handshake_rejected_total 1"));
         assert!(text.contains("# TYPE paseo_relay_ready gauge"));
     }

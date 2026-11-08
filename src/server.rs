@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::capacity::Capacity;
+use crate::capacity::{Capacity, TcpSlot};
 use crate::config::Config;
 use crate::connection::run_connection;
 use crate::metrics::Metrics;
@@ -148,13 +148,18 @@ async fn accept_loop(
                 configure_tcp(&stream, state.config.tcp_keepalive);
                 let state = Arc::clone(&state);
                 let tls = tls.clone();
+                // The TCP slot moves into the upgraded connection when the
+                // handshake succeeds; otherwise it is released when this task
+                // (and thus the holder) is dropped.
+                let preupgrade_slot = Arc::new(Mutex::new(Some(tcp_slot)));
                 tasks.spawn(async move {
+                    let slot_holder = Arc::clone(&preupgrade_slot);
                     match tls {
                         Some(acceptor) => {
                             let timeout = state.config.http_header_timeout;
                             match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
                                 Ok(Ok(tls_stream)) => {
-                                    serve_http(tls_stream, state, peer).await;
+                                    serve_http(tls_stream, state, peer, slot_holder).await;
                                 }
                                 Ok(Err(error)) => {
                                     tracing::debug!(error = %error, peer = %peer, "tls handshake failed");
@@ -164,9 +169,8 @@ async fn accept_loop(
                                 }
                             }
                         }
-                        None => serve_http(stream, state, peer).await,
+                        None => serve_http(stream, state, peer, slot_holder).await,
                     }
-                    drop(tcp_slot);
                 });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
@@ -202,19 +206,30 @@ async fn accept_loop(
     tracing::info!("relay stopped");
 }
 
-async fn serve_http<S>(stream: S, state: Arc<AppState>, peer: SocketAddr)
-where
+async fn serve_http<S>(
+    stream: S,
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    preupgrade_slot: Arc<Mutex<Option<TcpSlot>>>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
     let header_timeout = state.config.http_header_timeout;
     let service_state = Arc::clone(&state);
+    let service_slot = Arc::clone(&preupgrade_slot);
     let service = service_fn(move |request| {
         let state = Arc::clone(&service_state);
-        async move { handle_request(request, state, peer).await }
+        let slot = Arc::clone(&service_slot);
+        async move { handle_request(request, state, peer, slot).await }
     });
     let connection = http1::Builder::new()
         .header_read_timeout(header_timeout)
+        // Bound pre-upgrade memory: a peer cannot make hyper buffer the
+        // default ~408 KiB per connection before WebSocket admission.
+        .max_buf_size(16 * 1024)
+        .max_header_size(16 * 1024)
+        .max_headers(64)
         .timer(TokioTimer::new())
         .keep_alive(true)
         .serve_connection(io, service)
@@ -228,6 +243,7 @@ async fn handle_request(
     request: Request<Incoming>,
     state: Arc<AppState>,
     peer: SocketAddr,
+    preupgrade_slot: Arc<Mutex<Option<TcpSlot>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
@@ -260,11 +276,14 @@ async fn handle_request(
                 state.capacity.active_websockets(),
                 state.sessions.active_count(),
                 state.capacity.ingress_reserved_bytes(),
+                state.capacity.ingress.limit(),
                 state.ready(),
                 state.draining.load(Ordering::Relaxed),
             ))))
             .expect("valid metrics response")),
-        "/ws" if method == Method::GET => Ok(handle_ws(request, state, peer).await),
+        "/ws" if method == Method::GET => {
+            Ok(handle_ws(request, state, peer, preupgrade_slot).await)
+        }
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found\n")),
     }
 }
@@ -273,6 +292,7 @@ async fn handle_ws(
     mut request: Request<Incoming>,
     state: Arc<AppState>,
     peer: SocketAddr,
+    preupgrade_slot: Arc<Mutex<Option<TcpSlot>>>,
 ) -> Response<Full<Bytes>> {
     // Fail fast while draining; no session or capacity state is touched.
     if state.draining.load(Ordering::Relaxed)
@@ -284,7 +304,7 @@ async fn handle_ws(
         return json_response(StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"unready"}"#);
     }
 
-    if !origin_allowed(&request, &state.config.allowed_origins) {
+    if !origin_allowed(request.headers(), &state.config.allowed_origins) {
         Metrics::inc(&state.metrics.connection_rejections);
         return text_response(StatusCode::FORBIDDEN, "origin not allowed\n");
     }
@@ -349,12 +369,21 @@ async fn handle_ws(
         .body(Full::new(Bytes::new()))
         .expect("valid websocket upgrade response");
 
+    // Move the pre-upgrade TCP slot into the upgraded connection so
+    // MAX_TCP_CONNECTIONS stays the total open-socket cap.
+    let tcp_slot = preupgrade_slot
+        .lock()
+        .expect("pre-upgrade slot mutex poisoned")
+        .take();
     let state = Arc::clone(&state);
     let tracker = state.ws_tasks.clone();
     tracker.spawn(async move {
         match tokio::time::timeout(Duration::from_secs(10), on_upgrade).await {
             Ok(Ok(upgraded)) => {
-                run_connection(upgraded, connection, state, ws_slot, ip_guard, peer).await;
+                run_connection(
+                    upgraded, connection, state, ws_slot, ip_guard, tcp_slot, peer,
+                )
+                .await;
             }
             Ok(Err(error)) => {
                 tracing::debug!(error = %error, peer = %peer, "websocket upgrade failed");
@@ -369,19 +398,19 @@ async fn handle_ws(
     response
 }
 
-fn origin_allowed(request: &Request<Incoming>, allowed: &[String]) -> bool {
+fn origin_allowed(headers: &http::HeaderMap, allowed: &[String]) -> bool {
     if allowed.is_empty() {
         return true;
     }
-    let Some(origin) = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(value) = headers.get(header::ORIGIN) else {
         // Native Paseo clients (mobile/CLI/daemon) do not send Origin. The
         // allowlist exists to stop browser cross-site WebSocket hijacking, and
         // browsers always send Origin, so an absent header is safe to allow.
         return true;
+    };
+    // A present-but-unparseable Origin cannot match the allowlist; fail closed.
+    let Ok(origin) = value.to_str() else {
+        return false;
     };
     let set: HashSet<&str> = allowed.iter().map(String::as_str).collect();
     set.contains(origin)
@@ -444,4 +473,34 @@ fn build_tls(config: &Config) -> Result<Option<tokio_rustls::TlsAcceptor>> {
     Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(
         server_config,
     ))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+
+    #[test]
+    fn origin_allowlist_matches_exactly_and_fails_closed_on_bad_header() {
+        let allowed = vec!["https://app.example".to_owned()];
+        assert!(origin_allowed(&http::HeaderMap::new(), &allowed));
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://app.example"),
+        );
+        assert!(origin_allowed(&headers, &allowed));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(!origin_allowed(&headers, &allowed));
+
+        headers.insert(header::ORIGIN, HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(!origin_allowed(&headers, &allowed));
+
+        assert!(origin_allowed(&headers, &[]));
+    }
 }

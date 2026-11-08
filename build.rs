@@ -17,7 +17,23 @@ fn main() {
         .or_else(git_revision)
         .unwrap_or_else(|| "unknown".to_owned());
 
-    println!("cargo:rustc-env=PASEO_RELAY_BUILD_REVISION={revision}");
+    println!(
+        "cargo:rustc-env=PASEO_RELAY_BUILD_REVISION={}",
+        sanitize(&revision)
+    );
+}
+
+/// Keep the embedded revision safe for JSON, Prometheus labels, and logs.
+fn sanitize(value: &str) -> String {
+    let mut sanitized: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .take(64)
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("unknown");
+    }
+    sanitized
 }
 
 fn git_revision() -> Option<String> {

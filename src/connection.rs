@@ -6,6 +6,7 @@
 //! connection never closes another socket except for the protocol-mandated
 //! replacement/detach rules.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,15 +18,15 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::capacity::{BudgetError, BudgetGuard, IpGuard, WsSlot};
-use crate::config::CONTROL_FRAME_BYTES;
+use crate::capacity::{BudgetError, BudgetGuard, IpGuard, TcpSlot, WsSlot};
+use crate::config::{CONTROL_FRAME_BYTES, FIXED_MESSAGE_OVERHEAD};
 use crate::handshake::{self, HandshakeOutcome};
 use crate::metrics::Metrics;
 use crate::protocol::{Connection, Role};
 use crate::server::AppState;
 use crate::session::Session;
 use crate::writer::{spawn_writer, SendError, WriterHandle};
-use crate::ws::{self, FrameReader, OpCode, WsError, WsLimits};
+use crate::ws::{self, FrameReader, OpCode, WsError, WsLimits, MAX_FRAGMENTS_PER_MESSAGE};
 
 /// Bounded read-ahead: at most two completed messages/events are handed to the
 /// main task; the reader task blocks on the channel once that is full.
@@ -36,11 +37,41 @@ const READ_CHANNEL_CAPACITY: usize = 2;
 /// cannot delay shutdown close frames.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Data-frame payloads are read and charged to the ingress budget in chunks of
+/// this size. At most one chunk per connection is transiently allocated before
+/// it is charged, which keeps a stalled peer from reserving a whole message.
+const INGRESS_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Per-connection in-flight ingress budget.
+///
+/// Guards share this counter; the relay reserves at most
+/// [`Config::per_connection_ingress_bytes`] weighted bytes for one connection so
+/// a single peer cannot monopolise the node-wide budget through queued
+/// messages.
+struct ConnIngress {
+    used: AtomicU64,
+    limit: u64,
+}
+
+/// Ingress guard that also releases the connection-scoped counter.
+struct ScopedGuard {
+    guard: Option<BudgetGuard>,
+    scope: Arc<ConnIngress>,
+    weighted: u64,
+}
+
+impl Drop for ScopedGuard {
+    fn drop(&mut self) {
+        self.scope.used.fetch_sub(self.weighted, Ordering::Relaxed);
+        drop(self.guard.take());
+    }
+}
+
 enum Inbound {
     Message {
         opcode: OpCode,
         payload: Bytes,
-        guards: Vec<BudgetGuard>,
+        guards: Vec<ScopedGuard>,
     },
     Ping(Bytes),
     Pong,
@@ -75,6 +106,9 @@ pub async fn run_connection(
     state: Arc<AppState>,
     ws_slot: WsSlot,
     ip_guard: IpGuard,
+    // Held for the whole socket lifetime so MAX_TCP_CONNECTIONS bounds every
+    // open TCP socket, including upgraded WebSockets.
+    _tcp_slot: Option<TcpSlot>,
     peer: std::net::SocketAddr,
 ) {
     let io = TokioIo::new(upgraded);
@@ -91,7 +125,25 @@ pub async fn run_connection(
         } else {
             state.config.max_message_bytes
         },
+        max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
     };
+
+    let one_max_message_weighted = (state.config.max_message_bytes as u64 + FIXED_MESSAGE_OVERHEAD)
+        .saturating_mul(state.config.ingress_weight as u64);
+    // The read-ahead pipeline can hold up to four messages per connection
+    // (one being handled by the main task, two queued, one being read), so the
+    // per-connection cap must not be lower than that or a legitimate pipelining
+    // source would be closed. It still prevents one connection from taking more
+    // than four maximum messages when the global budget is larger.
+    let per_connection_limit = state
+        .config
+        .ingress_budget_bytes
+        .min(one_max_message_weighted.saturating_mul(4))
+        .max(one_max_message_weighted);
+    let ingress_scope = Arc::new(ConnIngress {
+        used: AtomicU64::new(0),
+        limit: per_connection_limit,
+    });
 
     let (writer, writer_task) = spawn_writer(
         write_half,
@@ -111,6 +163,7 @@ pub async fn run_connection(
         state.config.ingress_wait_timeout,
         state.config.frame_read_timeout,
         state.config.message_read_timeout,
+        Arc::clone(&ingress_scope),
     );
 
     let (session, attach) = match state.sessions.join(&connection, writer.clone(), socket_id) {
@@ -497,6 +550,11 @@ async fn handle_control_input(
     let Some(control) = control else {
         return;
     };
+    // Cheap prefilter: the only accepted control input is a text `{"type":
+    // "ping"}` message, so avoid paying serde_json on arbitrary control text.
+    if !payload.windows(4).any(|window| window == b"ping") {
+        return;
+    }
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(payload) else {
         return;
     };
@@ -520,9 +578,10 @@ async fn handle_control_input(
 }
 
 fn echo_close_code(code: u16) -> u16 {
-    match code {
-        1000..=1003 | 1007..=1011 | 3000..=4999 => code,
-        _ => 1000,
+    if ws::is_allowed_close_code(code) {
+        code
+    } else {
+        1000
     }
 }
 
@@ -536,6 +595,7 @@ fn spawn_reader<R>(
     wait_timeout: Duration,
     frame_read_timeout: Duration,
     message_read_timeout: Duration,
+    ingress_scope: Arc<ConnIngress>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -550,6 +610,7 @@ where
             wait_timeout,
             frame_read_timeout,
             message_read_timeout,
+            ingress_scope,
         )
         .await;
     })
@@ -565,6 +626,7 @@ async fn read_loop<R>(
     wait_timeout: Duration,
     frame_read_timeout: Duration,
     message_read_timeout: Duration,
+    ingress_scope: Arc<ConnIngress>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -572,19 +634,22 @@ async fn read_loop<R>(
     let mut assembling: Option<Assembling> = None;
     let mut message_started: Option<tokio::time::Instant> = None;
 
+    macro_rules! fail {
+        ($failure:expr) => {{
+            let _ = tx.send(Inbound::Failed($failure)).await;
+            return;
+        }};
+    }
+
     loop {
         let header_timeout =
             message_started.map(|started| message_read_timeout.saturating_sub(started.elapsed()));
         if header_timeout == Some(Duration::ZERO) {
-            let _ = tx.send(Inbound::Failed(Failure::ReadTimeout)).await;
-            return;
+            fail!(Failure::ReadTimeout);
         }
         let header = match read_header_bounded(&mut reader, header_timeout).await {
             Ok(header) => header,
-            Err(failure) => {
-                let _ = tx.send(Inbound::Failed(failure)).await;
-                return;
-            }
+            Err(failure) => fail!(failure),
         };
         let payload_timeout = message_started
             .map(|started| {
@@ -592,17 +657,16 @@ async fn read_loop<R>(
             })
             .unwrap_or(frame_read_timeout);
         if payload_timeout == Duration::ZERO {
-            let _ = tx.send(Inbound::Failed(Failure::ReadTimeout)).await;
-            return;
+            fail!(Failure::ReadTimeout);
         }
+        let payload_deadline = tokio::time::Instant::now() + payload_timeout;
+
         match header.opcode {
             OpCode::Close => {
-                let payload = match read_payload(&mut reader, &header, payload_timeout).await {
+                let payload = match read_small_payload(&mut reader, &header, payload_timeout).await
+                {
                     Ok(payload) => payload,
-                    Err(failure) => {
-                        let _ = tx.send(Inbound::Failed(failure)).await;
-                        return;
-                    }
+                    Err(failure) => fail!(failure),
                 };
                 match ws::parse_close_payload(&payload) {
                     Ok((code, reason)) => {
@@ -615,21 +679,20 @@ async fn read_loop<R>(
                 return;
             }
             OpCode::Ping => {
-                let payload = match read_payload(&mut reader, &header, payload_timeout).await {
+                let payload = match read_small_payload(&mut reader, &header, payload_timeout).await
+                {
                     Ok(payload) => payload,
-                    Err(failure) => {
-                        let _ = tx.send(Inbound::Failed(failure)).await;
-                        return;
-                    }
+                    Err(failure) => fail!(failure),
                 };
                 if tx.send(Inbound::Ping(payload)).await.is_err() {
                     return;
                 }
             }
             OpCode::Pong => {
-                if let Err(failure) = read_payload(&mut reader, &header, payload_timeout).await {
-                    let _ = tx.send(Inbound::Failed(failure)).await;
-                    return;
+                if let Err(failure) =
+                    read_small_payload(&mut reader, &header, payload_timeout).await
+                {
+                    fail!(failure);
                 }
                 if tx.send(Inbound::Pong).await.is_err() {
                     return;
@@ -637,42 +700,48 @@ async fn read_loop<R>(
             }
             OpCode::Text | OpCode::Binary => {
                 if assembling.is_some() {
-                    let _ = tx
-                        .send(Inbound::Failed(Failure::Ws(WsError::Protocol(
-                            "new data frame during fragmented message",
-                        ))))
-                        .await;
-                    return;
+                    fail!(Failure::Ws(WsError::Protocol(
+                        "new data frame during fragmented message",
+                    )));
                 }
-                let budget = match reserve(&capacity, &header, wait_timeout).await {
-                    Ok(budget) => budget,
-                    Err(failure) => {
-                        let _ = tx.send(Inbound::Failed(failure)).await;
-                        return;
-                    }
+                // Charge the fixed per-message overhead once per message. It is
+                // charged before the payload is read, but it is small (~1 KiB
+                // weighted at the default weight).
+                let overhead = match reserve_weighted(
+                    &capacity,
+                    &ingress_scope,
+                    capacity.ingress.overhead_weight(),
+                    wait_timeout,
+                )
+                .await
+                {
+                    Ok(guard) => guard,
+                    Err(failure) => fail!(failure),
                 };
+                let (payload, mut guards) = match read_data_payload(
+                    &mut reader,
+                    &header,
+                    &capacity,
+                    &ingress_scope,
+                    wait_timeout,
+                    payload_deadline,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(failure) => fail!(failure),
+                };
+                guards.insert(0, overhead);
                 metrics.observe_frame_size(header.payload_len);
-                let payload = match read_payload(&mut reader, &header, payload_timeout).await {
-                    Ok(payload) => payload,
-                    Err(failure) => {
-                        let _ = tx.send(Inbound::Failed(failure)).await;
-                        return;
-                    }
-                };
                 if header.fin {
-                    // Unfragmented: forward the already-owned Bytes directly
-                    // instead of copying into an assembly buffer.
                     if header.opcode == OpCode::Text && std::str::from_utf8(&payload).is_err() {
-                        let _ = tx
-                            .send(Inbound::Failed(Failure::Ws(WsError::InvalidUtf8)))
-                            .await;
-                        return;
+                        fail!(Failure::Ws(WsError::InvalidUtf8));
                     }
                     if tx
                         .send(Inbound::Message {
                             opcode: header.opcode,
-                            payload,
-                            guards: vec![budget],
+                            payload: Bytes::from(payload),
+                            guards,
                         })
                         .await
                         .is_err()
@@ -681,54 +750,42 @@ async fn read_loop<R>(
                     }
                 } else {
                     message_started = Some(tokio::time::Instant::now());
-                    let mut payload = payload.to_vec();
-                    payload.truncate(header.payload_len);
                     assembling = Some(Assembling {
                         opcode: header.opcode,
                         payload,
-                        guards: vec![budget],
+                        guards,
                     });
                 }
             }
             OpCode::Continuation => {
                 if let Some(started) = message_started {
                     if started.elapsed() > message_read_timeout {
-                        let _ = tx.send(Inbound::Failed(Failure::ReadTimeout)).await;
-                        return;
+                        fail!(Failure::ReadTimeout);
                     }
                 }
                 let Some(mut message) = assembling.take() else {
-                    let _ = tx
-                        .send(Inbound::Failed(Failure::Ws(WsError::Protocol(
-                            "unexpected continuation",
-                        ))))
-                        .await;
-                    return;
+                    fail!(Failure::Ws(WsError::Protocol("unexpected continuation")));
                 };
-                let total = message.payload.len() + header.payload_len;
-                if total > limits.max_message_payload {
-                    let _ = tx
-                        .send(Inbound::Failed(Failure::Ws(WsError::MessageTooLarge)))
-                        .await;
-                    return;
+                let (payload, guards) = match read_data_payload(
+                    &mut reader,
+                    &header,
+                    &capacity,
+                    &ingress_scope,
+                    wait_timeout,
+                    payload_deadline,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(failure) => fail!(failure),
+                };
+                if message.payload.len().saturating_add(payload.len()) > limits.max_message_payload
+                {
+                    fail!(Failure::Ws(WsError::MessageTooLarge));
                 }
-                let budget = match reserve(&capacity, &header, wait_timeout).await {
-                    Ok(budget) => budget,
-                    Err(failure) => {
-                        let _ = tx.send(Inbound::Failed(failure)).await;
-                        return;
-                    }
-                };
                 metrics.observe_frame_size(header.payload_len);
-                let payload = match read_payload(&mut reader, &header, payload_timeout).await {
-                    Ok(payload) => payload,
-                    Err(failure) => {
-                        let _ = tx.send(Inbound::Failed(failure)).await;
-                        return;
-                    }
-                };
                 message.payload.extend_from_slice(&payload);
-                message.guards.push(budget);
+                message.guards.extend(guards);
                 if header.fin {
                     message_started = None;
                     if let Err(failure) = finish_message(&tx, message, &limits).await {
@@ -743,10 +800,82 @@ async fn read_loop<R>(
     }
 }
 
+/// Read one data-frame payload in [`INGRESS_CHUNK_BYTES`] chunks, charging the
+/// ingress budget as bytes actually arrive.
+///
+/// At most one chunk per connection is transiently allocated before it is
+/// charged. A peer that declares a large frame but never sends it therefore
+/// holds only the per-message overhead, not the whole declared payload.
+async fn read_data_payload<R>(
+    reader: &mut FrameReader<R>,
+    header: &crate::ws::FrameHeader,
+    capacity: &Arc<crate::capacity::Capacity>,
+    ingress_scope: &Arc<ConnIngress>,
+    wait_timeout: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(Vec<u8>, Vec<ScopedGuard>), Failure>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut remaining = reader.begin_payload(header).map_err(Failure::Ws)?;
+    let mut payload = Vec::with_capacity(remaining.min(2 * INGRESS_CHUNK_BYTES));
+    let mut guards = Vec::new();
+    while remaining > 0 {
+        let chunk_len = remaining.min(INGRESS_CHUNK_BYTES);
+        let mut chunk = vec![0u8; chunk_len];
+        let read =
+            match tokio::time::timeout_at(deadline, reader.read_payload_chunk(&mut chunk)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) => return Err(Failure::Ws(error)),
+                Err(_) => return Err(Failure::ReadTimeout),
+            };
+        if read != chunk_len {
+            return Err(Failure::Ws(WsError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short WebSocket payload chunk",
+            ))));
+        }
+        let guard = reserve_weighted(
+            capacity,
+            ingress_scope,
+            capacity.ingress.chunk_weight(chunk_len),
+            wait_timeout,
+        )
+        .await?;
+        payload.extend_from_slice(&chunk);
+        guards.push(guard);
+        remaining -= chunk_len;
+    }
+    Ok((payload, guards))
+}
+
+async fn reserve_weighted(
+    capacity: &Arc<crate::capacity::Capacity>,
+    ingress_scope: &Arc<ConnIngress>,
+    weighted: u64,
+    wait_timeout: Duration,
+) -> Result<ScopedGuard, Failure> {
+    let guard = capacity
+        .ingress
+        .reserve_weighted(weighted, wait_timeout)
+        .await
+        .map_err(Failure::Budget)?;
+    let previous = ingress_scope.used.fetch_add(weighted, Ordering::Relaxed);
+    if previous.saturating_add(weighted) > ingress_scope.limit {
+        ingress_scope.used.fetch_sub(weighted, Ordering::Relaxed);
+        return Err(Failure::Budget(BudgetError::Exhausted));
+    }
+    Ok(ScopedGuard {
+        guard: Some(guard),
+        scope: Arc::clone(ingress_scope),
+        weighted,
+    })
+}
+
 struct Assembling {
     opcode: OpCode,
     payload: Vec<u8>,
-    guards: Vec<BudgetGuard>,
+    guards: Vec<ScopedGuard>,
 }
 
 async fn read_header_bounded<R>(
@@ -766,7 +895,8 @@ where
     }
 }
 
-async fn read_payload<R>(
+/// Read a small control payload (close/ping/pong, at most 125 bytes).
+async fn read_small_payload<R>(
     reader: &mut FrameReader<R>,
     header: &crate::ws::FrameHeader,
     timeout: Duration,
@@ -779,18 +909,6 @@ where
         Ok(Err(error)) => Err(Failure::Ws(error)),
         Err(_) => Err(Failure::ReadTimeout),
     }
-}
-
-async fn reserve(
-    capacity: &Arc<crate::capacity::Capacity>,
-    header: &crate::ws::FrameHeader,
-    wait_timeout: Duration,
-) -> Result<BudgetGuard, Failure> {
-    capacity
-        .ingress
-        .reserve(header.payload_len, wait_timeout)
-        .await
-        .map_err(Failure::Budget)
 }
 
 async fn finish_message(

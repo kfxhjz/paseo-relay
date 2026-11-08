@@ -3,7 +3,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use paseo_relay::{serve, Config, BUILD_REVISION, VERSION};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -42,7 +42,10 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::from_env()?;
-    let filter = EnvFilter::try_new(&config.log_filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    // Config::from_env validates the filter; propagate instead of silently
+    // falling back so the documented startup contract holds.
+    let filter = EnvFilter::try_new(&config.log_filter)
+        .context("PASEO_RELAY_LOG must be a valid tracing EnvFilter directive")?;
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false);

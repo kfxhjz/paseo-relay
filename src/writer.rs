@@ -82,8 +82,11 @@ impl WriterHandle {
             return Err(SendError::TooLarge);
         }
         let weighted = u32::try_from(weighted).map_err(|_| SendError::TooLarge)?;
-        let permit = tokio::time::timeout(
-            timeout,
+        // One absolute deadline for the whole delivery (permit + enqueue + ack)
+        // so a slow destination cannot multiply the configured timeout.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let permit = tokio::time::timeout_at(
+            deadline,
             Arc::clone(&self.permits).acquire_many_owned(weighted),
         )
         .await
@@ -91,8 +94,8 @@ impl WriterHandle {
         .map_err(|_| SendError::Closed)?;
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        tokio::time::timeout(
-            timeout,
+        tokio::time::timeout_at(
+            deadline,
             self.tx.send(Outbound::Frame {
                 opcode,
                 payload,
@@ -104,7 +107,7 @@ impl WriterHandle {
         .map_err(|_| SendError::SlowConsumer)?
         .map_err(|_| SendError::Closed)?;
 
-        match tokio::time::timeout(timeout, ack_rx).await {
+        match tokio::time::timeout_at(deadline, ack_rx).await {
             Ok(Ok(Ok(()))) => {
                 Metrics::inc(&self.metrics.frames_forwarded);
                 Ok(())
@@ -131,8 +134,9 @@ impl WriterHandle {
 
     pub async fn send_ping(&self, payload: Bytes, timeout: Duration) -> Result<(), SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        tokio::time::timeout(
-            timeout,
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::time::timeout_at(
+            deadline,
             self.tx.send(Outbound::Ping {
                 payload,
                 ack: ack_tx,
@@ -141,7 +145,7 @@ impl WriterHandle {
         .await
         .map_err(|_| SendError::SlowConsumer)?
         .map_err(|_| SendError::Closed)?;
-        match tokio::time::timeout(timeout, ack_rx).await {
+        match tokio::time::timeout_at(deadline, ack_rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(SendError::Writer(error.to_string())),
             Ok(Err(_)) => Err(SendError::Closed),
@@ -151,8 +155,9 @@ impl WriterHandle {
 
     pub async fn send_pong(&self, payload: Bytes, timeout: Duration) -> Result<(), SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        tokio::time::timeout(
-            timeout,
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::time::timeout_at(
+            deadline,
             self.tx.send(Outbound::Pong {
                 payload,
                 ack: ack_tx,
@@ -161,7 +166,7 @@ impl WriterHandle {
         .await
         .map_err(|_| SendError::SlowConsumer)?
         .map_err(|_| SendError::Closed)?;
-        match tokio::time::timeout(timeout, ack_rx).await {
+        match tokio::time::timeout_at(deadline, ack_rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(SendError::Writer(error.to_string())),
             Ok(Err(_)) => Err(SendError::Closed),

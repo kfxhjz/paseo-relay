@@ -45,6 +45,13 @@ pub const MAX_CLIENT_FRAME_PAYLOAD: usize = 32 * 1024 * 1024 - 14;
 /// still bounded to 125 payload bytes by [`FrameReader::read_header`].
 pub const MAX_CONTROL_PAYLOAD: usize = 64 * 1024;
 
+/// Maximum number of fragments accepted for one data message.
+///
+/// This is a relay policy limit that bounds per-message bookkeeping (one
+/// ingress guard per fragment, fragment counters) even when a peer sends many
+/// empty frames. Real Paseo messages use far fewer fragments.
+pub const MAX_FRAGMENTS_PER_MESSAGE: usize = 1024;
+
 /// Errors produced by the frame codec and the upgrade validator.
 #[derive(Debug, thiserror::Error)]
 pub enum WsError {
@@ -141,6 +148,8 @@ pub struct WsLimits {
     pub max_frame_payload: usize,
     /// Maximum payload of one (possibly fragmented) message.
     pub max_message_payload: usize,
+    /// Maximum number of frames in one fragmented message.
+    pub max_fragments: usize,
 }
 
 impl Default for WsLimits {
@@ -148,8 +157,17 @@ impl Default for WsLimits {
         WsLimits {
             max_frame_payload: MAX_CLIENT_FRAME_PAYLOAD,
             max_message_payload: MAX_CLIENT_FRAME_PAYLOAD,
+            max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
         }
     }
+}
+
+/// State of a payload that is being consumed in chunks.
+#[derive(Debug)]
+struct PayloadState {
+    remaining: usize,
+    mask: [u8; 4],
+    offset: usize,
 }
 
 /// Streaming frame reader for frames sent by a client.
@@ -158,8 +176,12 @@ pub struct FrameReader<R> {
     limits: WsLimits,
     /// Header whose payload has not been consumed yet.
     pending: Option<FrameHeader>,
+    /// Chunked payload currently being consumed.
+    payload: Option<PayloadState>,
     /// Assembled length of an in-progress fragmented message.
     fragmented_len: Option<usize>,
+    /// Number of frames seen for the in-progress fragmented message.
+    fragments: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -169,7 +191,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             reader,
             limits,
             pending: None,
+            payload: None,
             fragmented_len: None,
+            fragments: 0,
         }
     }
 
@@ -190,9 +214,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     ///
     /// A clean EOF between frames yields [`WsError::Closed`].
     pub async fn read_header(&mut self) -> Result<FrameHeader, WsError> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.payload.is_some() {
             return Err(WsError::Protocol(
-                "previous frame payload has not been read",
+                "previous frame payload has not been fully read",
             ));
         }
 
@@ -244,6 +268,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 }
                 if !fin {
                     self.fragmented_len = Some(payload_len);
+                    self.fragments = 1;
+                    if self.fragments > self.limits.max_fragments {
+                        return Err(WsError::Protocol("too many message fragments"));
+                    }
+                } else {
+                    self.fragments = 0;
                 }
             }
             OpCode::Continuation => {
@@ -256,7 +286,14 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if total > self.limits.max_message_payload {
                     return Err(WsError::MessageTooLarge);
                 }
+                self.fragments = self.fragments.saturating_add(1);
+                if self.fragments > self.limits.max_fragments {
+                    return Err(WsError::Protocol("too many message fragments"));
+                }
                 self.fragmented_len = if fin { None } else { Some(total) };
+                if fin {
+                    self.fragments = 0;
+                }
             }
             OpCode::Close | OpCode::Ping | OpCode::Pong => {}
         }
@@ -274,31 +311,98 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Ok(header)
     }
 
-    /// Read, unmask and return a frame payload.
+    /// Begin consuming the pending frame payload and return its length.
     ///
-    /// `header` must be the header returned by the most recent
-    /// [`FrameReader::read_header`] call; it may be called only once per
-    /// header. The allocation is exactly `header.payload_len` bytes.
-    pub async fn read_payload(&mut self, header: &FrameHeader) -> Result<Bytes, WsError> {
+    /// The payload is then read with [`FrameReader::read_payload_chunk`] until
+    /// the returned number of bytes has been consumed. Callers use this to
+    /// charge ingress budget incrementally as payload bytes actually arrive,
+    /// instead of reserving the full declared length up front.
+    pub fn begin_payload(&mut self, header: &FrameHeader) -> Result<usize, WsError> {
         let pending = self
             .pending
             .take()
             .ok_or(WsError::Protocol("no frame header is awaiting a payload"))?;
         if pending != *header {
+            self.pending = Some(pending);
             return Err(WsError::Protocol(
                 "frame header does not match the pending payload",
             ));
         }
+        if self.payload.is_some() {
+            self.pending = Some(pending);
+            return Err(WsError::Protocol("a frame payload is already being read"));
+        }
         if header.payload_len == 0 {
-            return Ok(Bytes::new());
+            return Ok(0);
+        }
+        self.payload = Some(PayloadState {
+            remaining: header.payload_len,
+            mask: header.mask_key,
+            offset: 0,
+        });
+        Ok(header.payload_len)
+    }
+
+    /// Read up to `buf.len()` bytes of the payload started by
+    /// [`FrameReader::begin_payload`], unmasking them.
+    ///
+    /// Returns the number of bytes read; this is `buf.len()` unless the
+    /// payload ends first. The returned data is always a prefix of the frame
+    /// payload, so consecutive calls preserve ordering.
+    pub async fn read_payload_chunk(&mut self, buf: &mut [u8]) -> Result<usize, WsError> {
+        let Some(state) = self.payload.as_ref() else {
+            return Err(WsError::Protocol("no frame payload is being read"));
+        };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let length = buf.len().min(state.remaining);
+        if length == 0 {
+            return Ok(0);
+        }
+        let offset = state.offset;
+        let mask = state.mask;
+
+        self.reader.read_exact(&mut buf[..length]).await?;
+        for (index, byte) in buf[..length].iter_mut().enumerate() {
+            *byte ^= mask[(offset + index) & 3];
         }
 
-        let mut payload = vec![0u8; header.payload_len];
-        self.reader.read_exact(&mut payload).await?;
+        if let Some(state) = self.payload.as_mut() {
+            state.remaining -= length;
+            state.offset += length;
+            if state.remaining == 0 {
+                self.payload = None;
+            }
+        }
+        Ok(length)
+    }
 
-        let mask = header.mask_key;
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index & 3];
+    /// Read, unmask and return a whole frame payload.
+    ///
+    /// Convenience helper for small control payloads and tests. Production data
+    /// frames use [`FrameReader::begin_payload`] plus
+    /// [`FrameReader::read_payload_chunk`] so the ingress budget is charged as
+    /// bytes arrive.
+    pub async fn read_payload(&mut self, header: &FrameHeader) -> Result<Bytes, WsError> {
+        let length = self.begin_payload(header)?;
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let mut payload = Vec::with_capacity(length.min(64 * 1024));
+        let mut remaining = length;
+        while remaining > 0 {
+            let chunk_len = remaining.min(8 * 1024);
+            let mut chunk = vec![0u8; chunk_len];
+            let read = self.read_payload_chunk(&mut chunk).await?;
+            if read != chunk_len {
+                return Err(WsError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short WebSocket payload chunk",
+                )));
+            }
+            payload.extend_from_slice(&chunk);
+            remaining -= chunk_len;
         }
         Ok(Bytes::from(payload))
     }
@@ -330,7 +434,13 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             126 => {
                 let mut bytes = [0u8; 2];
                 self.reader.read_exact(&mut bytes).await?;
-                Ok(usize::from(u16::from_be_bytes(bytes)))
+                let length = usize::from(u16::from_be_bytes(bytes));
+                if length < 126 {
+                    return Err(WsError::Protocol(
+                        "non-minimal 16-bit frame length encoding",
+                    ));
+                }
+                Ok(length)
             }
             127 => {
                 let mut bytes = [0u8; 8];
@@ -339,6 +449,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if length & (1 << 63) != 0 {
                     return Err(WsError::Protocol(
                         "64-bit payload length has the high bit set",
+                    ));
+                }
+                if length < 65_536 {
+                    return Err(WsError::Protocol(
+                        "non-minimal 64-bit frame length encoding",
                     ));
                 }
                 if length > self.limits.max_frame_payload as u64 {
@@ -458,17 +573,29 @@ pub fn close_payload(code: u16, reason: &str) -> Bytes {
     payload.freeze()
 }
 
+/// Whether a close-frame status code is valid to send or receive on the wire.
+///
+/// RFC 6455 forbids sending `1005`/`1006`/`1015` (reserved for local use),
+/// codes below `1000`, `1004`, and the unassigned `1016..=2999` range.
+/// `1012..=1014` are IANA-registered and accepted for compatibility.
+pub fn is_allowed_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
 /// Parse a close-frame payload.
 ///
 /// An empty payload means "no status code" and yields `(1005, "")`. A
-/// one-byte payload is invalid. A reason that is not UTF-8 is rejected with
-/// [`WsError::InvalidUtf8`].
+/// one-byte payload, a forbidden status code, or a reason that is not UTF-8 is
+/// rejected.
 pub fn parse_close_payload(payload: &[u8]) -> Result<(u16, String), WsError> {
     match payload.len() {
         0 => Ok((1005, String::new())),
         1 => Err(WsError::InvalidClosePayload),
         _ => {
             let code = u16::from_be_bytes([payload[0], payload[1]]);
+            if !is_allowed_close_code(code) {
+                return Err(WsError::Protocol("invalid close status code"));
+            }
             let reason = std::str::from_utf8(&payload[2..]).map_err(|_| WsError::InvalidUtf8)?;
             Ok((code, reason.to_owned()))
         }
@@ -788,6 +915,7 @@ mod tests {
         let limits = WsLimits {
             max_frame_payload: 100,
             max_message_payload: 100,
+            max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
         };
         let mut reader = reader_with_limits(&frame, limits);
         let error = reader.read_header().await.unwrap_err();
@@ -800,6 +928,7 @@ mod tests {
         let limits = WsLimits {
             max_frame_payload: 100,
             max_message_payload: 50,
+            max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
         };
         let mut reader = reader_with_limits(&frame, limits);
         let error = reader.read_header().await.unwrap_err();
@@ -819,6 +948,7 @@ mod tests {
         let limits = WsLimits {
             max_frame_payload: 100,
             max_message_payload: 5,
+            max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
         };
         let mut reader = reader_with_limits(&bytes, limits);
         let first = reader.read_header().await.unwrap();
@@ -956,6 +1086,26 @@ mod tests {
         };
         let error = reader.read_payload(&wrong).await.unwrap_err();
         assert!(matches!(error, WsError::Protocol(_)));
+    }
+
+    #[test]
+    fn parse_close_payload_rejects_forbidden_codes() {
+        for code in [0u16, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535] {
+            let payload = code.to_be_bytes();
+            assert!(
+                matches!(
+                    parse_close_payload(&payload).unwrap_err(),
+                    WsError::Protocol(_)
+                ),
+                "code {code} must be rejected"
+            );
+        }
+        for code in [
+            1000u16, 1001, 1002, 1003, 1007, 1011, 1012, 1013, 1014, 3000, 4999,
+        ] {
+            let payload = code.to_be_bytes();
+            assert_eq!(parse_close_payload(&payload).unwrap().0, code);
+        }
     }
 
     #[test]
@@ -1147,6 +1297,95 @@ mod tests {
 
         headers.remove(SEC_WEBSOCKET_KEY);
         assert_eq!(validate_upgrade(&headers), Err(UpgradeError::InvalidKey));
+    }
+
+    #[tokio::test]
+    async fn reader_reads_payload_in_chunks() {
+        let payload: Vec<u8> = (0..20_000u32).map(|value| (value % 251) as u8).collect();
+        let frame = encode_frame(true, OpCode::Binary, &payload, Some(MASK));
+        let mut reader = frame_reader(&frame);
+        let header = reader.read_header().await.unwrap();
+        let total = reader.begin_payload(&header).unwrap();
+        assert_eq!(total, payload.len());
+
+        let mut assembled = Vec::new();
+        let mut remaining = total;
+        while remaining > 0 {
+            let chunk_len = remaining.min(4096);
+            let mut chunk = vec![0u8; chunk_len];
+            let read = reader.read_payload_chunk(&mut chunk).await.unwrap();
+            assert_eq!(read, chunk_len);
+            assembled.extend_from_slice(&chunk);
+            remaining -= chunk_len;
+        }
+        assert_eq!(assembled, payload);
+        assert!(matches!(
+            reader.read_payload_chunk(&mut [0u8; 1]).await.unwrap_err(),
+            WsError::Protocol(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_handles_empty_payload_and_wrong_begin() {
+        let frame = encode_frame(true, OpCode::Text, b"", Some(MASK));
+        let mut reader = frame_reader(&frame);
+        let header = reader.read_header().await.unwrap();
+        assert_eq!(reader.begin_payload(&header).unwrap(), 0);
+        assert!(reader.begin_payload(&header).is_err());
+
+        let frame = encode_frame(true, OpCode::Text, b"hello", Some(MASK));
+        let mut reader = frame_reader(&frame);
+        let header = reader.read_header().await.unwrap();
+        let wrong = FrameHeader {
+            payload_len: header.payload_len + 1,
+            ..header
+        };
+        assert!(matches!(
+            reader.begin_payload(&wrong).unwrap_err(),
+            WsError::Protocol(_)
+        ));
+        assert_eq!(reader.begin_payload(&header).unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_non_minimal_length_encodings() {
+        let mut frame = vec![0x81, 0x80 | 126, 0x00, 0x05];
+        frame.extend_from_slice(&MASK);
+        let mut reader = frame_reader(&frame);
+        assert!(matches!(
+            reader.read_header().await.unwrap_err(),
+            WsError::Protocol(_)
+        ));
+
+        let mut frame = vec![0x81, 0x80 | 127];
+        frame.extend_from_slice(&5u64.to_be_bytes());
+        frame.extend_from_slice(&MASK);
+        let mut reader = frame_reader(&frame);
+        assert!(matches!(
+            reader.read_header().await.unwrap_err(),
+            WsError::Protocol(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_caps_fragments_per_message() {
+        let limits = WsLimits {
+            max_frame_payload: 1024,
+            max_message_payload: 1024,
+            max_fragments: 2,
+        };
+        let mut bytes = encode_frame(false, OpCode::Binary, b"", Some(MASK));
+        bytes.extend_from_slice(&encode_frame(false, OpCode::Continuation, b"", Some(MASK)));
+        bytes.extend_from_slice(&encode_frame(false, OpCode::Continuation, b"", Some(MASK)));
+
+        let mut reader = reader_with_limits(&bytes, limits);
+        let first = reader.read_header().await.unwrap();
+        reader.begin_payload(&first).unwrap();
+        let second = reader.read_header().await.unwrap();
+        reader.begin_payload(&second).unwrap();
+        let error = reader.read_header().await.unwrap_err();
+        assert!(matches!(error, WsError::Protocol(_)));
+        assert_eq!(error.close_code(), 1002);
     }
 
     fn upgrade_headers() -> HeaderMap {

@@ -22,8 +22,10 @@ use crate::ws::OpCode;
 /// Largest payload that [`looks_like_handshake`] considers worth parsing.
 ///
 /// Real handshake frames are a few hundred bytes; the cap keeps a pathological
-/// near-JSON frame from being parsed at the full 32 MiB data-frame limit.
-pub const MAX_HANDSHAKE_JSON: usize = 1024 * 1024;
+/// near-JSON frame from being parsed at the full 32 MiB data-frame limit. This
+/// is protocol hygiene, not a security boundary: larger JSON-looking frames
+/// are forwarded without inspection.
+pub const MAX_HANDSHAKE_JSON: usize = 64 * 1024;
 
 /// Handshake message kinds that receive validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,12 @@ pub fn looks_like_handshake(payload: &[u8]) -> bool {
 /// [`HandshakeOutcome::Reject`].
 pub fn check(opcode: OpCode, payload: &[u8]) -> HandshakeOutcome {
     if !matches!(opcode, OpCode::Text | OpCode::Binary) {
+        return HandshakeOutcome::NotHandshake;
+    }
+
+    // Cheap prefilter: both handshake kinds contain the literal `hello` in
+    // their type tag. This avoids serde_json on arbitrary JSON-looking frames.
+    if !payload.windows(5).any(|window| window == b"hello") {
         return HandshakeOutcome::NotHandshake;
     }
 

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use tracing_subscriber::EnvFilter;
 
 /// Per-message fixed overhead charged to the ingress budget, in bytes.
 ///
@@ -183,7 +184,9 @@ impl Config {
             )?;
         }
         if let Some(value) = get(vars, "PASEO_RELAY_INGRESS_WEIGHT") {
-            cfg.ingress_weight = parse_u64("PASEO_RELAY_INGRESS_WEIGHT", &value, 1, 16)? as u32;
+            // A weight of 1 cannot cover the transient copy during fragmented
+            // message assembly; 4 (the default) is the documented safe floor.
+            cfg.ingress_weight = parse_u64("PASEO_RELAY_INGRESS_WEIGHT", &value, 4, 16)? as u32;
         }
         if let Some(value) = get(vars, "PASEO_RELAY_INGRESS_WAIT_TIMEOUT_MS") {
             cfg.ingress_wait_timeout = Duration::from_millis(parse_u64(
@@ -335,6 +338,9 @@ impl Config {
         if self.ingress_budget_bytes > u32::MAX as u64 {
             bail!("PASEO_RELAY_INGRESS_BUDGET_BYTES must be <= {}", u32::MAX);
         }
+        if self.ingress_weight < 4 || self.ingress_weight > 16 {
+            bail!("PASEO_RELAY_INGRESS_WEIGHT must be between 4 and 16");
+        }
         let one_max_message = (self.max_message_bytes as u64 + FIXED_MESSAGE_OVERHEAD)
             .checked_mul(self.ingress_weight as u64)
             .context("ingress budget weight overflow")?;
@@ -344,9 +350,30 @@ impl Config {
             );
         }
         match (&self.tls_cert, &self.tls_key) {
-            (Some(_), Some(_)) | (None, None) => {}
+            (Some(cert), Some(key)) => {
+                // Catch missing/unreadable files at validate time so
+                // `--check-config` catches deployment mistakes.
+                std::fs::File::open(cert).with_context(|| {
+                    format!(
+                        "PASEO_RELAY_TLS_CERT must point to a readable file: {}",
+                        cert.display()
+                    )
+                })?;
+                std::fs::File::open(key).with_context(|| {
+                    format!(
+                        "PASEO_RELAY_TLS_KEY must point to a readable file: {}",
+                        key.display()
+                    )
+                })?;
+            }
+            (None, None) => {}
             _ => bail!("PASEO_RELAY_TLS_CERT and PASEO_RELAY_TLS_KEY must be set together"),
         }
+
+        // The documented runtime contract says invalid configuration aborts
+        // startup; validate the log filter instead of silently falling back.
+        EnvFilter::try_new(&self.log_filter)
+            .context("PASEO_RELAY_LOG must be a valid tracing EnvFilter directive")?;
         if self.max_clients_per_connection == 0 {
             bail!("PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION must be >= 1");
         }
@@ -434,6 +461,36 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_low_ingress_weight() {
+        assert!(
+            Config::from_map(&map(&[("PASEO_RELAY_INGRESS_WEIGHT", "2")])).is_err(),
+            "weight below 4 must be rejected"
+        );
+        assert!(Config::from_map(&map(&[("PASEO_RELAY_INGRESS_WEIGHT", "4")])).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_log_filter() {
+        assert!(
+            Config::from_map(&map(&[("PASEO_RELAY_LOG", "not a [ valid filter")])).is_err(),
+            "an invalid EnvFilter directive must abort validation"
+        );
+    }
+
+    #[test]
+    fn rejects_unreadable_tls_files() {
+        let cfg = Config {
+            tls_cert: Some(PathBuf::from("/nonexistent/paseo-cert.pem")),
+            tls_key: Some(PathBuf::from("/nonexistent/paseo-key.pem")),
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "missing TLS files must be rejected"
+        );
     }
 
     #[test]

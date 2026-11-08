@@ -58,15 +58,28 @@ impl IngressBudget {
         (payload_len as u64 + FIXED_MESSAGE_OVERHEAD) * self.weight
     }
 
-    /// Reserve weighted bytes before reading a payload. `timeout` bounds how
-    /// long the source waits for budget; on expiry the source is closed with
-    /// retryable `1013` instead of queueing without a bound.
-    pub async fn reserve(
+    /// Conservative memory weight charged per payload byte.
+    pub fn weight(&self) -> u64 {
+        self.weight
+    }
+
+    /// Weighted charge for one payload chunk (no fixed message overhead).
+    pub fn chunk_weight(&self, payload_len: usize) -> u64 {
+        (payload_len as u64).saturating_mul(self.weight)
+    }
+
+    /// Weighted charge for the fixed per-message bookkeeping overhead.
+    pub fn overhead_weight(&self) -> u64 {
+        FIXED_MESSAGE_OVERHEAD.saturating_mul(self.weight)
+    }
+
+    /// Reserve an already computed weighted amount before reading payload
+    /// bytes. `timeout` bounds how long the source waits for budget.
+    pub async fn reserve_weighted(
         &self,
-        payload_len: usize,
+        weighted: u64,
         timeout: Duration,
     ) -> Result<BudgetGuard, BudgetError> {
-        let weighted = self.weighted_bytes(payload_len);
         if weighted > self.limit {
             return Err(BudgetError::TooLarge);
         }
@@ -84,6 +97,18 @@ impl IngressBudget {
             weighted,
             reserved: Arc::clone(&self.reserved),
         })
+    }
+
+    /// Reserve the weighted bytes for a full payload message, including the
+    /// fixed per-message overhead. Most callers should charge per chunk with
+    /// [`IngressBudget::reserve_weighted`] instead.
+    pub async fn reserve(
+        &self,
+        payload_len: usize,
+        timeout: Duration,
+    ) -> Result<BudgetGuard, BudgetError> {
+        self.reserve_weighted(self.weighted_bytes(payload_len), timeout)
+            .await
     }
 
     #[cfg(test)]
