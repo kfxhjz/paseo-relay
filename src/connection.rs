@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::capacity::{BudgetError, BudgetGuard, IpGuard, TcpSlot, WsSlot};
-use crate::config::{CONTROL_FRAME_BYTES, FIXED_MESSAGE_OVERHEAD};
+use crate::config::{CONTROL_FRAME_BYTES, INGRESS_CHUNK_BYTES};
 use crate::handshake::{self, HandshakeOutcome};
 use crate::metrics::Metrics;
 use crate::protocol::{Connection, Role};
@@ -36,11 +36,6 @@ const READ_CHANNEL_CAPACITY: usize = 2;
 /// full delivery deadline (30 s). Bound them so a saturated control writer
 /// cannot delay shutdown close frames.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Data-frame payloads are read and charged to the ingress budget in chunks of
-/// this size. At most one chunk per connection is transiently allocated before
-/// it is charged, which keeps a stalled peer from reserving a whole message.
-const INGRESS_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Per-connection in-flight ingress budget.
 ///
@@ -128,8 +123,7 @@ pub async fn run_connection(
         max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
     };
 
-    let one_max_message_weighted = (state.config.max_message_bytes as u64 + FIXED_MESSAGE_OVERHEAD)
-        .saturating_mul(state.config.ingress_weight as u64);
+    let one_max_message_weighted = state.config.max_message_weighted_charge();
     // The read-ahead pipeline can hold up to four messages per connection
     // (one being handled by the main task, two queued, one being read), so the
     // per-connection cap must not be lower than that or a legitimate pipelining
@@ -550,11 +544,6 @@ async fn handle_control_input(
     let Some(control) = control else {
         return;
     };
-    // Cheap prefilter: the only accepted control input is a text `{"type":
-    // "ping"}` message, so avoid paying serde_json on arbitrary control text.
-    if !payload.windows(4).any(|window| window == b"ping") {
-        return;
-    }
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(payload) else {
         return;
     };
@@ -651,6 +640,15 @@ async fn read_loop<R>(
             Ok(header) => header,
             Err(failure) => fail!(failure),
         };
+        // Start the fragmented-message clock as soon as the first fragment
+        // header arrives, so MESSAGE_READ_TIMEOUT_MS bounds the whole wire
+        // time rather than only the time after the first payload was read.
+        if matches!(header.opcode, OpCode::Text | OpCode::Binary)
+            && !header.fin
+            && message_started.is_none()
+        {
+            message_started = Some(tokio::time::Instant::now());
+        }
         let payload_timeout = message_started
             .map(|started| {
                 frame_read_timeout.min(message_read_timeout.saturating_sub(started.elapsed()))
@@ -707,15 +705,18 @@ async fn read_loop<R>(
                 // Charge the fixed per-message overhead once per message. It is
                 // charged before the payload is read, but it is small (~1 KiB
                 // weighted at the default weight).
-                let overhead = match reserve_weighted(
-                    &capacity,
-                    &ingress_scope,
-                    capacity.ingress.overhead_weight(),
-                    wait_timeout,
-                )
-                .await
-                {
-                    Ok(guard) => guard,
+                let overhead = match bounded_budget_wait(payload_deadline, wait_timeout) {
+                    Ok(wait) => match reserve_weighted(
+                        &capacity,
+                        &ingress_scope,
+                        capacity.ingress.overhead_weight(),
+                        wait,
+                    )
+                    .await
+                    {
+                        Ok(guard) => guard,
+                        Err(failure) => fail!(failure),
+                    },
                     Err(failure) => fail!(failure),
                 };
                 let (payload, mut guards) = match read_data_payload(
@@ -749,7 +750,6 @@ async fn read_loop<R>(
                         return;
                     }
                 } else {
-                    message_started = Some(tokio::time::Instant::now());
                     assembling = Some(Assembling {
                         opcode: header.opcode,
                         payload,
@@ -818,7 +818,9 @@ where
     R: AsyncRead + Unpin,
 {
     let mut remaining = reader.begin_payload(header).map_err(Failure::Ws)?;
-    let mut payload = Vec::with_capacity(remaining.min(2 * INGRESS_CHUNK_BYTES));
+    // Grow the assembled payload only after each chunk has been charged, so the
+    // only uncharged memory per in-flight read is the 8 KiB chunk buffer below.
+    let mut payload = Vec::new();
     let mut guards = Vec::new();
     while remaining > 0 {
         let chunk_len = remaining.min(INGRESS_CHUNK_BYTES);
@@ -835,11 +837,12 @@ where
                 "short WebSocket payload chunk",
             ))));
         }
+        let wait = bounded_budget_wait(deadline, wait_timeout)?;
         let guard = reserve_weighted(
             capacity,
             ingress_scope,
             capacity.ingress.chunk_weight(chunk_len),
-            wait_timeout,
+            wait,
         )
         .await?;
         payload.extend_from_slice(&chunk);
@@ -847,6 +850,20 @@ where
         remaining -= chunk_len;
     }
     Ok((payload, guards))
+}
+
+/// Remaining budget wait, bounded by the frame/message read deadline so a
+/// source cannot extend its read deadline by waiting for ingress capacity.
+fn bounded_budget_wait(
+    deadline: tokio::time::Instant,
+    wait_timeout: Duration,
+) -> Result<Duration, Failure> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        Err(Failure::ReadTimeout)
+    } else {
+        Ok(wait_timeout.min(remaining))
+    }
 }
 
 async fn reserve_weighted(

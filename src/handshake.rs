@@ -71,12 +71,6 @@ pub fn check(opcode: OpCode, payload: &[u8]) -> HandshakeOutcome {
         return HandshakeOutcome::NotHandshake;
     }
 
-    // Cheap prefilter: both handshake kinds contain the literal `hello` in
-    // their type tag. This avoids serde_json on arbitrary JSON-looking frames.
-    if !payload.windows(5).any(|window| window == b"hello") {
-        return HandshakeOutcome::NotHandshake;
-    }
-
     let message: Value = match serde_json::from_slice(payload) {
         Ok(message) => message,
         Err(_) => return HandshakeOutcome::NotHandshake,
@@ -277,6 +271,22 @@ mod tests {
         assert_eq!(
             check(OpCode::Binary, &payload),
             HandshakeOutcome::Accept(HandshakeType::E2eeHello)
+        );
+    }
+
+    #[test]
+    fn escaped_handshake_type_is_still_validated() {
+        let key = encoded(&VALID_KEY);
+        let valid = format!(r#"{{"type":"h\u0065llo","key":"{key}"}}"#);
+        assert_eq!(
+            check(OpCode::Text, valid.as_bytes()),
+            HandshakeOutcome::Accept(HandshakeType::Hello)
+        );
+
+        let invalid = r#"{"type":"h\u0065llo","key":"AAAA"}"#;
+        assert_eq!(
+            check(OpCode::Text, invalid.as_bytes()),
+            HandshakeOutcome::Reject(HandshakeType::Hello)
         );
     }
 

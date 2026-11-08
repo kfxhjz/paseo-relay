@@ -502,7 +502,9 @@ async fn client_limit_per_connection_is_enforced() {
 async fn ingress_budget_rejects_excess_sources() {
     let mut config = test_config();
     config.max_message_bytes = 1024;
-    config.ingress_budget_bytes = 6 * 1024;
+    // Must admit one maximum message including chunk bookkeeping; direct test
+    // configs bypass the env parser's 128 MiB floor.
+    config.ingress_budget_bytes = 205_000;
     config.ingress_wait_timeout = Duration::from_millis(50);
     config.data_attach_timeout = Duration::from_millis(500);
     let (server, addr) = start(config).await;
@@ -510,7 +512,7 @@ async fn ingress_budget_rejects_excess_sources() {
     // Each client waits for a data route that never appears, holding one
     // ingress reservation. The first few fit; a later one times out with 1013.
     let mut clients = Vec::new();
-    for index in 0..8 {
+    for index in 0..64 {
         let mut client = connect(
             addr,
             &format!("serverId=srv_budget&role=client&v=2&connectionId=missing-{index}"),
@@ -897,7 +899,9 @@ async fn stalled_frame_header_does_not_reserve_the_whole_budget() {
     // payload must not reserve the full message before payload bytes arrive.
     let mut config = test_config();
     config.max_message_bytes = 32 * 1024;
-    config.ingress_budget_bytes = 256 * 1024;
+    // One maximum message costs 132,096 + chunk bookkeeping; leave headroom for
+    // the victim's small frame.
+    config.ingress_budget_bytes = 330_000;
     config.ingress_wait_timeout = Duration::from_millis(200);
     let (server, addr) = start(config).await;
 

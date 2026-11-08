@@ -47,10 +47,10 @@ pub const MAX_CONTROL_PAYLOAD: usize = 64 * 1024;
 
 /// Maximum number of fragments accepted for one data message.
 ///
-/// This is a relay policy limit that bounds per-message bookkeeping (one
-/// ingress guard per fragment, fragment counters) even when a peer sends many
-/// empty frames. Real Paseo messages use far fewer fragments.
-pub const MAX_FRAGMENTS_PER_MESSAGE: usize = 1024;
+/// This is a relay policy limit that bounds per-message bookkeeping; the
+/// constant lives in the configuration module because the ingress-budget
+/// validation needs the same bound.
+pub use crate::config::MAX_FRAGMENTS_PER_MESSAGE;
 
 /// Errors produced by the frame codec and the upgrade validator.
 #[derive(Debug, thiserror::Error)]

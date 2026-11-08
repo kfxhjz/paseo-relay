@@ -30,6 +30,17 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = MAX_CLIENT_FRAME_PAYLOAD;
 /// Per-connection inbound frame cap for the v2 daemon control socket.
 pub const CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
+/// Data payloads are charged to the ingress budget in chunks of this size.
+pub const INGRESS_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Extra weighted charge per payload chunk for its bookkeeping (one
+/// connection-scoped budget guard plus vector capacity). This keeps the
+/// unaccounted heap amplification of many tiny chunks bounded by the budget.
+pub const INGRESS_CHUNK_OVERHEAD: u64 = 192;
+
+/// Maximum number of fragments accepted for one data message.
+pub const MAX_FRAGMENTS_PER_MESSAGE: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: IpAddr,
@@ -341,9 +352,7 @@ impl Config {
         if self.ingress_weight < 4 || self.ingress_weight > 16 {
             bail!("PASEO_RELAY_INGRESS_WEIGHT must be between 4 and 16");
         }
-        let one_max_message = (self.max_message_bytes as u64 + FIXED_MESSAGE_OVERHEAD)
-            .checked_mul(self.ingress_weight as u64)
-            .context("ingress budget weight overflow")?;
+        let one_max_message = self.max_message_weighted_charge();
         if self.ingress_budget_bytes < one_max_message {
             bail!(
                 "PASEO_RELAY_INGRESS_BUDGET_BYTES must admit one maximum message at the configured weight"
@@ -353,18 +362,8 @@ impl Config {
             (Some(cert), Some(key)) => {
                 // Catch missing/unreadable files at validate time so
                 // `--check-config` catches deployment mistakes.
-                std::fs::File::open(cert).with_context(|| {
-                    format!(
-                        "PASEO_RELAY_TLS_CERT must point to a readable file: {}",
-                        cert.display()
-                    )
-                })?;
-                std::fs::File::open(key).with_context(|| {
-                    format!(
-                        "PASEO_RELAY_TLS_KEY must point to a readable file: {}",
-                        key.display()
-                    )
-                })?;
+                check_readable_file(cert, "PASEO_RELAY_TLS_CERT")?;
+                check_readable_file(key, "PASEO_RELAY_TLS_KEY")?;
             }
             (None, None) => {}
             _ => bail!("PASEO_RELAY_TLS_CERT and PASEO_RELAY_TLS_KEY must be set together"),
@@ -392,6 +391,25 @@ impl Config {
     /// delivery deadline rather than by an unreservable queue slot. The control
     /// queue floor is kept separate so small control notifications are never
     /// starved by a single large payload.
+    /// Worst-case weighted charge for one maximum-size message.
+    ///
+    /// Includes the per-message overhead, all payload chunks, and the
+    /// per-chunk bookkeeping. The extra `MAX_FRAGMENTS_PER_MESSAGE` chunks
+    /// cover the worst case where every fragment forms its own partial chunk.
+    pub fn max_message_weighted_charge(&self) -> u64 {
+        let chunks = self
+            .max_message_bytes
+            .saturating_add(INGRESS_CHUNK_BYTES - 1)
+            / INGRESS_CHUNK_BYTES;
+        let chunks = chunks.saturating_add(MAX_FRAGMENTS_PER_MESSAGE);
+        // Each non-empty chunk carries at least one payload byte, so the chunk
+        // count can never exceed the message size.
+        let chunks = chunks.min(self.max_message_bytes) as u64;
+        (self.max_message_bytes as u64 + FIXED_MESSAGE_OVERHEAD)
+            .saturating_mul(self.ingress_weight as u64)
+            .saturating_add(chunks.saturating_mul(INGRESS_CHUNK_OVERHEAD))
+    }
+
     pub fn writer_queue_bytes(&self) -> usize {
         self.control_queue_bytes
             .max(self.max_message_bytes.saturating_add(64 * 1024))
@@ -418,6 +436,17 @@ fn get(vars: &HashMap<String, String>, key: &str) -> Option<String> {
     vars.get(key)
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+fn check_readable_file(path: &std::path::Path, key: &str) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("{key} must point to a readable file: {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{key} must point to a regular file: {}", path.display());
+    }
+    std::fs::File::open(path)
+        .with_context(|| format!("{key} must be readable: {}", path.display()))?;
+    Ok(())
 }
 
 fn parse_u64(key: &str, value: &str, min: u64, max: u64) -> Result<u64> {
@@ -464,6 +493,34 @@ mod tests {
     }
 
     #[test]
+    fn max_message_charge_includes_chunk_bookkeeping() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.max_message_weighted_charge(),
+            (cfg.max_message_bytes as u64 + FIXED_MESSAGE_OVERHEAD) * cfg.ingress_weight as u64
+                + (cfg.max_message_bytes.div_ceil(INGRESS_CHUNK_BYTES) + MAX_FRAGMENTS_PER_MESSAGE)
+                    as u64
+                    * INGRESS_CHUNK_OVERHEAD
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn compose_129mib_budget_is_accepted_and_128mib_is_not() {
+        let accepted = Config {
+            ingress_budget_bytes: 135_266_304,
+            ..Config::default()
+        };
+        assert!(accepted.validate().is_ok());
+
+        let rejected = Config {
+            ingress_budget_bytes: 128 * 1024 * 1024,
+            ..Config::default()
+        };
+        assert!(rejected.validate().is_err());
+    }
+
+    #[test]
     fn rejects_low_ingress_weight() {
         assert!(
             Config::from_map(&map(&[("PASEO_RELAY_INGRESS_WEIGHT", "2")])).is_err(),
@@ -478,6 +535,22 @@ mod tests {
             Config::from_map(&map(&[("PASEO_RELAY_LOG", "not a [ valid filter")])).is_err(),
             "an invalid EnvFilter directive must abort validation"
         );
+    }
+
+    #[test]
+    fn rejects_directory_as_tls_file() {
+        let dir = std::env::temp_dir();
+        let unique = format!("paseo-tls-dir-{}", std::process::id());
+        let cfg = Config {
+            tls_cert: Some(dir.join(&unique)),
+            tls_key: Some(dir.join(format!("{unique}-key"))),
+            ..Config::default()
+        };
+        // Create the "cert" path as a directory to prove only regular files pass.
+        let cert_dir = cfg.tls_cert.as_ref().unwrap();
+        std::fs::create_dir_all(cert_dir).unwrap();
+        assert!(cfg.validate().is_err(), "a directory is not a TLS file");
+        let _ = std::fs::remove_dir(cert_dir);
     }
 
     #[test]

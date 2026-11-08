@@ -188,6 +188,9 @@ jobs:
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
+          # Do not let a prerelease tag become the repository's "Latest
+          # release"; only stable tags (no '-') are candidates.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Published container image:
             `${{ steps.merge.outputs.name }}@${{ steps.merge.outputs.digest }}`

@@ -9,10 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Security
 
 - Ingress budget accounting is now incremental: data-frame payloads are read in
-  8 KiB chunks and charged only as bytes arrive, with a per-connection in-flight
-  cap and a 1024-fragment limit. A peer that sends only a stalled frame header,
-  or a stream of empty continuation frames, can no longer reserve the node-wide
-  budget and close other sessions with `1013`.
+  8 KiB chunks and charged only as bytes arrive, with per-chunk bookkeeping
+  charged too, a per-connection in-flight cap and a 1024-fragment limit. A peer that declares a payload and never sends
+  it (stalled payload), or a stream of empty continuation frames, can no longer
+  reserve the node-wide budget and close other sessions with `1013`. Ingress
+  budget waits are also capped by the remaining frame/message read deadline.
 - Pre-upgrade HTTP memory is bounded: hyper runs with a 16 KiB read buffer,
   16 KiB header limit, and 64 headers, so unauthenticated TCP connections cannot
   make the relay buffer ~400 KiB each before WebSocket admission.
@@ -47,8 +48,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   updates arrive as at most one PR per ecosystem.
 - `PASEO_RELAY_INGRESS_WEIGHT` now accepts 4..=16 (the minimum is the documented
   safe floor for transient assembly copies). Invalid `PASEO_RELAY_LOG` values
-  and unreadable TLS certificate/key files now fail startup and
-  `--check-config`.
+  and TLS certificate/key paths that are not regular, readable files now fail
+  startup and `--check-config`.
 - Release hardening: only stable tags (no `-`) move the GHCR `latest` tag, and
   the release workflow grants write permissions per job instead of globally.
 - Quickstart examples are sized for their documented memory: Compose caps

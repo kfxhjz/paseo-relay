@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::{Config, FIXED_MESSAGE_OVERHEAD};
+use crate::config::{Config, FIXED_MESSAGE_OVERHEAD, INGRESS_CHUNK_OVERHEAD};
 use crate::metrics::Metrics;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,9 +63,12 @@ impl IngressBudget {
         self.weight
     }
 
-    /// Weighted charge for one payload chunk (no fixed message overhead).
+    /// Weighted charge for one payload chunk: payload bytes plus the fixed
+    /// per-chunk bookkeeping charge (one budget guard and vector slack).
     pub fn chunk_weight(&self, payload_len: usize) -> u64 {
-        (payload_len as u64).saturating_mul(self.weight)
+        (payload_len as u64)
+            .saturating_mul(self.weight)
+            .saturating_add(INGRESS_CHUNK_OVERHEAD)
     }
 
     /// Weighted charge for the fixed per-message bookkeeping overhead.
@@ -351,6 +354,19 @@ mod tests {
         drop(first);
         capacity.try_acquire_ip(ip).unwrap();
         drop(second);
+    }
+
+    #[test]
+    fn chunk_weight_includes_bookkeeping() {
+        let budget = IngressBudget::new(1 << 20, 4);
+        assert_eq!(
+            budget.chunk_weight(1),
+            4 + crate::config::INGRESS_CHUNK_OVERHEAD
+        );
+        assert_eq!(
+            budget.chunk_weight(crate::config::INGRESS_CHUNK_BYTES),
+            crate::config::INGRESS_CHUNK_BYTES as u64 * 4 + crate::config::INGRESS_CHUNK_OVERHEAD
+        );
     }
 
     #[test]

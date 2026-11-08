@@ -137,7 +137,7 @@ impl Metrics {
         counter(
             &mut out,
             "paseo_relay_connection_rejections_total",
-            "WebSocket upgrades rejected at configured capacity or while draining.",
+            "WebSocket upgrades rejected at capacity, while draining, or for invalid handshake/Origin/upgrade failures.",
             &self.connection_rejections,
         );
         counter(
