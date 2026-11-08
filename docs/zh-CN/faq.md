@@ -53,5 +53,15 @@ Paseo 自带 relay 传输 E2E
 ## 默认限制是多少？
 
 默认 20,000 WebSocket、20,000 session、512 MiB 加权 ingress、单消息
-32 MiB−14、v2 control 帧 64 KiB、delivery timeout 30 s。都可配置；见
-[configuration.md](configuration.md)。
+32 MiB−14、v2 control 帧 64 KiB、delivery timeout 30 s，以及每条消息最多 1024 个
+分片。payload 字节按 8 KiB chunk 在到达时计费；每消息固定 256 字节开销只计一次；
+单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)` 的 ingress 预算。除分片
+上限外都可配置；见 [configuration.md](configuration.md)。
+
+## 需要多少内存？
+
+idle 已接受 socket 是主要开销：每个约 23 KiB（hyper 读写缓冲加 task），因此按
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 加 in-flight ingress 预算规划。内置
+25,000 TCP / 20,000 WebSocket 默认值在无 payload 流量前就需要约 700–800 MiB；
+512 MB 主机必须调低上限（Compose 示例使用 5,000 / 4,000 / 4,000）。upgrade 前
+HTTP 路径还受 hyper 限制：16 KiB 缓冲/header、64 个 header。

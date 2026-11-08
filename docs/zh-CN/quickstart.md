@@ -12,8 +12,10 @@
   指向 VPS。
 - Docker + Compose v2，并在防火墙/安全组开放入站 TCP `80`/`443`
   （HTTP/3 可选 UDP `443`）。
-- 使用下面的 Compose 默认值时约 **512 MB 内存**（128 MiB ingress 预算）。relay
-  本身很小，但要给 Caddy 和连接峰值留余量。如果把
+- **relay 容器约 512 MB 内存**（Compose 默认 `PASEO_RELAY_MEM_LIMIT=512m`、
+  129 MiB ingress 预算，连接上限按 512 MB 设置），另给 Caddy 和连接峰值留余量。
+  一个 idle 已接受 socket 仍占约 23 KiB，规划时要算进去。调高
+  `PASEO_RELAY_MEM_LIMIT` 时连接上限要一起调高。如果把
   `PASEO_RELAY_INGRESS_BUDGET_BYTES` 提到内置默认 512 MiB，建议至少 ~1 GB。
   从源码构建需要至少 ~1 GB 和几分钟。
 
@@ -30,8 +32,11 @@ docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
 Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.1`；`latest` 跟随
-最新 release。可用 `PASEO_RELAY_IMAGE` 覆盖版本；如果需要固定不可变的 digest，
-见[部署指南](deployment.md)。
+最新 **stable** release（预发布 tag 不会移动它）。可用 `PASEO_RELAY_IMAGE`
+覆盖版本；如果需要固定不可变的 digest，见[部署指南](deployment.md)。示例还把
+`PASEO_RELAY_MAX_CONNECTIONS`（4,000）、`PASEO_RELAY_MAX_SESSIONS`（4,000）、
+`PASEO_RELAY_MAX_TCP_CONNECTIONS`（5,000）限制到适合 512 MB 内存上限的值；调高
+`PASEO_RELAY_MEM_LIMIT` 时请一起调高这些上限。
 
 Caddy 会自动申请证书。验证：
 
@@ -104,7 +109,7 @@ relay 状态是临时的：Paseo 客户端会重连，E2EE 配对是端到端的
 | 所有连接被拒 | 检查 `PASEO_RELAY_MAX_CONNECTIONS`、`/ready` 和 relay 日志 |
 | 看不到 metrics | `/metrics` 和 `/ready` 被 Caddy 屏蔽；从内网抓 relay |
 | 要下线节点 | 先从边缘摘除，再发 SIGTERM，等待 grace window |
-| OOM 或构建失败 | 使用预构建镜像，或给构建至少 ~1 GB 内存 |
+| OOM 或构建失败 | 使用预构建镜像；同时调高 `PASEO_RELAY_MEM_LIMIT` 和连接上限（每个 idle socket 约 23 KiB），或给构建至少 ~1 GB 内存 |
 
 ## 什么情况下不要用这条路径
 

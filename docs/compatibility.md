@@ -31,6 +31,9 @@ Payloads are opaque and end-to-end encrypted; the relay never decrypts them.
 | Protected / legacy Paseo E2EE | Opaque pass-through; the relay does not negotiate or inspect E2EE records |
 | Legacy `hello` / `e2ee_hello` key hygiene | Supported: small JSON-shaped client frames only, `1008` on invalid keys |
 | Maximum masked client frame / message | `32 MiB - 14` bytes (`1009` on overflow) |
+| Fragments per message | At most 1024 (relay policy; exceeding `1002`) |
+| Frame length encoding | Non-minimal 126/127 encodings rejected (`1002`) |
+| Close codes | Invalid/reserved codes rejected (`1002`); valid range `1000..=1003`, `1007..=1014`, `3000..=4999` |
 | v2 control frame cap | 64 KiB |
 | WebSocket ping/pong | Supported (relay answers pings) |
 | WebSocket compression | Not negotiated (Paseo does not require it) |

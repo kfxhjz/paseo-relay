@@ -44,7 +44,9 @@ Public deployments must serve `wss://`. Either:
   interface, and forward WebSocket upgrades; or
 - mount a PEM certificate chain and key into the container and set
   `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`. The relay then serves HTTPS/
-  WSS directly with rustls. Both settings must be present or startup fails.
+  WSS directly with rustls. Both settings must be present or startup fails, and
+  the files must be readable by the relay user (UID 65532 in the image);
+  `paseo-relay --check-config` verifies that readability.
 
 TLS is not optional for the public internet: although Paseo payloads are
 end-to-end encrypted, `serverId`, connection metadata, and availability are
@@ -64,14 +66,27 @@ The LB must:
 
 Examples:
 
-- Nginx: [examples/nginx.conf](../examples/nginx.conf)
-- HAProxy: [examples/haproxy.cfg](../examples/haproxy.cfg)
+- Nginx: [examples/nginx.conf](../examples/nginx.conf) — TLS edge, consistent
+  hashing, per-IP connection/rate limits, operations endpoints blocked, and an
+  access log that omits the query string.
+- HAProxy: [examples/haproxy.cfg](../examples/haproxy.cfg) — consistent hashing,
+  `/ready` checks, operations endpoints denied, per-source connection/rate
+  limits, and a log format that omits the query string.
 - Kubernetes with ingress-nginx: annotate the Ingress with
   `nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_serverId"` and use
-  `/health` for liveness and `/ready` for readiness probes. See
-  [examples/kubernetes.yaml](../examples/kubernetes.yaml).
+  `/health` for liveness and `/ready` for readiness probes. The example also
+  includes a NetworkPolicy that admits only the ingress-nginx namespace on port
+  4000. See [examples/kubernetes.yaml](../examples/kubernetes.yaml).
 - Envoy: use a `RING_HASH` cluster and a route hash policy with
   `query_parameter: { name: serverId }`.
+
+The Nginx and HAProxy examples assume they terminate TLS directly, so the
+per-IP limits see the real client. If another proxy/CDN is in front, the peer
+address is that proxy: move the limits to the outer edge (or configure the
+proxy protocol/real-IP module) instead of tightening the inner caps. Caddy has
+no built-in per-IP rate limiting in its standard build; use an external CDN/WAF
+for per-client limits. The relay's own `PASEO_RELAY_PER_IP_MAX_CONNECTIONS`
+sees the proxy IP for the same reason.
 
 A small custom gateway is also acceptable if it reads the query string and
 performs the same consistent hash; the relay does not require a specific
@@ -113,9 +128,11 @@ an edge proxy. To serve TLS directly from the relay, mount the PEM files, set
 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`, and publish the TLS port (for
 example `-p 0.0.0.0:443:4000`).
 
-`v0.1.1` is the current release tag and `latest` follows the newest release. For
-an immutable reference, pin the multi-arch index digest for `v0.1.1` listed in
-the [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
+`v0.1.1` is the current release tag and `latest` follows the newest **stable**
+release. Prerelease tags (any tag containing `-`, for example `v0.2.0-rc1`) do
+not move `latest`. For an immutable reference, pin the multi-arch index digest
+for `v0.1.1` listed in the
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1)
 instead of the tag:
 
 ```sh
@@ -135,7 +152,10 @@ The image is a static musl binary in a `scratch` filesystem, runs as UID/GID
 `curl`.
 
 See [examples/docker-compose.yml](../examples/docker-compose.yml) for a
-read-only Compose example that also pulls the published image.
+read-only Compose example that also pulls the published image and sizes the
+connection caps for a 512 MB container (`PASEO_RELAY_MEM_LIMIT`,
+`MAX_CONNECTIONS=4000`, `MAX_SESSIONS=4000`, `MAX_TCP_CONNECTIONS=5000`); raise
+them together with the memory limit.
 
 To build the relay from source (only needed while changing the relay itself),
 use the build override
@@ -154,14 +174,19 @@ Key settings:
 
 - `runAsNonRoot: true`, `runAsUser: 65532`, `readOnlyRootFilesystem: true`,
   `allowPrivilegeEscalation: false`, drop `ALL` capabilities;
+- `automountServiceAccountToken: false` — the relay never calls the Kubernetes
+  API;
 - readiness probe `GET /ready` (removes draining nodes from Service endpoints);
 - liveness/startup probe `GET /health`;
 - `terminationGracePeriodSeconds` greater than
   `PASEO_RELAY_SHUTDOWN_GRACE_MS` (default 10 s), e.g. 30 s;
-- Service accounts need no API permissions; the process needs no filesystem
-  writes;
-- NetworkPolicy: allow ingress only from the ingress controller/proxy; keep
-  `/metrics` reachable only by monitoring;
+- capacity env sized for the container limit (the example uses a 1Gi limit with
+  `MAX_CONNECTIONS=8000`, `MAX_SESSIONS=8000`, `MAX_TCP_CONNECTIONS=10000`, and a
+  129 MiB ingress budget);
+- NetworkPolicy: allow ingress only from the ingress controller/proxy namespace
+  on port 4000; keep `/metrics` reachable only by monitoring (NetworkPolicy is
+  L3/L4, so filter the operations paths at the ingress or scrape the internal
+  Service);
 - keep replicas stable. Scale by adding relay nodes and updating the edge's
   consistent-hash ring; do not use an HPA that reshuffles the ring frequently.
 
@@ -214,17 +239,28 @@ contain no `serverId` labels. See
 
 ## Capacity sizing
 
-Size the container memory above the configured ingress budget plus per-socket
-overhead:
+Memory has two parts: idle/pre-upgrade sockets and in-flight payload accounting.
 
+- **Idle sockets.** An accepted socket costs roughly 23 KiB (hyper read/write
+  buffers plus the task), so reserve `MAX_TCP_CONNECTIONS × ~30 KiB` at idle.
+  The built-in defaults (25,000 TCP / 20,000 WebSocket) need roughly
+  700–800 MiB before any payload traffic; a 512 MB container must lower
+  `PASEO_RELAY_MAX_TCP_CONNECTIONS`, `PASEO_RELAY_MAX_CONNECTIONS`, and
+  `PASEO_RELAY_MAX_SESSIONS` (the Compose examples use 5,000 / 4,000 / 4,000).
+  The hyper builder caps pre-upgrade request buffers (`max_buf_size` 16 KiB,
+  `max_header_size` 16 KiB, `max_headers` 64) and
+  `PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS` bounds the header phase, but those limits
+  do not make an idle socket free.
 - `PASEO_RELAY_INGRESS_BUDGET_BYTES` (default 512 MiB weighted) bounds
-  in-flight payload accounting;
-- `PASEO_RELAY_MAX_CONNECTIONS` (default 20,000) bounds WebSockets;
-- `PASEO_RELAY_MAX_TCP_CONNECTIONS` (default 25,000) bounds all TCP sockets,
-  including pre-upgrade HTTP;
-- `PASEO_RELAY_MAX_SESSIONS` (default 20,000) bounds idle `serverId` entries;
+  in-flight payload accounting; it is charged in 8 KiB chunks as payload bytes
+  arrive, and one connection can hold at most
+  `min(budget, 4 × one-max-message charge)`.
+- `PASEO_RELAY_MAX_TCP_CONNECTIONS` is the total OS-socket cap and includes
+  upgraded WebSockets (the slot is held for the whole socket lifetime), so
+  `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` matters.
+- `PASEO_RELAY_MAX_SESSIONS` (default 20,000) bounds idle `serverId` entries.
 - `PASEO_RELAY_CONTROL_QUEUE_BYTES` / writer queues bound per-destination
   buffering.
 
-The relay's own memory is small and proportional to active sockets and queued
-payloads; measure with `/metrics` and the container's RSS under your workload.
+The relay's own memory is proportional to active sockets and queued payloads;
+measure with `/metrics` and the container's RSS under your workload.

@@ -108,7 +108,7 @@ daemon。必要时重启/重载 daemon，然后重新生成配对链接。
 |---|---|---|---|
 | 运行时 | 一个静态 musl 二进制 | BEAM release + Cowboy | 由托管方决定 |
 | Erlang distribution / cookie / EPMD | 无 | 有（集群模式） | 不适用 |
-| 内存模型 | 显式有界预算和队列；读取 payload 前先记账 | BEAM + capacity ledger | 由托管方决定 |
+| 内存模型 | 显式有界预算和队列；payload 按 chunk 记账 | BEAM + capacity ledger | 由托管方决定 |
 | 多节点 | 边缘按 `serverId` 一致性哈希；无 reroute/ownership | Syn ownership + 409 reroute | 托管方管理 |
 | 原生 TLS | rustls | 通常在边缘终止 | 托管方管理 |
 | 运维 | SIGTERM drain、scratch 非 root 镜像、聚合指标 | BEAM release | 托管方管理 |
@@ -124,8 +124,10 @@ relay，选这个。如果你不想维护带 `serverId` 亲和性的边缘代理
   control ping/pong。
 - **E2EE payload 不透明**：不解密、不落盘、不记录 payload；唯一的检查是有界的
   `hello`/`e2ee_hello` key 卫生检查。
-- **默认有界**：2 万 WebSocket/session，payload 分配前预扣加权 ingress 预算，
-  每消息固定开销，每 destination writer 队列有界，帧/消息读取有 deadline。
+- **默认有界**：2 万 WebSocket/session；payload 到达时按 8 KiB chunk 计入加权
+  ingress 预算（每连接最多一个 8 KiB chunk 尚未计费）；每消息固定 256 字节开销只计
+  一次；每连接 in-flight 上限；每条消息最多 1024 个分片；每 destination writer
+  队列有界；帧/消息读取有 deadline。
 - **Fail closed**：明确的 HTTP 状态码或 WebSocket close code；不留下半开状态；
   非法 ID 直接 `400`。
 - **运维**：`/health`、`/ready`、`/metrics`、`/version`，文本或 JSON 结构化日志，
@@ -134,8 +136,8 @@ relay，选这个。如果你不想维护带 `serverId` 亲和性的边缘代理
   per-IP WebSocket 上限；日志不记录 ID/payload。
 - **无账号、无遥测、无外呼**：relay 只监听，不注册、不统计、不 phone-home
   （Paseo 配对是端到端的）。
-- **部署**：固定 digest 的 builder、多架构发布工作流（含 provenance/SBOM）、
-  scratch 非 root 运行时、read-only 友好。
+- **部署**：固定 digest 的 builder、多架构发布工作流（每个平台独立的
+  provenance 和 SBOM attestation）、scratch 非 root 运行时、read-only 友好。
 
 ## 一图看懂架构
 
@@ -172,10 +174,12 @@ probe 脚本和输出未提交，因此只作为补充材料，不是可复现�
 ## 部署
 
 发布 `v0.1.1` 会把多架构（`linux/amd64`、`linux/arm64`）镜像发布到 GHCR，
-附带 provenance 和 SBOM。直接用短版本 tag 即可；tag 带前导 `v`（不带 `v` 的
+附带 **每个平台独立** 的 provenance 和 SBOM attestation（多架构 index 本身没有
+index 级 attestation）。直接用短版本 tag 即可；tag 带前导 `v`（不带 `v` 的
 `0.1.1` 没有发布）：
 
-- **镜像 tag：** `ghcr.io/kfxhjz/paseo-relay:v0.1.1`（同时打 `latest`）。
+- **镜像 tag：** `ghcr.io/kfxhjz/paseo-relay:v0.1.1`（同时打 `latest`；只有
+  stable release tag 会移动 `latest`，预发布 tag 不会）。
 
 可以用以下命令检查已发布镜像：
 
@@ -225,13 +229,28 @@ SHA-pinned CI actions），不宣称跨主机 bit-for-bit 完全一致。
 ## 运维与指标
 
 `/metrics` 是只含聚合值的 Prometheus 文本（没有 `serverId` label）：readiness/
-draining、活跃 WebSocket/session、ingress 预留、转发帧/字节、slow consumer、
-delivery timeout、拒绝数、handshake 结果、最大帧、uptime、build info。见
+draining、活跃 WebSocket/session、ingress 已预留/预算字节、转发帧/字节、slow
+consumer、delivery timeout、拒绝数、handshake 结果、最大帧、uptime、build info。见
 [docs/zh-CN/operations.md](docs/zh-CN/operations.md)、
 [examples/prometheus.yml](examples/prometheus.yml)、
 [examples/alerts.yml](examples/alerts.yml)。
 
 请把 `/metrics` 和 `/ready` 放在内网。relay 的运维端点没有认证。
+
+## 内存模型与滥用上限
+
+idle 内存主要由已接受 socket 决定，而不是 payload：hyper 限制了未认证的 upgrade 前
+请求路径（缓冲/header 16 KiB、64 个 header），但一个 idle socket 仍约占 23 KiB，
+因此按 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 规划。内置 25,000 TCP /
+20,000 WebSocket 默认值在没有任何 payload 流量前就需要约 700–800 MiB；512 MB 主机
+必须调低上限（Compose 示例使用 5,000 / 4,000 / 4,000）。
+
+payload 记账是增量的：data frame payload 按 8 KiB chunk 在字节到达时计费，每消息
+固定 256 字节开销只计一次，单个连接最多持有
+`min(budget, 4 × 一条最大消息的计费)` 的加权 ingress 预算，一条消息最多 1024 个
+分片。因此停滞 header 无法为它从未发送的 payload 预留预算，分片上限也限制了空分片
+洪泛。完整限制见 [docs/zh-CN/configuration.md](docs/zh-CN/configuration.md) 和
+[DESIGN.zh-CN.md](DESIGN.zh-CN.md)。
 
 ## 性能基准
 
@@ -257,8 +276,8 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 - **没有透明会话迁移**：节点 drain/替换对客户端来说是一次重连。
 - **per-IP 限制较粗**：默认 `0`，因为文档推荐拓扑使用边缘代理；直连部署时再启用
   并按用户规模设置。
-- **大消息占用预算**：少数最大消息可能吃掉配置的 ingress 预算；可以提高预算或
-  在边缘限流。
+- **大消息占用预算**：少数最大消息可能吃掉配置的 ingress 预算（单连接上限为
+  `min(budget, 4 × 一条最大消息的计费)`）；可以提高预算或在边缘限流。
 - **没有 per-user 配额/relay 认证**：公共运营者必须在边缘做限制并提供隐私/滥用
   政策；见 [operator-policy.md](docs/zh-CN/operator-policy.md)。
 - **没有第三方安全审计**：这里的证据是代码评审、真实 socket 测试、fuzz scaffold

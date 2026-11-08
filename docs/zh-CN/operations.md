@@ -38,18 +38,24 @@ Counter：`paseo_relay_frames_forwarded_total`、`paseo_relay_bytes_forwarded_to
 
 Gauge：`paseo_relay_ready`、`paseo_relay_draining`、
 `paseo_relay_active_websockets`、`paseo_relay_active_sessions`、
-`paseo_relay_ingress_reserved_bytes`、`paseo_relay_max_frame_bytes`、
-`paseo_relay_uptime_seconds`、`paseo_relay_build_info{version,revision}`。
+`paseo_relay_ingress_reserved_bytes`、`paseo_relay_ingress_budget_bytes`、
+`paseo_relay_max_frame_bytes`、`paseo_relay_uptime_seconds`、
+`paseo_relay_build_info{version,revision}`。
 
 建议告警：节点 unready 超过 2 分钟、connection rejection 上升、slow-consumer 断开、
-ingress 预留超过配置预算约 80%、实例从 scrape targets 消失。见
+ingress 预留超过配置预算约 80%（用
+`paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes` 比率，对任意
+配置预算都成立）、实例从 scrape targets 消失。见
 [examples/alerts.yml](../../examples/alerts.yml)。
 
 ## 容量与排障
 
-- `paseo_relay_ingress_reserved_bytes` 接近
-  `PASEO_RELAY_INGRESS_BUDGET_BYTES` 说明有大消息 in-flight 或慢 destination；
-  查看 slow-consumer/delivery 指标。
+- `paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes` 接近
+  `0.8` 说明有大消息 in-flight 或慢 destination；查看 slow-consumer/delivery
+  指标。该比率对任意配置预算都适用，不像绝对字节阈值那样依赖默认值。
+- idle 内存主要由已接受 socket 决定，而不是 payload：一个 idle socket 约占
+  23 KiB，因此 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 是下限。内置
+  25,000 socket 默认值在无流量时就要约 700–800 MiB；小节点请调低这些上限。
 - `active_sessions` 包含空 session，直到 idle sweep 清理；重连风暴后这是正常的。
 - `connection_rejections_total` 包含非法 upgrade、draining、per-IP 限制和容量；
   需结合边缘日志归因。

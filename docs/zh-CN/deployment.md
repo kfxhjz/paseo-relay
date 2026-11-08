@@ -39,7 +39,9 @@ flowchart TD
 
 - 在边缘终止 TLS（推荐），relay 只监听私网，并转发 WebSocket upgrade；或
 - 挂载 PEM 证书链和私钥，设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`，
-  由 relay 用 rustls 直接提供 HTTPS/WSS。两者必须同时设置，否则启动失败。
+  由 relay 用 rustls 直接提供 HTTPS/WSS。两者必须同时设置，否则启动失败；文件必须
+  对 relay 用户（镜像内 UID 65532）可读，`paseo-relay --check-config` 会校验
+  可读性。
 
 Paseo payload 虽然 E2EE，但 `serverId`、连接元数据和可用性仍会暴露给明文网络上的
 被动/主动攻击者，所以公网不能只跑 `ws://`。
@@ -57,13 +59,22 @@ LB 必须：
 
 示例：
 
-- Nginx：[examples/nginx.conf](../../examples/nginx.conf)
-- HAProxy：[examples/haproxy.cfg](../../examples/haproxy.cfg)
+- Nginx：[examples/nginx.conf](../../examples/nginx.conf) —— TLS 边缘、一致性哈希、
+  per-IP 连接/速率限制、屏蔽运维端点，访问日志不记录 query string。
+- HAProxy：[examples/haproxy.cfg](../../examples/haproxy.cfg) —— 一致性哈希、
+  `/ready` 检查、拒绝运维端点、per-source 连接/速率限制，日志格式不记录 query string。
 - Kubernetes + ingress-nginx：Ingress annotation 设为
   `nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_serverId"`，liveness 用
-  `/health`，readiness 用 `/ready`。见 [examples/kubernetes.yaml](../../examples/kubernetes.yaml)。
+  `/health`，readiness 用 `/ready`。示例还包含只允许 ingress-nginx namespace 访问
+  4000 端口的 NetworkPolicy。见 [examples/kubernetes.yaml](../../examples/kubernetes.yaml)。
 - Envoy：使用 `RING_HASH` cluster，route hash policy 选
   `query_parameter: { name: serverId }`。
+
+Nginx 和 HAProxy 示例假定它们直接终止 TLS，因此 per-IP 限制看到的是真实客户端。
+如果前面还有一层代理/CDN，peer 地址就是那层代理：请把限制放到最外层（或配置
+proxy protocol/real-IP 模块），不要收紧内层上限。Caddy 标准构建没有内置 per-IP
+限流；需要 per-client 限制时用外部 CDN/WAF。同理，relay 自己的
+`PASEO_RELAY_PER_IP_MAX_CONNECTIONS` 看到的也是代理 IP。
 
 也可以自己写一个小 gateway 读 query 并做同样的哈希；relay 不依赖特定厂商。
 
@@ -99,8 +110,9 @@ docker run -d \
 TLS，请挂载 PEM 证书、设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`，并发布
 TLS 端口（例如 `-p 0.0.0.0:443:4000`）。
 
-`v0.1.1` 是当前 release tag，`latest` 跟随最新 release。如果需要不可变引用，请改用
-[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1) 中
+`v0.1.1` 是当前 release tag，`latest` 跟随最新 **stable** release。预发布 tag
+（任何包含 `-` 的 tag，例如 `v0.2.0-rc1`）不会移动 `latest`。如果需要不可变引用，
+请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1) 中
 `v0.1.1` 对应的多架构 index digest，而不是 tag：
 
 ```sh
@@ -118,8 +130,10 @@ docker run -d \
 `healthcheck` 子命令（镜像 `HEALTHCHECK` 调用 `/paseo-relay healthcheck`）。
 不需要 shell 或 `curl`。
 
-Compose 示例见 [examples/docker-compose.yml](../../examples/docker-compose.yml)，
-同样默认拉取已发布镜像。
+Compose 示例见 [examples/docker-compose.yml](../../examples/docker-compose.yml)：
+同样默认拉取已发布镜像，并把连接上限按 512 MB 容器设置
+（`PASEO_RELAY_MEM_LIMIT`、`MAX_CONNECTIONS=4000`、`MAX_SESSIONS=4000`、
+`MAX_TCP_CONNECTIONS=5000`）；调高内存上限时请一起调高这些值。
 
 只有在修改 relay 本身时才需要从源码构建：使用 build override
 （[examples/docker-compose.build.yml](../../examples/docker-compose.build.yml)），
@@ -136,12 +150,16 @@ docker compose -f examples/docker-compose.yml \
 
 - `runAsNonRoot: true`、`runAsUser: 65532`、`readOnlyRootFilesystem: true`、
   `allowPrivilegeEscalation: false`，drop `ALL` capabilities；
+- `automountServiceAccountToken: false` —— relay 不调用 Kubernetes API；
 - readiness probe `GET /ready`，让 draining 节点从 Service endpoints 摘除；
 - liveness/startup probe `GET /health`；
 - `terminationGracePeriodSeconds` 大于 `PASEO_RELAY_SHUTDOWN_GRACE_MS`
   （默认 10 s），例如 30 s；
-- ServiceAccount 不需要 API 权限；进程不需要写文件；
-- NetworkPolicy：只允许 ingress controller/proxy 入站；`/metrics` 只给监控；
+- 容量 env 按容器 limit 设置（示例用 1Gi limit，`MAX_CONNECTIONS=8000`、
+  `MAX_SESSIONS=8000`、`MAX_TCP_CONNECTIONS=10000`，ingress 预算 129 MiB）；
+- NetworkPolicy：只允许 ingress controller/proxy namespace 访问 4000 端口；
+  `/metrics` 只给监控（NetworkPolicy 只到 L3/L4，运维路径要在 ingress 过滤，或从
+  内网 Service 抓取）；
 - 保持 replicas 稳定。扩容时增加 relay 节点并更新边缘一致性哈希环；不要用会让
   环频繁重排的 HPA。
 
@@ -189,13 +207,25 @@ sequenceDiagram
 
 ## 容量规划
 
-容器内存要大于配置的 ingress budget 加每 socket 开销：
+内存分两部分：idle/upgrade 前 socket 与 in-flight payload 记账。
 
-- `PASEO_RELAY_INGRESS_BUDGET_BYTES`（默认 512 MiB 加权）限制 in-flight payload 记账；
-- `PASEO_RELAY_MAX_CONNECTIONS`（默认 20,000）限制 WebSocket；
-- `PASEO_RELAY_MAX_TCP_CONNECTIONS`（默认 25,000）限制所有 TCP，包括 upgrade 前 HTTP；
-- `PASEO_RELAY_MAX_SESSIONS`（默认 20,000）限制 idle `serverId` 条目；
+- **Idle socket。** 一个已接受 socket 约占 23 KiB（hyper 读写缓冲加 task），因此
+  idle 时按 `MAX_TCP_CONNECTIONS × ~30 KiB` 预留。内置默认值
+  （25,000 TCP / 20,000 WebSocket）在没有任何 payload 流量前就需要约
+  700–800 MiB；512 MB 容器必须调低 `PASEO_RELAY_MAX_TCP_CONNECTIONS`、
+  `PASEO_RELAY_MAX_CONNECTIONS` 和 `PASEO_RELAY_MAX_SESSIONS`（Compose 示例使用
+  5,000 / 4,000 / 4,000）。hyper builder 限制了 upgrade 前请求缓冲
+  （`max_buf_size` 16 KiB、`max_header_size` 16 KiB、`max_headers` 64），
+  `PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS` 限制 header 阶段，但这些限制不会让 idle
+  socket 变得免费。
+- `PASEO_RELAY_INGRESS_BUDGET_BYTES`（默认 512 MiB 加权）限制 in-flight payload
+  记账；它按 8 KiB chunk 随 payload 字节到达计费，单个连接最多持有
+  `min(budget, 4 × 一条最大消息的计费)`。
+- `PASEO_RELAY_MAX_TCP_CONNECTIONS` 是 OS socket 总上限，包含 upgrade 后的
+  WebSocket（slot 在整个 socket 生命周期内持有），因此
+  `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` 有意义。
+- `PASEO_RELAY_MAX_SESSIONS`（默认 20,000）限制 idle `serverId` 条目。
 - `PASEO_RELAY_CONTROL_QUEUE_BYTES` / writer 队列限制每 destination 缓冲。
 
-relay 自身内存很小，与活跃 socket 和排队 payload 成正比；请用 `/metrics` 和容器
+relay 自身内存与活跃 socket 和排队 payload 成正比；请用 `/metrics` 和容器
 RSS 在真实负载下测量。

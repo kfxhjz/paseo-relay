@@ -23,6 +23,12 @@ Paseo clients and daemons treat `serverId` as a bearer secret: anyone who knows
 it can attach to the session. The relay does not add authentication by design;
 see the security model in README and `SECURITY.md`.
 
+Send exactly one unencoded `serverId`. If a query parameter appears more than
+once, the relay uses the **last** occurrence (last-wins, matching the Elixir
+implementation's `Map.new/1`). Edge consistent hashing normally hashes the raw
+query value, so duplicate or percent-encoded forms can route the two sides of a
+session to different relay nodes.
+
 ## v1
 
 One server socket and one client socket per `serverId`. A newer socket for a
@@ -116,20 +122,35 @@ sequenceDiagram
 | Item | Limit / behavior |
 |---|---|
 | Client data frame / reassembled message | `32 MiB - 14` bytes; overflow closes `1009` |
+| Fragments per message | At most 1024; exceeding closes `1002` |
+| Length encoding | The 126/127 length forms must be minimal; a non-minimal encoding closes `1002` |
 | v2 control frames | 64 KiB per frame/message |
 | WebSocket control frames | RFC 6455 (≤125 bytes, not fragmented) |
+| Close payload | Empty, or at least 2 bytes with a valid status code; an invalid code closes `1002` |
 | Compression | Not negotiated |
 | Masking | Client frames must be masked; unmasked closes `1002` |
 | Invalid UTF-8 in a text message | Closes `1007` |
 | Fragmented messages | Reassembled and forwarded as one message; opcode preserved |
 | Frame payload read | Must complete within `FRAME_READ_TIMEOUT_MS`; closes `1013` |
 | Fragmented message | Must complete within `MESSAGE_READ_TIMEOUT_MS`; closes `1013` |
-| Source payload accounting | Weighted ingress budget is reserved **before** payload allocation |
+| Idle/header timeout between frames | None between WebSocket frames; idle connections hold their slots by design, so enforce idle limits at the edge |
+| Source payload accounting | Data payload is read in 8 KiB chunks and each chunk is charged after it arrives; at most one 8 KiB chunk per connection is allocated before charging |
+| Per-connection in-flight cap | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)` |
 | Slow destination | Bounded writer queue + deadline; destination sheds `1013` |
+
+Ingress accounting has two refinements that matter for abuse limits:
+
+- the fixed 256-byte per-message overhead is charged **once per message**, not
+  once per fragment, so a fragmented message is not billed thousands of times
+  for its headers;
+- a data-frame payload is read in 8 KiB chunks and each chunk is charged after
+  it arrives, so at most one 8 KiB chunk per connection is allocated before it
+  is accounted. A stalled frame therefore cannot reserve budget for bytes it
+  never sends.
 
 ## Handshake key hygiene
 
-For client text/binary frames of at most 1 MiB whose first non-whitespace byte
+For client text/binary frames of at most 64 KiB whose first non-whitespace byte
 is `{`, the relay parses the JSON. If `type` is `hello` or `e2ee_hello`, the
 `key` must be canonical padded Base64 for a canonical 32-byte X25519 public key
 and must not be a known low-order/unsupported point. A mismatch closes `1008`
@@ -137,7 +158,7 @@ and must not be a known low-order/unsupported point. A mismatch closes `1008`
 
 This is protocol hygiene, **not** a security boundary: Paseo's E2EE handshake is
 authenticated by the endpoints, and the relay is untrusted by design. Frames
-larger than 1 MiB that look like JSON are not inspected by this check.
+larger than 64 KiB that look like JSON are not inspected by this check.
 
 ## Close codes
 
@@ -145,13 +166,20 @@ larger than 1 MiB that look like JSON are not inspected by this check.
 |---|---|
 | `1000` | Normal closure; a received allowed code is echoed |
 | `1001` | Last v2 client detached, data socket closed |
-| `1002` | Protocol error (bad frame, masking, close payload) |
+| `1002` | Protocol error: bad frame or masking, non-minimal length encoding, too many fragments, or invalid close payload/code |
 | `1007` | Invalid UTF-8 in a text message |
 | `1008` | Replaced by a newer socket, invalid handshake key, or policy close |
 | `1009` | Frame or message too large |
 | `1011` | Control socket unresponsive |
 | `1012` | Relay shutting down, or v2 server data socket disconnected |
 | `1013` | Ingress budget/read timeout, data route unavailable, or delivery unavailable (retryable) |
+
+Valid close codes are `1000..=1003`, `1007..=1014`, and `3000..=4999`. An empty
+close payload is allowed; a one-byte payload is not. `1005`/`1006`/`1015` are
+reserved for local use and are never sent on the wire. Codes below `1000`,
+`1004`, `1005`, `1006`, `1015`, `1016..=2999`, and codes above `4999` are
+rejected with `1002`. `1002` means the peer violated the framing/protocol
+contract; the relay closes the socket and does not retry.
 
 ## HTTP endpoints
 

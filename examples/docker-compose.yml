@@ -17,6 +17,14 @@ services:
     cap_drop: ["ALL"]
     security_opt:
       - no-new-privileges:true
+    # WebSocket sessions are long-lived; do not inherit a low host fd limit.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Defaults sized for a 512 MB container. Raise PASEO_RELAY_MEM_LIMIT and the
+    # connection caps together, or the process will be OOM-killed.
+    mem_limit: "${PASEO_RELAY_MEM_LIMIT:-512m}"
     ports:
       - "127.0.0.1:4000:4000"
     environment:
@@ -24,6 +32,12 @@ services:
       PASEO_RELAY_PORT: "4000"
       PASEO_RELAY_LOG: "info"
       PASEO_RELAY_LOG_FORMAT: "json"
+      # Sized for a 512 MB container; raise together with PASEO_RELAY_MEM_LIMIT.
+      # An idle accepted socket costs ~23 KiB, so keep MAX_TCP_CONNECTIONS well
+      # below RAM/30 KiB. The built-in defaults (20k/25k) need ~700-800 MiB idle.
+      PASEO_RELAY_MAX_CONNECTIONS: "4000"
+      PASEO_RELAY_MAX_SESSIONS: "4000"
+      PASEO_RELAY_MAX_TCP_CONNECTIONS: "5000"
       # PUBLIC DEPLOYMENTS: terminate TLS at the edge and leave these unset.
       # For a private network with native TLS, mount PEM files and set both:
       # PASEO_RELAY_TLS_CERT: "/tls/cert.pem"

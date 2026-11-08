@@ -63,4 +63,7 @@ query string，并把配对链接和二维码当作秘密。relay 按设计没�
 
 见 README 的 hardening checklist 和 [docs/zh-CN/deployment.md](docs/zh-CN/deployment.md)。
 至少：终止 TLS、不要公开 `/metrics` 和 `/ready`、在边缘做 per-IP 限制、用提供的
-非 root 用户以 read-only 运行容器，并保持 relay 和 Rust 工具链更新。
+非 root 用户以 read-only 运行容器，并保持 relay 和 Rust 工具链更新。连接上限要按
+主机内存设置：一个 idle 已接受 socket 约占 23 KiB，按
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` 规划（内置 25,000 socket 默认值约需
+700–800 MiB），小节点必须调低上限。

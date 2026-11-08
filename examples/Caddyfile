@@ -5,15 +5,20 @@
 # need an edge that hashes the `serverId` query parameter (see nginx.conf /
 # haproxy.cfg); Caddy's generic reverse_proxy does not provide that.
 #
-# /metrics is intentionally blocked from the public listener. Scrape the relay
-# directly on the private Docker network if you need Prometheus metrics.
+# `/metrics`, `/ready`, and `/version` are intentionally blocked from the public
+# listener. Scrape the relay directly on the private Docker network if you need
+# Prometheus metrics. Caddy OSS has no built-in per-IP rate limiting: put a
+# CDN/WAF (or a custom Caddy module) in front if you need per-client limits.
+#
+# `serverId` is a bearer routing secret in the query string. Do not enable an
+# access log that records query strings.
 
 {$RELAY_DOMAIN} {
 	encode zstd gzip
 
 	# Keep operations surfaces off the public listener. /health remains public
 	# for simple liveness checks; readiness is available on the relay network.
-	@operations path /metrics /ready
+	@operations path /metrics /ready /version
 	handle @operations {
 		respond 404
 	}

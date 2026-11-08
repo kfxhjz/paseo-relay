@@ -4,9 +4,9 @@
 #     docker compose -f examples/docker-compose.caddy.yml up -d
 #
 # This pulls the published relay image (default
-# `ghcr.io/kfxhjz/paseo-relay:v0.1.1`; `latest` follows the newest release).
-# Override with PASEO_RELAY_IMAGE, ideally by digest. For a local source build
-# use the build override:
+# `ghcr.io/kfxhjz/paseo-relay:v0.1.1`; only stable release tags move
+# `latest`, so prerelease tags never do). Override with PASEO_RELAY_IMAGE,
+# ideally by digest. For a local source build use the build override:
 #   docker compose -f examples/docker-compose.caddy.yml \
 #     -f examples/docker-compose.caddy.build.yml up -d --build
 #
@@ -22,16 +22,34 @@ services:
     cap_drop: ["ALL"]
     security_opt:
       - no-new-privileges:true
+    # WebSocket sessions are long-lived; do not inherit a low host fd limit.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Defaults sized for a 512 MB container. Raise PASEO_RELAY_MEM_LIMIT and the
+    # connection caps together, or the relay will be OOM-killed.
+    mem_limit: "${PASEO_RELAY_MEM_LIMIT:-512m}"
     environment:
       PASEO_RELAY_HOST: "0.0.0.0"
       PASEO_RELAY_PORT: "4000"
       PASEO_RELAY_LOG: "info"
       PASEO_RELAY_LOG_FORMAT: "json"
-      # Small VPS default (128 MiB weighted ingress). Raise together with the
-      # container memory limit; the built-in default is 512 MiB.
-      PASEO_RELAY_INGRESS_BUDGET_BYTES: "${PASEO_RELAY_INGRESS_BUDGET_BYTES:-134217728}"
+      # 129 MiB weighted ingress for a small VPS. The validator requires
+      # >= (MAX_MESSAGE_BYTES + 256) * INGRESS_WEIGHT = 134,218,696 bytes, and
+      # 128 MiB (134,217,728) is just below that floor, so the container would
+      # refuse to start. 135,266,304 = 129 MiB clears it. The built-in default
+      # is 512 MiB; raise this together with the memory limit.
+      PASEO_RELAY_INGRESS_BUDGET_BYTES: "${PASEO_RELAY_INGRESS_BUDGET_BYTES:-135266304}"
+      # Sized for a 512 MB container; raise together with PASEO_RELAY_MEM_LIMIT.
+      # An idle accepted socket costs ~23 KiB, so keep MAX_TCP_CONNECTIONS well
+      # below RAM/30 KiB. The built-in defaults (20k/25k) need ~700-800 MiB idle.
+      PASEO_RELAY_MAX_CONNECTIONS: "4000"
+      PASEO_RELAY_MAX_SESSIONS: "4000"
+      PASEO_RELAY_MAX_TCP_CONNECTIONS: "5000"
       # Behind Caddy every client appears as the Caddy IP; keep 0 and limit at
-      # the edge.
+      # the edge. Caddy OSS has no built-in per-IP limiter; use a CDN/WAF in
+      # front for per-client rate limits.
       PASEO_RELAY_PER_IP_MAX_CONNECTIONS: "0"
     healthcheck:
       test: ["CMD", "/paseo-relay", "healthcheck"]

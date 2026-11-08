@@ -38,7 +38,7 @@
                         │                 └─ hyper upgrade ──┐           │
                         │  per-socket reader task            │           │
                         │   ├─ RFC 6455 frame decode         │           │
-                        │   ├─ ingress budget reservation    │           │
+                        │   ├─ chunked ingress charging      │           │
                         │   └─ route via session registry    │           │
                         │  per-socket writer task            │           │
                         │   ├─ bounded mpsc + byte permits   │           │
@@ -81,9 +81,15 @@ flowchart TD
 ```
 
 1. **TCP accept。** listener 在读取请求之前先获取 TCP slot
-   （`MAX_TCP_CONNECTIONS`）。HTTP header 阶段有 header timeout，慢 client 不能无限
-   占用 slot。per-IP WebSocket slot（`PER_IP_MAX_CONNECTIONS`，0 = 不限制）在
-   admission 阶段、upgrade 完成之前获取。
+   （`MAX_TCP_CONNECTIONS`），并在整个 socket 生命周期内持有它（包括 WebSocket
+   upgrade 之后），因此 `MAX_TCP_CONNECTIONS` 是 OS socket 总上限。HTTP header
+   阶段受 header timeout 和 hyper 请求限制（`max_buf_size` 16 KiB、
+   `max_header_size` 16 KiB、`max_headers` 64）约束，慢 client 不能无限占用 slot，
+   upgrade 前路径也不会无界分配。一个 idle 的已接受 socket 仍约占 23 KiB（hyper
+   读写缓冲加 task）；idle 时按 `MAX_TCP_CONNECTIONS × ~30 KiB` 规划，25,000 默认值
+   约需 700–800 MiB，所以 512 MB 节点必须调低上限。per-IP WebSocket slot
+   （`PER_IP_MAX_CONNECTIONS`，0 = 不限制）在 admission 阶段、upgrade 完成之前
+   获取。
 2. **请求分类。** `GET /ws` 是唯一可 upgrade 的路由；其他路径返回 `404`，运维端点
    只读。`/health` 与 readiness 独立，这样 liveness 探针不会在 drain 期间触发重启。
 3. **upgrade 前校验。** 在分配任何 relay 状态之前，请求必须通过：
@@ -135,8 +141,12 @@ flowchart TD
 
 relay 的核心可靠性规则是 **源端背压，而不是缓冲**：
 
-1. reader 一次解析一帧。在读取 payload 之前，它从节点级预算中预留加权 ingress
-   字节。
+1. reader 一次解析一帧。data frame 的 payload 按 8 KiB chunk 读取，每个 chunk 到达后
+   才计入加权 ingress 预算，因此每个连接在计费前最多分配一个 8 KiB chunk。每消息
+   固定 256 字节开销 **每条消息只计一次**，不按分片重复计费；一条消息最多 1024 个
+   分片（固定策略，超过则 close `1002`）。每连接 in-flight 上限为
+   `min(全局预算, 4 × 一条最大消息的计费)`，限制单个连接最多持有的预算；4× 对应
+   reader 最多流水化 4 条消息。
 2. 它从 registry 解析 destination，并把帧 enqueue 到 destination 的 writer 队列，
    等待有界 byte permit。
 3. writer 写入并 flush 帧，然后 ack；路由 task 等待该 ack（受 delivery deadline
@@ -156,10 +166,20 @@ control socket 有自己的 64 KiB 帧上限。
 
 节点级信号量限制所有连接中 **in-flight** 的 payload 字节。每条消息的计费是
 `(payload_len + 256) * ingress_weight`：固定的 256 字节开销让空帧和小帧不是免费的
-；weight 建模了 buffered payload 可能被保留多次的事实（read buffer、writer
-queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket 死亡总会归还字节。
-预算在 **读取 payload 之前** 预留，因此超大或预算耗尽的消息在被缓冲之前就被
-拒绝。
+（每条消息只计一次）；weight 建模了 buffered payload 可能被保留多次的事实（read
+buffer、writer queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket
+死亡总会归还字节。
+
+计费是增量的，不是按声明帧长度一次性预留。reader 按 8 KiB chunk 读取 data frame
+payload；每个 chunk 到达后才计费，并在帧投递完成或连接死亡时释放，因此每个连接在
+计费前最多分配一个 8 KiB chunk。每连接 in-flight 上限为
+`min(全局预算, 4 × 一条最大消息的计费)`：单个连接最多持有这么多加权预算，4× 对应
+reader 最多流水化 4 条消息。再配合每条消息最多 1024 个分片的固定策略，这些上限
+限制了停滞帧或空分片洪泛能占用多少预算：帧声明的长度在字节真正到达之前不会被计费。
+
+`PASEO_RELAY_INGRESS_WEIGHT` 被限制在 `4..=16`。最小值 `4` 为 2× 临时拷贝（发送方
+read buffer 加 destination writer queue）留出余量，同时保持记账保守；`256` 和 `4`
+是可评审的配置常量，不是测量出来的 allocator 成本。
 
 ### 2.6 生命周期与优雅关闭
 
@@ -181,7 +201,7 @@ queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket �
 。
 - 帧转发时保留 opcode。Binary payload 完全透明；text payload 在 framing 层做 UTF-8
   校验（协议要求），但不为路由解析内容。
-- 透明性有一个狭窄例外：client 发来的、最多 1 MiB 且首个非空白字节为 `{` 的帧会被
+- 透明性有一个狭窄例外：client 发来的、最多 64 KiB 且首个非空白字节为 `{` 的帧会被
   预筛为可能的 Paseo `hello`/`e2ee_hello` 握手；只有这时才解析，其 `key` 必须是
   规范 32 字节 X25519 公钥的规范 padded Base64。这是协议卫生，不是安全边界；失败会
   以 `1008` 关闭 client，且绝不转发。
@@ -210,8 +230,8 @@ queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket �
 | # | 不变量 | 执行方式 |
 |---|---|---|
 | I1 | payload 不透明，绝不记录或持久化。 | 除有界 handshake 卫生检查外不解析 payload；指标只计字节，不记内容；`serverId` 和 payload 字节绝不记录。 |
-| I2 | 内存由配置约束，而不是由 peer 行为约束。 | 帧/消息上限、control 帧上限、data frame 的 writer 字节信号量、有界 mpsc、全局 ingress 预算、connection/session/per-IP 上限、HTTP header timeout；ping/pong 帧还受 mpsc 条数和 RFC 125 字节限制约束。 |
-| I3 | 慢 destination 对 source 施加背压；队列绝不无界增长。 | source 等待 ingress 预留和 writer ack；delivery deadline 触发淘汰而不是缓冲。 |
+| I2 | 内存由配置约束，而不是由 peer 行为约束。 | 帧/消息上限、1024 分片策略、control 帧上限、data frame 的 writer 字节信号量、有界 mpsc、带每连接 in-flight 上限的增量 ingress 计费、upgrade 前 HTTP 缓冲/header 上限、connection/session/per-IP 上限、HTTP header timeout；ping/pong 帧还受 mpsc 条数和 RFC 125 字节限制约束。 |
+| I3 | 慢 destination 对 source 施加背压；队列绝不无界增长。 | source 等待 ingress 预算和 writer ack；delivery deadline 触发淘汰而不是缓冲。 |
 | I4 | 连接失败只影响该连接及其协议定义的对端。 | detach 只移除自己的 handle；writer ack 独立于 source 存活；唯一的跨 socket 关闭是替换（`1008`）、v2 data 死亡（`1012`）和最后 client detach（`1001`）。 |
 | I5 | 失败即关闭：没有半开或静默丢弃的状态转换。 | 握手/query 错误返回 HTTP 错误且不创建状态；framing 错误用明确 close code；shutdown 用 `1012`。 |
 | I6 | 一个 relay 节点是其 session 的唯一权威；没有脑裂。 | 没有集群成员、共享所有权或跨节点 session 状态；`serverId` 亲和性由边缘负责。 |
@@ -227,12 +247,12 @@ queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket �
 | 未知路径或不支持的方法 | HTTP `404` |
 | 对 `/ws` 的非 upgrade 请求 | HTTP `426` |
 | 非法 `serverId`、`role`、`v`、`connectionId` 或非法 upgrade header | HTTP `400`，不创建状态 |
-| Origin 不在 `PASEO_RELAY_ALLOWED_ORIGINS` | HTTP `403`，不创建状态 |
+| Origin 不在 `PASEO_RELAY_ALLOWED_ORIGINS`，或 Origin 存在但无法解析 | HTTP `403`，不创建状态 |
 | WS 容量满、session 上限达到或正在 draining | HTTP `503`（不 upgrade） |
 | 超过 per-IP 连接上限 | HTTP `429`（不 upgrade） |
 | native TLS 模式下 TLS 握手失败 | 在 HTTP 之前直接断开 TCP |
 | client 帧/消息超过配置上限 | WebSocket close `1009` |
-| 坏帧、错误 masking、坏 close payload | WebSocket close `1002` |
+| 坏帧、错误 masking、坏 close payload/code、非最小 126/127 长度编码，或分片数超过 1024 | WebSocket close `1002` |
 | text 帧非法 UTF-8 | WebSocket close `1007` |
 | 被更新 socket 替换 | WebSocket close `1008` |
 | 非法 Paseo handshake key | WebSocket close `1008` |
@@ -269,15 +289,15 @@ queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket �
 
 | 方面 | 决策 |
 |---|---|
-| Upgrade | 在创建任何 session、writer 或容量状态之前校验 method/path、upgrade header、key 编码和 query 参数；被拒绝的请求不分配任何状态。 |
-| 消息记账 | 每条消息计固定开销加加权 payload；读取 payload 前预留；限制队列、读取 deadline 和每个 source 的 in-flight 字节。 |
+| Upgrade | 在创建任何 session、writer 或容量状态之前校验 method/path、upgrade header、key 编码和 query 参数；被拒绝的请求不分配任何状态。upgrade 前 HTTP 还受 hyper 限制（`max_buf_size` 16 KiB、`max_header_size` 16 KiB、`max_headers` 64）和 header timeout 约束。 |
+| 消息记账 | 每条消息计固定开销加加权 payload；payload 按 8 KiB chunk 随到达计费（每连接最多一个未计费 chunk）；限制每连接 in-flight 字节和分片数；限制队列和读取 deadline。 |
 | 隔离 | 没有共享 owner 进程；session 只持短拓扑锁；source detach 绝不关闭 destination；慢 consumer 在自己的 deadline 被淘汰。 |
 | 失败 | 失败即关闭，返回明确的 HTTP 状态或 WebSocket close code；没有半开状态。 |
 | 扩展 | 单节点；边缘 `serverId` 亲和性；没有 ownership 注册表、reroute 或脑裂仲裁。 |
 | 运行时 | 无 Erlang/OTP、EPMD、cookie 或 distribution；静态 musl 二进制；可选原生 TLS。 |
 | 可观测性 | 只有聚合指标；结构化日志不含 `serverId`、`connectionId` 或 payload。 |
 | 生命周期 | 有界 SIGTERM/SIGINT drain；readiness 翻转；剩余 socket 以 `1012` 关闭。 |
-| 供应链 | scratch 非 root 运行时；digest-pinned builder；SHA-pinned CI actions；provenance/SBOM。 |
+| 供应链 | scratch 非 root 运行时；digest-pinned builder；SHA-pinned CI actions；per-platform provenance/SBOM attestation。 |
 
 ## 8. 非目标
 
@@ -301,7 +321,8 @@ queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket �
 - **per-IP 限制较粗。** NAT 用户共享 IP，因此限制必须按部署规模设置（或用 `0`
   禁用）。per-`serverId` 配额和 connect-rate 限制刻意不在进程内实现。
 - **固定开销和 weight 是启发式。** 256 字节开销和 weight 4 是保守值，而不是针对每个
-  allocator 测量出来的；它们是可配置、可评审的常量。
+  allocator 测量出来的；weight 可在 `4..=16` 配置，下限 4 为 2× 临时拷贝留余量。
+  它们是可配置、可评审的常量。
 - **HTTP 状态映射** 的 admission 拒绝在 README 中记录；协议 close code 是兼容性
   contract 的一部分，未经 Paseo client/daemon 兼容性评审不应修改。
 
@@ -320,7 +341,8 @@ queue、kernel）。预留在 RAII guard 中，所以取消、panic 或 socket �
   指标。
 - 较新的回归测试覆盖只有 ping 流量时的分片消息 deadline、control nudge/`1011`
   watchdog、per-connection client 上限、native 与 browser client 的 Origin
-  allowlist、停滞的 frame payload、以及 session-capacity admission。
+  allowlist、停滞的 frame payload、增量 ingress 计费、1024 分片策略、非最小长度编码
+  拒绝、非法 close code，以及 session-capacity admission。
 - CI 和 `scripts/ci.sh` 中的 container smoke test 构建静态镜像并从宿主机轮询
   `/health`，因为 scratch 镜像没有 shell。
 

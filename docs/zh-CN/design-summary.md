@@ -31,7 +31,8 @@ daemon ───────┘                                                 
 ```
 
 - **hyper** 只提供 HTTP/1.1 与 `/ws` upgrade；WebSocket 帧由 `src/ws.rs` 自己解析，
-  这样可以在读取 payload 之前预扣 ingress 预算。
+  这样 payload 可以按 8 KiB chunk 读取并逐块计入 ingress 预算（每个连接最多一个
+  chunk 在计费前被分配），而不是按声明的帧长度一次性预留。
 - **SessionRegistry** 是 `DashMap<serverId, Arc<Session>>`；Session 只保存拓扑（socket
   handle、connectionId、v1/v2 槽位），不保存 payload。
 - **每个 socket 一个 reader task + 一个 writer task**；writer 队列同时受 mpsc 条数和
@@ -70,12 +71,12 @@ daemon ───────┘                                                 
 | 未知路径/不支持 method | 404 |
 | `/ws` 非 upgrade | 426 |
 | 非法 serverId/role/v/connectionId/upgrade header | 400，不创建状态 |
-| Origin 不在 allowlist | 403，不创建状态 |
+| Origin 不在 allowlist（或存在但无法解析） | 403，不创建状态 |
 | WS 容量满、session 满、draining | 503（不 upgrade） |
 | per-IP 超限 | 429（不 upgrade） |
 | native TLS 握手失败 | TCP 直接断开 |
 | 帧/消息超限 | `1009` |
-| 坏帧/masking/close payload | `1002` |
+| 坏帧/masking/close payload、非法 close code、非最小长度编码、分片超过 1024 | `1002` |
 | text 非法 UTF-8 | `1007` |
 | 被新 socket 替换 | `1008` |
 | handshake key 非法 | `1008` |
@@ -101,7 +102,9 @@ daemon ───────┘                                                 
 ## 加固决策摘要
 
 - upgrade/query 全校验后才创建状态；失败不占容量。
-- 每条消息固定开销 + 读取前计入 ingress 预算。
+- 每条消息固定 256 字节开销只计一次；payload 按 8 KiB chunk 到达时计入 ingress
+  预算；每连接 in-flight 上限为 `min(预算, 4 × 一条最大消息的计费)`；每条消息最多
+  1024 个分片。
 - source/destination 隔离；慢 consumer 在自己的 deadline 淘汰。
 - 单节点 + 边缘 `serverId` 哈希；无 ownership/reroute。
 - 无 Erlang distribution；可选原生 TLS；结构化日志不含 ID/payload。

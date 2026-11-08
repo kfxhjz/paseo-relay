@@ -23,10 +23,18 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
 
 - 终止 TLS；不要公开明文 `ws://`。
 - 前面放限流边缘（CDN/WAF/LB）：per-IP 连接数、建连速率、消息速率、带宽。
-  LB 终止连接时，进程内 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` 看到的是代理 IP；
-  请在边缘后保持 `0`，在边缘限制。
+  仓库提供的 Nginx/HAProxy 示例已经包含 per-client 连接/速率限制、拒绝运维端点、
+  不记录 query string 的日志；请按自己的流量调整阈值。Caddy 示例没有进程内
+  per-IP 限流，需要配合外部 CDN/WAF。LB 终止连接时，进程内
+  `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` 看到的是代理 IP；请在边缘后保持 `0`，
+  在边缘限制。
 - 按主机规模设置 `PASEO_RELAY_MAX_CONNECTIONS`、`MAX_TCP_CONNECTIONS`、
-  `MAX_SESSIONS` 和 ingress 预算；监控 `/ready` 和 `/metrics`。
+  `MAX_SESSIONS` 和 ingress 预算；监控 `/ready` 和 `/metrics`。一个 idle 已接受
+  socket 仍占约 23 KiB，因此 `MAX_TCP_CONNECTIONS × ~30 KiB` 是内存下限，
+  512 MB 主机不能使用内置 25,000 默认值。
+- 客户端应只发送一个未编码的 `serverId`。重复 query key 在 relay 侧是 last-wins，
+  而边缘一致性哈希通常使用原始 query 值，因此重复或 percent-encoded 的值可能把
+  同一 session 的两端路由到不同 relay 节点。
 - `/metrics` 只放内网，并限制访问。
 - 使用提供的 scratch 镜像：read-only、非 root、drop capabilities；保持工具链/
   镜像更新。
@@ -52,8 +60,10 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
 
 ## 容量与可用性
 
-- relay 节点很小，但带宽和连接数才是实际限制。按主机设置
-  `PASEO_RELAY_MAX_CONNECTIONS`、`MAX_SESSIONS` 和 ingress 预算，并给突发留余量。
+- relay 节点很小，但带宽和连接数才是实际限制。idle 内存主要由已接受 socket
+  决定（每个约 23 KiB），请按 `MAX_TCP_CONNECTIONS × ~30 KiB` 加 ingress 预算
+  规划，并给突发和 Caddy/proxy 留余量。按主机设置 `PASEO_RELAY_MAX_CONNECTIONS`、
+  `MAX_SESSIONS` 和 ingress 预算。
 - 多节点必须用边缘按 `serverId` query 一致性哈希，并用 `/ready` 摘除 draining 节点。
   普通 round-robin 会拆分 session。
 - SIGTERM drain，等待 grace window，再移除节点；不要先 SIGKILL。

@@ -23,8 +23,14 @@ groups:
           severity: warning
         annotations:
           summary: "Relay {{ $labels.instance }} is shedding slow destinations"
+      # Ratio of the configured budget, so the rule works for the built-in
+      # 512 MiB default and for smaller budgets such as the 129 MiB Compose
+      # example. The gauge guard keeps the division well-defined.
       - alert: PaseoRelayIngressSaturated
-        expr: paseo_relay_ingress_reserved_bytes > 0.8 * 536870912
+        expr: |
+          paseo_relay_ingress_budget_bytes > 0
+          and
+          paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes > 0.8
         for: 5m
         labels:
           severity: warning

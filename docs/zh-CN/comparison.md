@@ -20,7 +20,7 @@
 - **运行时/运维**：单个 Rust 静态二进制 vs BEAM release + Cowboy vs 托管。
 - **集群模型**：边缘一致性哈希（本 relay）vs Syn ownership/reroute（Elixir）vs 托管。
 - **失败模型**：节点 drain = 客户端重连；没有透明迁移。
-- **内存/限制**：本 relay 显式配置上限、读 payload 前记账；Elixir 用 BEAM +
+- **内存/限制**：本 relay 显式配置上限、payload 按 chunk 记账；Elixir 用 BEAM +
   capacity ledger。
 - **TLS**：本 relay 可原生 rustls 或边缘终止；Elixir 通常在边缘。
 - **认证**：两者按设计都没有 relay 认证；Paseo E2EE 保护内容，`serverId` 是 bearer

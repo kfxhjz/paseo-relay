@@ -18,6 +18,8 @@ spec:
         app.kubernetes.io/name: paseo-relay
     spec:
       terminationGracePeriodSeconds: 30
+      # The relay never calls the Kubernetes API.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -27,7 +29,8 @@ spec:
       containers:
         - name: relay
           # For production, pin the multi-arch release digest for v0.1.1
-          # (listed in the release notes) instead of the mutable tag.
+          # (listed in the release notes) instead of the mutable tag. Only
+          # stable release tags move `latest`.
           image: ghcr.io/kfxhjz/paseo-relay:v0.1.1
           imagePullPolicy: IfNotPresent
           args: []
@@ -43,6 +46,19 @@ spec:
               value: "json"
             - name: PASEO_RELAY_LOG
               value: "info"
+            # Sized for the 1Gi memory limit below; raise together with it.
+            # An idle accepted socket costs ~23 KiB, so 10,000 TCP slots need
+            # roughly 300 MiB before payload/queue traffic. The built-in
+            # defaults (20k/25k) need ~700-800 MiB idle and are too large here.
+            - name: PASEO_RELAY_MAX_CONNECTIONS
+              value: "8000"
+            - name: PASEO_RELAY_MAX_SESSIONS
+              value: "8000"
+            - name: PASEO_RELAY_MAX_TCP_CONNECTIONS
+              value: "10000"
+            # 129 MiB weighted ingress (>= (MAX_MESSAGE_BYTES + 256) * weight).
+            - name: PASEO_RELAY_INGRESS_BUDGET_BYTES
+              value: "135266304"
             # Behind a proxy, keep the per-IP cap at 0 and limit at the edge:
             - name: PASEO_RELAY_PER_IP_MAX_CONNECTIONS
               value: "0"
@@ -110,3 +126,44 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: paseo-relay
+---
+# Only the ingress controller may reach the relay, and only on port 4000.
+# NetworkPolicy is L3/L4 only: `/metrics`, `/ready`, and `/version` share that
+# port, so keep the Service internal (do not expose it publicly) and filter the
+# operations endpoints at the ingress, or scrape them from a monitoring
+# namespace as shown in the commented rule below.
+#
+# Note: some CNIs also apply NetworkPolicy to kubelet probe traffic. If probes
+# fail after applying this policy, additionally allow your node CIDR(s) to port
+# 4000 (or use whatever probe exemption your CNI documents).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: paseo-relay
+  labels:
+    app.kubernetes.io/name: paseo-relay
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: paseo-relay
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # Kubernetes labels every namespace with its own name. Set this
+              # to the namespace where ingress-nginx is installed.
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 4000
+    # Prometheus scraping: uncomment and point at your monitoring namespace.
+    # The relay has no auth on /metrics, so keep it on the internal network.
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    #   ports:
+    #     - protocol: TCP
+    #       port: 4000

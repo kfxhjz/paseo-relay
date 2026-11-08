@@ -119,7 +119,7 @@ password. Do not log query strings at the edge.
 |---|---|---|---|
 | Runtime | One static musl binary | BEAM release + Cowboy | Provider-specific |
 | Erlang distribution / cookie / EPMD | none | yes (cluster mode) | n/a |
-| Memory model | Explicit bounded budgets and queues; pre-payload accounting | BEAM + capacity ledger | provider |
+| Memory model | Explicit bounded budgets and queues; chunked payload accounting | BEAM + capacity ledger | provider |
 | Multi-node | edge consistent hashing; no reroute/ownership | Syn ownership + 409 reroute | managed |
 | Native TLS | rustls | terminate at edge | managed |
 | Operations | SIGTERM drain, scratch non-root image, aggregate metrics | BEAM release | managed |
@@ -137,7 +137,9 @@ the Elixir relay if you need its built-in cluster/ownership/reroute behavior.
 - **Opaque E2EE payloads**: no decryption, storage, or payload logging; the only
   inspection is a bounded `hello`/`e2ee_hello` key-hygiene check.
 - **Bounded by default**: 20k WebSockets/sessions, weighted ingress budget
-  reserved before payload allocation, fixed per-message overhead, bounded
+  charged chunk-by-chunk as payload arrives (at most one 8 KiB chunk per
+  connection uncharged), a fixed 256-byte per-message overhead charged once, a
+  per-connection in-flight cap, a 1024-fragment message limit, bounded
   per-destination writer queues, frame/message read deadlines.
 - **Fail closed**: explicit HTTP status or WebSocket close codes; no half-open
   state; invalid IDs are rejected with `400`.
@@ -148,7 +150,8 @@ the Elixir relay if you need its built-in cluster/ownership/reroute behavior.
 - **No account, no telemetry, no outbound calls**: the relay only listens; there
   is no signup, analytics, or phone-home (Paseo pairing is end-to-end).
 - **Deployment**: digest-pinned builder, multi-arch release workflow with
-  provenance/SBOM, scratch non-root runtime, read-only friendly.
+  per-platform provenance and SBOM attestations, scratch non-root runtime,
+  read-only friendly.
 
 ## Architecture in one picture
 
@@ -188,10 +191,12 @@ codes, and known differences from the Elixir relay.
 ## Deployment
 
 Release `v0.1.1` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
-GHCR with provenance and SBOM. Use the short version tag; the tag includes the
-leading `v` (`0.1.1` without it is not published):
+GHCR with per-platform provenance and SBOM attestations (the multi-arch index
+itself has no index-level attestation). Use the short version tag; the tag
+includes the leading `v` (`0.1.1` without it is not published):
 
-- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.1` (also tagged `latest`).
+- **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.1` (also tagged `latest`; only
+  stable release tags move `latest`, so prerelease tags do not).
 
 Inspect the published image with:
 
@@ -246,14 +251,34 @@ across nodes will not pair. If you operate a public relay, read
 ## Operations and metrics
 
 `/metrics` is aggregate-only Prometheus text (no `serverId` labels):
-readiness/draining, active WebSockets/sessions, ingress reservations, forwarded
-frames/bytes, slow consumers, delivery timeouts, rejections, handshake outcomes,
-max frame, uptime, build info. See [docs/operations.md](docs/operations.md),
+readiness/draining, active WebSockets/sessions, ingress reserved and budget
+bytes, forwarded frames/bytes, slow consumers, delivery timeouts, rejections,
+handshake outcomes, max frame, uptime, build info. See
+[docs/operations.md](docs/operations.md),
 [examples/prometheus.yml](examples/prometheus.yml), and
 [examples/alerts.yml](examples/alerts.yml).
 
 Keep `/metrics` and `/ready` on an internal network. The relay has no
 authentication on ops endpoints.
+
+## Memory model and abuse limits
+
+Idle memory is dominated by accepted sockets, not by payload: hyper caps the
+unauthenticated pre-upgrade request path (16 KiB buffers/headers, 64 headers),
+but an idle socket still costs roughly 23 KiB, so plan for
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB`. The built-in 25,000 TCP / 20,000
+WebSocket defaults need roughly 700–800 MiB before any payload traffic; a
+512 MB host must lower the caps (the Compose examples use 5,000 / 4,000 /
+4,000).
+
+Payload accounting is incremental: a data-frame payload is charged in 8 KiB
+chunks as bytes arrive, the 256-byte per-message overhead is charged once per
+message, one connection can hold at most `min(budget, 4 × one-max-message
+charge)` of the weighted ingress budget, and one message may contain at most
+1024 fragments. A stalled header therefore cannot reserve budget for a payload
+it never sends, and the fragment cap bounds empty-fragment floods. See
+[docs/configuration.md](docs/configuration.md) and [DESIGN.md](DESIGN.md) for
+the full limits.
 
 ## Benchmarks
 
@@ -285,7 +310,8 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
 - **Per-IP limits are coarse**: default `0` because the documented topology uses
   an edge proxy; enable and size them for direct exposure.
 - **Large in-flight messages**: a few maximum-size messages can consume the
-  configured ingress budget; raise the budget or limit at the edge.
+  configured ingress budget (one connection is capped at `min(budget, 4 ×
+  one-max-message charge)`); raise the budget or limit at the edge.
 - **No per-user quotas or relay auth**: public operators must provide edge
   limits and a privacy/abuse policy; see [operator-policy.md](docs/operator-policy.md).
 - **No third-party security audit**: the evidence here is code review,

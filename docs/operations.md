@@ -42,19 +42,27 @@ Counters: `paseo_relay_frames_forwarded_total`, `paseo_relay_bytes_forwarded_tot
 
 Gauges: `paseo_relay_ready`, `paseo_relay_draining`,
 `paseo_relay_active_websockets`, `paseo_relay_active_sessions`,
-`paseo_relay_ingress_reserved_bytes`, `paseo_relay_max_frame_bytes`,
-`paseo_relay_uptime_seconds`, and `paseo_relay_build_info{version,revision}`.
+`paseo_relay_ingress_reserved_bytes`, `paseo_relay_ingress_budget_bytes`,
+`paseo_relay_max_frame_bytes`, `paseo_relay_uptime_seconds`, and
+`paseo_relay_build_info{version,revision}`.
 
 Suggested alerts: node unready for >2 minutes, rising connection rejections,
 slow-consumer disconnects, ingress reservations above ~80% of the configured
-budget, and an instance disappearing from scrape targets. See
+budget (use the `paseo_relay_ingress_reserved_bytes /
+paseo_relay_ingress_budget_bytes` ratio, which works for any configured budget),
+and an instance disappearing from scrape targets. See
 [examples/alerts.yml](../examples/alerts.yml).
 
 ## Capacity and debugging
 
-- `paseo_relay_ingress_reserved_bytes` approaching
-  `PASEO_RELAY_INGRESS_BUDGET_BYTES` means large in-flight messages or slow
-  destinations; look at slow-consumer/delivery metrics.
+- `paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes`
+  approaching `0.8` means large in-flight messages or slow destinations; look at
+  slow-consumer/delivery metrics. The ratio works for any configured budget,
+  unlike an absolute byte threshold.
+- Idle memory is dominated by accepted sockets, not by payload: an idle socket
+  costs roughly 23 KiB, so `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` is the
+  floor. The built-in 25,000-socket default needs ~700–800 MiB before traffic;
+  lower the caps on small nodes.
 - `active_sessions` includes empty sessions until the idle sweep removes them;
   this is expected after a reconnect storm.
 - `connection_rejections_total` includes invalid upgrades, draining, per-IP

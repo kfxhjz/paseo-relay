@@ -14,8 +14,9 @@
 
 - **决策：** 直接基于 `AsyncRead`/`AsyncWrite` 实现服务端 RFC 6455 帧编解码，
   header 与 payload 分阶段读取。
-- **原因：** 需要在分配 payload 之前预扣 ingress 预算，并精确执行 Paseo 的 32 MiB、
-  分片、control frame 限制；高层 WebSocket 库通常会先完整组装消息。
+- **原因：** 需要在 payload 字节到达时逐块计入 ingress 预算（按 8 KiB chunk，每个
+  连接最多一个 chunk 在计费前分配，而不是按声明长度一次性预留），并精确执行 Paseo
+  的 32 MiB、分片、control frame 限制；高层 WebSocket 库通常会先完整组装消息。
 - **代价：** 维护协议代码；用单元测试、集成测试和 fuzz scaffold 覆盖；不支持压缩。
 
 ## ADR 0003：relay 不做认证

@@ -77,4 +77,7 @@ See the hardening checklist in [README.md](README.md) and the deployment
 examples in [docs/deployment.md](docs/deployment.md). At minimum: terminate TLS,
 do not expose `/metrics` or `/ready` publicly, apply per-IP limits at the edge,
 run the container read-only as the provided non-root user, and keep the relay
-and Rust toolchain up to date.
+and Rust toolchain up to date. Size the connection caps to host memory: an idle
+accepted socket costs roughly 23 KiB, so plan for
+`PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` (the built-in 25,000-socket default
+needs ~700–800 MiB) and lower the caps on small nodes.

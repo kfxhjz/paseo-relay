@@ -22,8 +22,8 @@ fits which user, and what this project does **not** do.
 - **Cluster model:** edge consistent hashing (this relay) vs Syn ownership and
   reroute (Elixir) vs provider-managed.
 - **Failure model:** node drain = reconnect; no transparent migration.
-- **Memory/limits:** explicit configured caps and pre-payload accounting here;
-  BEAM/capacity ledger in Elixir.
+- **Memory/limits:** explicit configured caps and chunked payload accounting
+  here; BEAM/capacity ledger in Elixir.
 - **TLS:** native rustls or edge; Elixir typically edge.
 - **Authentication:** none in either relay by design; Paseo E2EE protects
   content, and `serverId` is a bearer secret.

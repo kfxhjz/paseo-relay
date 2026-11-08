@@ -13,10 +13,13 @@ cluster.
   `relay.example.com` pointing at the VPS.
 - Docker with Compose v2, and inbound TCP `80`/`443` (UDP `443` optional for
   HTTP/3) open in the firewall/security group.
-- **512 MB RAM** for the Compose defaults below (128 MiB ingress budget). The
-  relay itself is tiny; leave headroom for Caddy and connection bursts. If you
-  raise `PASEO_RELAY_INGRESS_BUDGET_BYTES` to the built-in 512 MiB default, use
-  at least ~1 GB. Building from source needs at least ~1 GB and several minutes.
+- **512 MB RAM for the relay container** (the Compose defaults set
+  `PASEO_RELAY_MEM_LIMIT=512m`, a 129 MiB ingress budget, and connection caps
+  sized for 512 MB), plus headroom for Caddy and connection bursts. An idle
+  accepted socket still costs ~23 KiB; leave room for that and for Caddy. If you
+  raise `PASEO_RELAY_MEM_LIMIT`, raise the connection caps with it. If you raise
+  `PASEO_RELAY_INGRESS_BUDGET_BYTES` to the built-in 512 MiB default, use at
+  least ~1 GB. Building from source needs at least ~1 GB and several minutes.
 
 ## Deploy the published image
 
@@ -31,9 +34,13 @@ docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
 The Compose file pulls the current release,
-`ghcr.io/kfxhjz/paseo-relay:v0.1.1`; `latest` follows the newest release. Set
-`PASEO_RELAY_IMAGE` to override the version, and see
-[deployment.md](deployment.md) if you need an immutable digest pin.
+`ghcr.io/kfxhjz/paseo-relay:v0.1.1`; `latest` follows the newest stable release
+(prerelease tags do not move it). Set `PASEO_RELAY_IMAGE` to override the
+version, and see [deployment.md](deployment.md) if you need an immutable digest
+pin. The example also caps `PASEO_RELAY_MAX_CONNECTIONS` (4,000),
+`PASEO_RELAY_MAX_SESSIONS` (4,000), and `PASEO_RELAY_MAX_TCP_CONNECTIONS`
+(5,000) so the 512 MB memory limit is realistic; raise them together with
+`PASEO_RELAY_MEM_LIMIT`.
 
 Caddy will obtain a certificate automatically. Verify:
 
@@ -111,7 +118,7 @@ and the relay drains existing sessions within its grace window.
 | All connections rejected | Check `PASEO_RELAY_MAX_CONNECTIONS`, `/ready`, and relay logs |
 | Metrics missing | `/metrics` and `/ready` are blocked at Caddy; scrape the relay over the internal network |
 | Need to take the node down | Remove from any edge, send SIGTERM, wait for the grace window |
-| OOM or build fails | Use the prebuilt image, or give the build at least ~1 GB RAM |
+| OOM or build fails | Use the prebuilt image; raise `PASEO_RELAY_MEM_LIMIT` and the connection caps together (idle sockets cost ~23 KiB each), or give the build at least ~1 GB RAM |
 
 ## When not to use this path
 

@@ -29,6 +29,9 @@
 | Protected / legacy Paseo E2EE | 原样透传；relay 不协商/检查 E2EE 记录 |
 | Legacy `hello` / `e2ee_hello` key 卫生 | 仅检查小型 JSON 形状 client 帧；非法 key `1008` |
 | 最大 masked client 帧/消息 | `32 MiB - 14` 字节（超限 `1009`） |
+| 每条消息的分片数 | 最多 1024（relay 策略；超过 `1002`） |
+| 帧长度编码 | 非最小 126/127 长度编码被拒绝（`1002`） |
+| Close code | 非法/保留 code 被拒绝（`1002`）；合法范围 `1000..=1003`、`1007..=1014`、`3000..=4999` |
 | v2 control 帧上限 | 64 KiB |
 | WebSocket ping/pong | 支持（relay 回 pong） |
 | WebSocket 压缩 | 不协商（Paseo 不要求） |
