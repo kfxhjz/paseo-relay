@@ -6,11 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Ingress budget accounting is now incremental: data-frame payloads are read in
+  8 KiB chunks and charged only as bytes arrive, with a per-connection in-flight
+  cap and a 1024-fragment limit. A peer that sends only a stalled frame header,
+  or a stream of empty continuation frames, can no longer reserve the node-wide
+  budget and close other sessions with `1013`.
+- Pre-upgrade HTTP memory is bounded: hyper runs with a 16 KiB read buffer,
+  16 KiB header limit, and 64 headers, so unauthenticated TCP connections cannot
+  make the relay buffer ~400 KiB each before WebSocket admission.
+- TCP slots are held for the whole socket lifetime, so
+  `PASEO_RELAY_MAX_TCP_CONNECTIONS` again bounds total open sockets.
+- Hardening: invalid close codes and non-minimal frame length encodings are
+  rejected with `1002`; an unparseable `Origin` header is denied when an
+  allowlist is configured; handshake/control JSON parsing uses cheap byte
+  prefilters and the handshake hygiene cap drops from 1 MiB to 64 KiB; writer
+  delivery uses one absolute deadline instead of up to three sequential
+  timeouts; the build revision is sanitized before being embedded in
+  `/version` and metrics.
+
 ### Added
 
 - Quick production `docker run` recipes (detached, `--restart unless-stopped`,
   30 s stop timeout) next to the foreground quickstart check, in both READMEs
   and the deployment guide.
+- `paseo_relay_ingress_budget_bytes` gauge metric so operators can alert on
+  ingress saturation as a ratio of the configured budget.
+- Fuzz targets for the RFC 6455 frame reader and upgrade validation.
 
 ### Changed
 
@@ -22,6 +45,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dependabot PRs are grouped per ecosystem (cargo, GitHub Actions, Docker), and
   every workflow now pins the current action releases, so weekly dependency
   updates arrive as at most one PR per ecosystem.
+- `PASEO_RELAY_INGRESS_WEIGHT` now accepts 4..=16 (the minimum is the documented
+  safe floor for transient assembly copies). Invalid `PASEO_RELAY_LOG` values
+  and unreadable TLS certificate/key files now fail startup and
+  `--check-config`.
+- Release hardening: only stable tags (no `-`) move the GHCR `latest` tag, and
+  the release workflow grants write permissions per job instead of globally.
+- Quickstart examples are sized for their documented memory: Compose caps
+  connections at 4000 sessions/5000 TCP sockets, sets a 129 MiB ingress budget
+  (512 MiB RAM), `nofile`/memory limits, and the edge examples no longer log
+  `serverId` query strings or expose operations endpoints by default.
+- The Kubernetes example disables service-account token automounting, adds a
+  NetworkPolicy, and caps connections for its 1 Gi memory limit.
+
+### Fixed
+
+- Compose quickstart could not start: the shipped 128 MiB ingress budget was
+  below the required one-max-message reservation; it is now 129 MiB.
+- Writer delivery deadlines are no longer applied up to three times
+  sequentially for one frame.
 
 ## [0.1.1] - 2026-11-07
 
