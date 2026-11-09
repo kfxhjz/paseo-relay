@@ -1,0 +1,48 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "assets/logo.svg"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Build the MkDocs site and publish it to GitHub Pages. Pages must be enabled
+# with "GitHub Actions" as the source (Settings -> Pages), which also provides
+# the deployment URL and token used below.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install MkDocs Material
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check "mkdocs-material==9.8.1"
+      - name: Build documentation
+        run: NO_MKDOCS_2_WARNING=1 .venv/bin/mkdocs build --strict
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
