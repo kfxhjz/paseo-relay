@@ -28,6 +28,11 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
+          # The default GITHUB_TOKEN cannot read classic branch protection
+          # rules. Create a fine-grained PAT with Administration (read-only)
+          # and repository Contents (read-only), add it as SCORECARD_TOKEN, and
+          # the Branch-Protection check can be evaluated too.
+          repo_token: ${{ secrets.SCORECARD_TOKEN || github.token }}
           # Publish results to the OpenSSF public dataset and API (public repos).
           publish_results: true
       - name: Upload SARIF artifact

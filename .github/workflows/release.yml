@@ -214,6 +214,7 @@ jobs:
             image-digest.txt
             image-digest.txt.sig
             image-digest.txt.pem
+            provenance.intoto.jsonl
           # Do not let a prerelease tag become the repository's "Latest
           # release"; only stable tags (no '-') are candidates.
           prerelease: ${{ contains(github.ref_name, '-') }}

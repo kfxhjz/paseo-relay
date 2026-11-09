@@ -38,7 +38,37 @@ jobs:
             --output-signature image-digest.txt.sig \
             --output-certificate image-digest.txt.pem \
             image-digest.txt
+          DIGEST="${digest}" python3 - > provenance.intoto.jsonl <<'PY'
+          import json, os
+          digest = os.environ["DIGEST"]
+          statement = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{
+                  "name": "ghcr.io/kfxhjz/paseo-relay",
+                  "digest": {"sha256": digest.split(":", 1)[1]},
+              }],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {
+                  "buildDefinition": {
+                      "buildType": "https://github.com/actions/runner",
+                      "externalParameters": {"tag": os.environ.get("TAG")},
+                      "internalParameters": {},
+                      "resolvedDependencies": [],
+                  },
+                  "runDetails": {
+                      "builder": {"id": "https://github.com/actions/runner"},
+                      "metadata": {
+                          "invocationId": os.environ.get("GITHUB_RUN_ID", ""),
+                          "startedOn": "",
+                          "finishedOn": "",
+                      },
+                      "byproducts": [],
+                  },
+              },
+          }
+          print(json.dumps(statement, separators=(",", ":")))
+          PY
           gh release upload "${TAG}" \
             image-digest.txt image-digest.txt.sig image-digest.txt.pem \
-            --clobber
+            provenance.intoto.jsonl --clobber
           echo "Signed ${TAG} image digest ${digest}" >> "$GITHUB_STEP_SUMMARY"
