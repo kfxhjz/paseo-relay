@@ -150,7 +150,17 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
             tag_args+=(--tag "${name}:latest")
           fi
+          # GitHub reads the package description, license, and linked repository
+          # from annotations on the OCI image *index* for multi-arch images.
+          # Dockerfile labels alone are not enough here: the per-platform
+          # manifests carry them, but the package page reads the index.
+          annotation_args=(
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            --annotation "index:org.opencontainers.image.description=Self-hostable, wire-compatible relay for Paseo, written in Rust"
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0"
+          )
           docker buildx imagetools create \
+            "${annotation_args[@]}" \
             "${tag_args[@]}" \
             "${sources[@]}"
           digest="$(docker buildx imagetools inspect "${name}:${tag}" | awk '/^Digest:/ {print $NF; exit}')"
