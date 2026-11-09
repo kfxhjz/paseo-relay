@@ -4,8 +4,12 @@
 
 ## Getting help
 
-- **Documentation**: [README.md](README.md), [docs/](docs/), and the Chinese
-  index at [docs/zh-CN/README.md](docs/zh-CN/README.md).
+- **Documentation**: the searchable [docs site](https://kfxhjz.github.io/paseo-relay/),
+  [README.md](README.md), [docs/](docs/), and the Chinese index at
+  [docs/zh-CN/README.md](docs/zh-CN/README.md).
+- **Deployment questions and community help**: use
+  [GitHub Discussions](https://github.com/kfxhjz/paseo-relay/discussions)
+  (Q&A / Show and tell).
 - **Bug reports / feature requests**: use the GitHub issue templates. Include
   your relay version/commit, deployment topology, and redacted logs.
 - **Security issues**: follow [SECURITY.md](SECURITY.md) — never open a public

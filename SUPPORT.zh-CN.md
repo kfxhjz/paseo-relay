@@ -4,7 +4,10 @@
 
 ## 获取帮助
 
-- **文档**：[README.zh-CN.md](README.zh-CN.md)、[docs/zh-CN/README.md](docs/zh-CN/README.md)
+- **文档**：可搜索的[文档站](https://kfxhjz.github.io/paseo-relay/)、
+  [README.zh-CN.md](README.zh-CN.md)、[docs/zh-CN/README.md](docs/zh-CN/README.md)
+- **部署问题/社区帮助**：[GitHub Discussions](https://github.com/kfxhjz/paseo-relay/discussions)
+  （Q&A / Show and tell）
 - **Bug/功能请求**：使用 GitHub issue 模板。请提供 relay 版本/commit、部署拓扑和脱敏日志。
 - **安全漏洞**：按 [SECURITY.zh-CN.md](SECURITY.zh-CN.md) 走私密报告；不要开公开 issue。
 - **Paseo client/daemon/上游协议问题**：请走 [Paseo 项目](https://github.com/getpaseo/paseo)

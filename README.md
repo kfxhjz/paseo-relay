@@ -341,6 +341,7 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
 
 - [Documentation site](https://kfxhjz.github.io/paseo-relay/) — searchable docs, English + 中文
 - [Documentation index](docs/README.md) — all guides, references, and operations docs
+- [Discussions](https://github.com/kfxhjz/paseo-relay/discussions) — deployment Q&A, ideas, and Show and tell
 - [Design](DESIGN.md) — architecture, invariants, failure semantics
 - [Changelog](CHANGELOG.md) — release history
 - [Chinese documentation](docs/zh-CN/README.md) — 中文文档索引

@@ -52,3 +52,6 @@
 - [comparison.md（English）](../comparison.md)
 - [operator-policy.md（English）](../operator-policy.md)
 - [translation.md（English）](../translation.md)
+
+
+- [Discussions](https://github.com/kfxhjz/paseo-relay/discussions) — 部署问答、想法和 Show and tell

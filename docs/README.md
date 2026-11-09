@@ -36,6 +36,7 @@ Paseo's daemon connects **outbound** to a relay; clients meet it there. This pro
 - [Container image](https://github.com/kfxhjz/paseo-relay/pkgs/container/paseo-relay)
 - [Design](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)
 - [Security model](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.md)
+- [Discussions](https://github.com/kfxhjz/paseo-relay/discussions)
 - [Contributing](https://github.com/kfxhjz/paseo-relay/blob/main/CONTRIBUTING.md)
 
 > **Community implementation.** This is not the managed relay behind `relay.paseo.sh:443`, not affiliated with or endorsed by the Paseo project, and not built-in clustering/ownership failover. Affinity for multiple nodes is provided by your edge (consistent hashing on `serverId`). See [Compatibility](compatibility.md).
@@ -69,6 +70,7 @@ Paseo's daemon connects **outbound** to a relay; clients meet it there. This pro
 - [Design](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)
 - [ADRs](adr/README.md)
 - [Changelog](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md)
+- [Discussions](https://github.com/kfxhjz/paseo-relay/discussions)
 - [Contributing](https://github.com/kfxhjz/paseo-relay/blob/main/CONTRIBUTING.md)
 - [Security](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.md)
 - [Support](https://github.com/kfxhjz/paseo-relay/blob/main/SUPPORT.md)

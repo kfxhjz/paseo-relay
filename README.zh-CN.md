@@ -301,6 +301,7 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 
 - [文档站](https://kfxhjz.github.io/paseo-relay/) — 可搜索文档，英文 + 中文
 - [中文文档索引](docs/zh-CN/README.md) — 全部中文指南、参考和运维文档
+- [Discussions](https://github.com/kfxhjz/paseo-relay/discussions) — 部署问答、想法和 Show and tell
 - [完整设计（中文）](DESIGN.zh-CN.md) / [English design](DESIGN.md)
 - [English documentation index](docs/README.md) — 英文规范文档
 - [变更日志](CHANGELOG.md)
