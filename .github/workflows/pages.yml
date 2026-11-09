@@ -27,12 +27,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install MkDocs Material
-        run: |
-          python3 -m venv .venv
-          .venv/bin/pip install --disable-pip-version-check "mkdocs-material==9.8.1"
       - name: Build documentation
-        run: NO_MKDOCS_2_WARNING=1 .venv/bin/mkdocs build --strict
+        run: |
+          docker run --rm \
+            --volume "$PWD:/docs" \
+            --workdir /docs \
+            --env NO_MKDOCS_2_WARNING=1 \
+            squidfunk/mkdocs-material@sha256:f797da217ff01b20b298d2185eb9d88fb81f5a322c439eba854f2e4de8a48e65 \
+            build --strict
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: site

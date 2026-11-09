@@ -1,0 +1,44 @@
+name: Sign release digest
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to sign (e.g. v0.1.2)"
+        required: true
+        default: v0.1.2
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: "v2.4.1"
+      - name: Sign the published image digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # The release body records the immutable multi-arch index digest.
+          digest="$(gh release view "${TAG}" --json body --jq .body \
+            | grep -o 'sha256:[0-9a-f]\{64\}' | head -1)"
+          test -n "${digest}"
+          printf '%s\n' "${digest}" > image-digest.txt
+          cosign sign-blob --yes \
+            --output-signature image-digest.txt.sig \
+            --output-certificate image-digest.txt.pem \
+            image-digest.txt
+          gh release upload "${TAG}" \
+            image-digest.txt image-digest.txt.sig image-digest.txt.pem \
+            --clobber
+          echo "Signed ${TAG} image digest ${digest}" >> "$GITHUB_STEP_SUMMARY"
