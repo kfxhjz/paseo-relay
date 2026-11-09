@@ -68,8 +68,11 @@ RUN set -eux; \
 FROM scratch
 
 LABEL org.opencontainers.image.title="paseo-relay" \
-      org.opencontainers.image.description="Single-node, protocol-compatible WebSocket relay for Paseo" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.description="Self-hostable, wire-compatible relay for Paseo, written in Rust" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/kfxhjz/paseo-relay" \
+      org.opencontainers.image.documentation="https://kfxhjz.github.io/paseo-relay/" \
+      org.opencontainers.image.vendor="kfxhjz"
 
 COPY --from=builder /paseo-relay /paseo-relay
 
