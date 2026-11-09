@@ -12,7 +12,7 @@
 | 小团队，一个 daemon、几个 client | **本 relay**，单节点；监控容量 |
 | 需要多 relay 节点且不想额外配置边缘 | **Elixir relay**（Syn ownership/409 reroute）或托管 relay |
 | 完全不想自己运营公网 endpoint | **Paseo 托管 relay** |
-| 安全敏感、希望审计 relay | **本 relay**（小型 Rust 代码、有界模型），但先读 [SECURITY.zh-CN.md](../../SECURITY.zh-CN.md) |
+| 安全敏感、希望审计 relay | **本 relay**（小型 Rust 代码、有界模型），但先读 [SECURITY.zh-CN.md](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.zh-CN.md) |
 | 要面向公众运营 relay | **本 relay** 可用，但请读 [operator-policy.md](operator-policy.md)，提供边缘限流和隐私政策 |
 
 ## 对比维度
@@ -37,7 +37,7 @@
 - 除 health/ready/metrics/version 外没有管理 HTTP API。
 
 如果这些是硬需求，不要部署本 relay；请用 Elixir relay 或托管 relay。这是
-[完整中文设计](../../DESIGN.zh-CN.md)（英文规范 [DESIGN.md（英文）](../../DESIGN.md)）中明确的范围取舍。
+[完整中文设计](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.zh-CN.md)（英文规范 [DESIGN.md（英文）](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)）中明确的范围取舍。
 
 ## 迁移
 

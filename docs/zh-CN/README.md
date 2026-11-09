@@ -1,18 +1,18 @@
 # Paseo Relay 中文文档
 
-[English README](../../README.md) | [English docs](../README.md) | **简体中文**
+[English README](https://github.com/kfxhjz/paseo-relay/blob/main/README.md) | [English docs](../) | **简体中文**
 
 这里是 Paseo Relay 的中文文档索引。英文文档是规范来源；中文翻译会在发布前同步。
 如果两者出现不一致，以英文文档为准。
 
 ## 入门
 
-- [中文 README](../../README.zh-CN.md) — 项目介绍、快速开始、与 Paseo 配合使用
+- [中文 README](https://github.com/kfxhjz/paseo-relay/blob/main/README.zh-CN.md) — 项目介绍、快速开始、与 Paseo 配合使用
 - [五分钟 VPS 快速部署](quickstart.md) — Caddy 自动 HTTPS + Compose
 - [选择 relay 部署方式](comparison.md)
 - [运营公共 relay](operator-policy.md)
 - [协议与 close code](protocol.md) — `/ws` query、v1/v2 语义、帧限制、错误码
-- [完整设计（中文）](../../DESIGN.zh-CN.md) — 架构、不变量、失败语义、安全设计
+- [完整设计（中文）](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.zh-CN.md) — 架构、不变量、失败语义、安全设计
 - [设计摘要](design-summary.md) — 快速摘要（完整设计见上）
 - [运行时配置](configuration.md) — 全部环境变量、CLI、健康检查
 
@@ -31,15 +31,15 @@
 
 ## 安全与贡献
 
-- [安全策略](../../SECURITY.zh-CN.md)
-- [支持渠道](../../SUPPORT.zh-CN.md)
-- [贡献指南](../../CONTRIBUTING.zh-CN.md)
+- [安全策略](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.zh-CN.md)
+- [支持渠道](https://github.com/kfxhjz/paseo-relay/blob/main/SUPPORT.zh-CN.md)
+- [贡献指南](https://github.com/kfxhjz/paseo-relay/blob/main/CONTRIBUTING.zh-CN.md)
 - [文档与翻译策略](translation.md)
-- [架构决策记录（中文摘要）](adr-summary.md) / [英文原文](../adr/)
+- [架构决策记录（中文摘要）](adr-summary.md) / [英文原文](../adr/README.md)
 
 ## 英文规范文档
 
-- [DESIGN.md（English）](../../DESIGN.md)
+- [DESIGN.md（English）](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)
 - [protocol.md（English）](../protocol.md)
 - [configuration.md（English）](../configuration.md)
 - [deployment.md（English）](../deployment.md)

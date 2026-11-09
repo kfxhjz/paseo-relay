@@ -9,16 +9,18 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-blue.svg)](rust-toolchain.toml)
 [![Image](https://img.shields.io/badge/ghcr.io-paseo--relay-blue)](https://github.com/kfxhjz/paseo-relay/pkgs/container/paseo-relay)
+[![Release](https://img.shields.io/github/v/release/kfxhjz/paseo-relay?sort=semver)](https://github.com/kfxhjz/paseo-relay/releases)
+[![GitHub stars](https://img.shields.io/github/stars/kfxhjz/paseo-relay?style=social)](https://github.com/kfxhjz/paseo-relay/stargazers)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/kfxhjz/paseo-relay/badge)](https://securityscorecards.dev/viewer/?uri=github.com/kfxhjz/paseo-relay)
 
-一个用 Rust 编写的 **单节点、线协议兼容的 Paseo relay 替代实现**。整个服务是
-`scratch` 镜像里的一个静态 musl 二进制，以非 root 用户运行：没有 Erlang/OTP，
+**五分钟自托管 Paseo 的 relay。** 一个用 Rust 编写的单节点、线协议兼容实现 ——
+`scratch` 镜像里的单个静态 musl 二进制，以非 root 用户运行；没有 Erlang/OTP，
 没有 EPMD，没有 node cookie，也没有集群。Paseo 的 payload 端到端加密，relay
 原样转发，不读取内容。
 
-> **社区实现。** 本项目不是 `relay.paseo.sh:443` 背后的托管 relay，与 Paseo
-> 项目没有隶属或背书关系，也不内置集群/ownership failover。它面向 Paseo v1/v2
-> 会话的自托管；多节点亲和性由边缘代理完成（按 `serverId` 做一致性哈希），
-> 而不是由 relay 自己完成。详见[兼容性](#兼容性)。
+**文档站：** [kfxhjz.github.io/paseo-relay](https://kfxhjz.github.io/paseo-relay/) ·
+**快速开始：** [五分钟 VPS 指南](docs/zh-CN/quickstart.md) ·
+**English:** [English README](README.md)
 
 ## 从哪里开始
 
@@ -297,6 +299,7 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 
 ## 文档
 
+- [文档站](https://kfxhjz.github.io/paseo-relay/) — 可搜索文档，英文 + 中文
 - [中文文档索引](docs/zh-CN/README.md) — 全部中文指南、参考和运维文档
 - [完整设计（中文）](DESIGN.zh-CN.md) / [English design](DESIGN.md)
 - [English documentation index](docs/README.md) — 英文规范文档

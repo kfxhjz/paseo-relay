@@ -64,7 +64,7 @@ slow-consumer disconnects, ingress reservations above ~80% of the configured
 budget (use the `paseo_relay_ingress_reserved_bytes /
 paseo_relay_ingress_budget_bytes` ratio, which works for any configured budget),
 and an instance disappearing from scrape targets. See
-[examples/alerts.yml](../examples/alerts.yml).
+[examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml).
 
 ## Capacity and debugging
 

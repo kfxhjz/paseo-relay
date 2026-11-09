@@ -1,9 +1,9 @@
 # 设计摘要
 
-[English DESIGN.md](../../DESIGN.md) | **简体中文**
+[English DESIGN.md](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md) | **简体中文**
 
-本文是完整设计的中文摘要；完整中文版见 [DESIGN.zh-CN.md](../../DESIGN.zh-CN.md)，英文规范版见
-[DESIGN.md（英文）](../../DESIGN.md)。
+本文是完整设计的中文摘要；完整中文版见 [DESIGN.zh-CN.md](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.zh-CN.md)，英文规范版见
+[DESIGN.md（英文）](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)。
 
 ## 目标
 

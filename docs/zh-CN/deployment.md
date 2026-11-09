@@ -4,7 +4,7 @@
 
 Paseo Relay 是 **单节点** 组件。水平扩展和高可用由边缘负载均衡完成：同一个 Paseo
 `serverId` 的所有 socket 必须落在同一个 relay 进程上。relay 本身没有内置集群、
-ownership registry 或 409 reroute；这是刻意取舍（见[完整中文设计](../../DESIGN.zh-CN.md)，英文规范 [DESIGN.md（英文）](../../DESIGN.md)）。
+ownership registry 或 409 reroute；这是刻意取舍（见[完整中文设计](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.zh-CN.md)，英文规范 [DESIGN.md（英文）](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)）。
 
 ## 选择拓扑
 
@@ -59,15 +59,15 @@ LB 必须：
 
 示例：
 
-- Nginx：[examples/nginx.conf](../../examples/nginx.conf) —— TLS 边缘、一致性哈希、
+- Nginx：[examples/nginx.conf](https://github.com/kfxhjz/paseo-relay/blob/main/examples/nginx.conf) —— TLS 边缘、一致性哈希、
   per-IP 连接/速率限制、屏蔽 `/metrics` 与 `/version` 且 `/ready` 只允许私网范围，
   访问日志不记录 query string。
-- HAProxy：[examples/haproxy.cfg](../../examples/haproxy.cfg) —— 一致性哈希、
+- HAProxy：[examples/haproxy.cfg](https://github.com/kfxhjz/paseo-relay/blob/main/examples/haproxy.cfg) —— 一致性哈希、
   `/ready` 检查、拒绝运维端点、per-source 连接/速率限制，日志格式不记录 query string。
 - Kubernetes + ingress-nginx：Ingress annotation 设为
   `nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_serverId"`，liveness 用
   `/health`，readiness 用 `/ready`。示例还包含只允许 ingress-nginx namespace 访问
-  4000 端口的 NetworkPolicy。见 [examples/kubernetes.yaml](../../examples/kubernetes.yaml)。
+  4000 端口的 NetworkPolicy。见 [examples/kubernetes.yaml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/kubernetes.yaml)。
 - Envoy：使用 `RING_HASH` cluster，route hash policy 选
   `query_parameter: { name: serverId }`。
 
@@ -141,13 +141,13 @@ docker run -d \
 `healthcheck` 子命令（镜像 `HEALTHCHECK` 调用 `/paseo-relay healthcheck`）。
 不需要 shell 或 `curl`。
 
-Compose 示例见 [examples/docker-compose.yml](../../examples/docker-compose.yml)：
+Compose 示例见 [examples/docker-compose.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/docker-compose.yml)：
 同样默认拉取已发布镜像，并把连接上限按 512 MB 容器设置
 （`PASEO_RELAY_MEM_LIMIT`、`MAX_CONNECTIONS=4000`、`MAX_SESSIONS=4000`、
 `MAX_TCP_CONNECTIONS=5000`）；调高内存上限时请一起调高这些值。
 
 只有在修改 relay 本身时才需要从源码构建：使用 build override
-（[examples/docker-compose.build.yml](../../examples/docker-compose.build.yml)），
+（[examples/docker-compose.build.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/docker-compose.build.yml)），
 或直接 `docker build -t paseo-relay .`：
 
 ```sh
@@ -157,7 +157,7 @@ docker compose -f examples/docker-compose.yml \
 
 ## Kubernetes
 
-以 [examples/kubernetes.yaml](../../examples/kubernetes.yaml) 为起点。关键配置：
+以 [examples/kubernetes.yaml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/kubernetes.yaml) 为起点。关键配置：
 
 - `runAsNonRoot: true`、`runAsUser: 65532`、`readOnlyRootFilesystem: true`、
   `allowPrivilegeEscalation: false`，drop `ALL` capabilities；
@@ -177,7 +177,7 @@ docker compose -f examples/docker-compose.yml \
 
 ## systemd
 
-示例 unit 见 [examples/paseo-relay.service](../../examples/paseo-relay.service)。
+示例 unit 见 [examples/paseo-relay.service](https://github.com/kfxhjz/paseo-relay/blob/main/examples/paseo-relay.service)。
 用 `EnvironmentFile=` 提供 runtime contract，`Restart=always`，并给
 `TimeoutStopSec` 留出大于 drain grace 的时间（例如 `TimeoutStopSec=30`）。
 
@@ -213,8 +213,8 @@ sequenceDiagram
 ## 指标与告警
 
 从内网抓取 `/metrics`。指标只有聚合值，没有 `serverId` label。示例见
-[examples/prometheus.yml](../../examples/prometheus.yml)、
-[examples/alerts.yml](../../examples/alerts.yml)，指标说明见
+[examples/prometheus.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/prometheus.yml)、
+[examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml)，指标说明见
 [operations.md](operations.md)。
 
 ## 容量规划

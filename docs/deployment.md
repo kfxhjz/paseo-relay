@@ -6,7 +6,7 @@ Paseo Relay is a **single-node** component. Horizontal scale and high
 availability come from an edge load balancer that keeps every socket for one
 Paseo `serverId` on the same relay node. There is no built-in cluster, ownership
 registry, or 409 reroute path; this is a deliberate trade-off (see
-[DESIGN.md](../DESIGN.md)).
+[DESIGN.md](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md)).
 
 ## Choose a topology
 
@@ -66,18 +66,18 @@ The LB must:
 
 Examples:
 
-- Nginx: [examples/nginx.conf](../examples/nginx.conf) — TLS edge, consistent
+- Nginx: [examples/nginx.conf](https://github.com/kfxhjz/paseo-relay/blob/main/examples/nginx.conf) — TLS edge, consistent
   hashing, per-IP connection/rate limits, `/metrics` and `/version` blocked with
   `/ready` limited to private ranges, and an access log that omits the query
   string.
-- HAProxy: [examples/haproxy.cfg](../examples/haproxy.cfg) — consistent hashing,
+- HAProxy: [examples/haproxy.cfg](https://github.com/kfxhjz/paseo-relay/blob/main/examples/haproxy.cfg) — consistent hashing,
   `/ready` checks, operations endpoints denied, per-source connection/rate
   limits, and a log format that omits the query string.
 - Kubernetes with ingress-nginx: annotate the Ingress with
   `nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_serverId"` and use
   `/health` for liveness and `/ready` for readiness probes. The example also
   includes a NetworkPolicy that admits only the ingress-nginx namespace on port
-  4000. See [examples/kubernetes.yaml](../examples/kubernetes.yaml).
+  4000. See [examples/kubernetes.yaml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/kubernetes.yaml).
 - Envoy: use a `RING_HASH` cluster and a route hash policy with
   `query_parameter: { name: serverId }`.
 
@@ -162,7 +162,7 @@ The image is a static musl binary in a `scratch` filesystem, runs as UID/GID
 `HEALTHCHECK` calls `/paseo-relay healthcheck`). It does not need a shell or
 `curl`.
 
-See [examples/docker-compose.yml](../examples/docker-compose.yml) for a
+See [examples/docker-compose.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/docker-compose.yml) for a
 read-only Compose example that also pulls the published image and sizes the
 connection caps for a 512 MB container (`PASEO_RELAY_MEM_LIMIT`,
 `MAX_CONNECTIONS=4000`, `MAX_SESSIONS=4000`, `MAX_TCP_CONNECTIONS=5000`); raise
@@ -170,7 +170,7 @@ them together with the memory limit.
 
 To build the relay from source (only needed while changing the relay itself),
 use the build override
-([examples/docker-compose.build.yml](../examples/docker-compose.build.yml)) or a
+([examples/docker-compose.build.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/docker-compose.build.yml)) or a
 plain `docker build -t paseo-relay .`:
 
 ```sh
@@ -180,7 +180,7 @@ docker compose -f examples/docker-compose.yml \
 
 ## Kubernetes
 
-Use [examples/kubernetes.yaml](../examples/kubernetes.yaml) as a starting point.
+Use [examples/kubernetes.yaml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/kubernetes.yaml) as a starting point.
 Key settings:
 
 - `runAsNonRoot: true`, `runAsUser: 65532`, `readOnlyRootFilesystem: true`,
@@ -205,7 +205,7 @@ Key settings:
 ## systemd
 
 An example unit is provided at
-[examples/paseo-relay.service](../examples/paseo-relay.service). Set
+[examples/paseo-relay.service](https://github.com/kfxhjz/paseo-relay/blob/main/examples/paseo-relay.service). Set
 `EnvironmentFile=` with the runtime contract values, use `Restart=always`, and
 allow enough `TimeoutStopSec` for the drain grace window
 (`TimeoutStopSec=30`).
@@ -245,8 +245,8 @@ sequenceDiagram
 
 Scrape `/metrics` from an internal network. The metrics are aggregate-only and
 contain no `serverId` labels. See
-[examples/prometheus.yml](../examples/prometheus.yml) and
-[examples/alerts.yml](../examples/alerts.yml), and the metrics reference in
+[examples/prometheus.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/prometheus.yml) and
+[examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml), and the metrics reference in
 [operations.md](operations.md).
 
 ## Capacity sizing

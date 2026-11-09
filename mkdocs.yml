@@ -1,0 +1,100 @@
+site_name: Paseo Relay
+site_description: Self-hostable, wire-compatible relay for Paseo, written in Rust.
+site_url: https://kfxhjz.github.io/paseo-relay/
+repo_url: https://github.com/kfxhjz/paseo-relay
+repo_name: kfxhjz/paseo-relay
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_javascript:
+  - https://unpkg.com/mermaid@11/dist/mermaid.min.js
+
+nav:
+  - Home: README.md
+  - Getting started:
+      - Quickstart: quickstart.md
+      - Comparison: comparison.md
+      - Deployment: deployment.md
+      - Configuration: configuration.md
+  - Reference:
+      - Protocol: protocol.md
+      - Compatibility: compatibility.md
+      - Operator policy: operator-policy.md
+      - Architecture decisions:
+          - Overview: adr/README.md
+          - "0001: single-node edge hashing": adr/0001-single-node-edge-hashing.md
+          - "0002: custom RFC 6455 codec": adr/0002-custom-rfc6455-codec.md
+          - "0003: no relay authentication": adr/0003-no-relay-authentication.md
+  - Operations:
+      - Operations: operations.md
+      - Migration: migration.md
+      - Benchmarks: benchmarks.md
+      - FAQ: faq.md
+      - E2E evidence: evidence/paseo-e2e-2026-11-07.md
+  - Translation policy: translation.md
+  - 简体中文:
+      - 首页: zh-CN/README.md
+      - 快速开始: zh-CN/quickstart.md
+      - 对比: zh-CN/comparison.md
+      - 部署: zh-CN/deployment.md
+      - 配置: zh-CN/configuration.md
+      - 协议: zh-CN/protocol.md
+      - 兼容性: zh-CN/compatibility.md
+      - 运营策略: zh-CN/operator-policy.md
+      - 运维: zh-CN/operations.md
+      - 迁移: zh-CN/migration.md
+      - 基准: zh-CN/benchmarks.md
+      - FAQ: zh-CN/faq.md
+      - 兼容性证据: zh-CN/evidence/paseo-e2e-2026-11-07.md
+      - ADR 摘要: zh-CN/adr-summary.md
+      - 设计摘要: zh-CN/design-summary.md
+      - 翻译政策: zh-CN/translation.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/kfxhjz/paseo-relay

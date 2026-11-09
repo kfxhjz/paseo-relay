@@ -10,7 +10,7 @@
 - 英文：`README.md`、`docs/protocol.md`、`SECURITY.md` ...
 - 简体中文：`README.zh-CN.md`、`docs/zh-CN/protocol.md`、`SECURITY.zh-CN.md` ...
 - 中文文档索引：[docs/zh-CN/README.md](README.md)。
-- 完整中文设计：[DESIGN.zh-CN.md](../../DESIGN.zh-CN.md)；
+- 完整中文设计：[DESIGN.zh-CN.md](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.zh-CN.md)；
   [docs/zh-CN/design-summary.md](design-summary.md) 是较短的架构/不变量摘要。
 
 ## 规则

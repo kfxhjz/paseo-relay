@@ -57,7 +57,7 @@ Gauge：`paseo_relay_ready`、`paseo_relay_draining`、
 ingress 预留超过配置预算约 80%（用
 `paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes` 比率，对任意
 配置预算都成立）、实例从 scrape targets 消失。见
-[examples/alerts.yml](../../examples/alerts.yml)。
+[examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml)。
 
 ## 容量与排障
 

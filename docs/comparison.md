@@ -13,7 +13,7 @@ fits which user, and what this project does **not** do.
 | A small team with one daemon and several clients | **This relay**, single node; monitor capacity |
 | A team that needs multiple relay nodes without extra edge work | **Elixir relay** (Syn ownership/409 reroute) or the managed relay |
 | Someone who does not want to operate a public endpoint at all | **Managed Paseo relay** |
-| Security-sensitive and wants to inspect/audit the relay | **This relay** (small Rust code, bounded model), but read [SECURITY.md](../SECURITY.md) first |
+| Security-sensitive and wants to inspect/audit the relay | **This relay** (small Rust code, bounded model), but read [SECURITY.md](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.md) first |
 | A relay operator serving the public | **This relay** is usable, but read [operator-policy.md](operator-policy.md) and provide edge limits/privacy policy |
 
 ## Comparison dimensions
@@ -40,7 +40,7 @@ fits which user, and what this project does **not** do.
 
 If those are requirements, do not deploy this relay; use the Elixir relay or the
 managed relay. This is an intentional scope, documented in
-[DESIGN.md](../DESIGN.md).
+[DESIGN.md](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.md).
 
 ## Migration
 

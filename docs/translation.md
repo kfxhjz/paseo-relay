@@ -13,7 +13,7 @@ first.
 - Simplified Chinese: `README.zh-CN.md`, `docs/zh-CN/protocol.md`,
   `SECURITY.zh-CN.md`, ...
 - The Chinese docs index is [docs/zh-CN/README.md](zh-CN/README.md).
-- Full Chinese DESIGN translation: [DESIGN.zh-CN.md](../DESIGN.zh-CN.md);
+- Full Chinese DESIGN translation: [DESIGN.zh-CN.md](https://github.com/kfxhjz/paseo-relay/blob/main/DESIGN.zh-CN.md);
   [docs/zh-CN/design-summary.md](zh-CN/design-summary.md) is a shorter architecture/invariant summary.
 
 ## Rules

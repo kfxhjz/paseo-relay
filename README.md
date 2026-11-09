@@ -9,18 +9,18 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-blue.svg)](rust-toolchain.toml)
 [![Image](https://img.shields.io/badge/ghcr.io-paseo--relay-blue)](https://github.com/kfxhjz/paseo-relay/pkgs/container/paseo-relay)
+[![Release](https://img.shields.io/github/v/release/kfxhjz/paseo-relay?sort=semver)](https://github.com/kfxhjz/paseo-relay/releases)
+[![GitHub stars](https://img.shields.io/github/stars/kfxhjz/paseo-relay?style=social)](https://github.com/kfxhjz/paseo-relay/stargazers)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/kfxhjz/paseo-relay/badge)](https://securityscorecards.dev/viewer/?uri=github.com/kfxhjz/paseo-relay)
 
-A **single-node, wire-compatible replacement for Paseo's relay**, written in
-Rust. One static musl binary in a `scratch`, non-root container: no Erlang/OTP,
-no EPMD, no node cookie, no cluster. Paseo payloads are end-to-end encrypted and
-forwarded opaquely.
+**Self-host Paseo's relay in five minutes.** A single-node, wire-compatible relay
+written in Rust — one static musl binary in a `scratch`, non-root container; no
+Erlang/OTP, no EPMD, no node cookie, no cluster. Paseo payloads are end-to-end
+encrypted and forwarded opaquely.
 
-> **Community implementation.** This is not the managed relay behind
-> `relay.paseo.sh:443`, not affiliated with or endorsed by the Paseo project,
-> and not built-in clustering/ownership failover. It is a self-hostable relay
-> for Paseo v1/v2 sessions; affinity for multiple nodes is provided by your edge
-> (consistent hashing on `serverId`), not by the relay. See
-> [Compatibility](#compatibility).
+**Docs:** [kfxhjz.github.io/paseo-relay](https://kfxhjz.github.io/paseo-relay/) ·
+**Quickstart:** [five-minute VPS guide](docs/quickstart.md) ·
+**中文:** [README.zh-CN.md](README.zh-CN.md)
 
 ## Start here
 
@@ -194,6 +194,12 @@ dated run summary is committed at
 [docs/compatibility.md](docs/compatibility.md) for the feature matrix, close
 codes, and known differences from the Elixir relay.
 
+> **Community implementation.** This project is not the managed relay behind
+> `relay.paseo.sh:443`, is not affiliated with or endorsed by the Paseo project,
+> and does not implement clustering/ownership failover. It is a self-hostable
+> relay for Paseo v1/v2 sessions; multi-node affinity is provided by your edge
+> (consistent hashing on `serverId`), not by the relay. See [Compatibility](#compatibility).
+
 ## Deployment
 
 Release `v0.1.2` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
@@ -333,6 +339,7 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
 
 ## Documentation
 
+- [Documentation site](https://kfxhjz.github.io/paseo-relay/) — searchable docs, English + 中文
 - [Documentation index](docs/README.md) — all guides, references, and operations docs
 - [Design](DESIGN.md) — architecture, invariants, failure semantics
 - [Changelog](CHANGELOG.md) — release history

@@ -16,3 +16,6 @@ local/
 
 # Python tooling cache
 .ruff_cache/
+# Local documentation build output
+site/
+.tmp-mkdocs/

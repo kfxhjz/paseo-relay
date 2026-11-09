@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Paseo Relay logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#152238"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g fill="none" stroke="url(#accent)" stroke-width="18" stroke-linecap="round">
+    <path d="M132 180h96l56 76 56-76h40"/>
+    <path d="M132 332h96l56-76 56 76h40"/>
+  </g>
+  <circle cx="132" cy="180" r="22" fill="#22d3ee"/>
+  <circle cx="132" cy="332" r="22" fill="#34d399"/>
+  <circle cx="380" cy="180" r="22" fill="#22d3ee"/>
+  <circle cx="380" cy="332" r="22" fill="#34d399"/>
+  <circle cx="256" cy="256" r="30" fill="#e2e8f0"/>
+  <circle cx="256" cy="256" r="12" fill="#0b1220"/>
+</svg>

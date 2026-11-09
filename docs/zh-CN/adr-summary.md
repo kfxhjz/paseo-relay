@@ -1,6 +1,6 @@
 # 架构决策记录（中文摘要）
 
-[English ADRs](../adr/) | **简体中文**
+[English ADRs](../adr/README.md) | **简体中文**
 
 ## ADR 0001：单节点 + 边缘一致性哈希
 
@@ -28,4 +28,4 @@
 - **代价：** 可用性风险由知道 `serverId` 的人承担；用边缘限流、VPN/mTLS、日志脱敏
   缓解。未来若增加 relay token，需要 Paseo 上游协同。
 
-完整英文 ADR 在 [docs/adr/](../adr/)，中文摘要与英文规范不一致时以英文为准。
+完整英文 ADR 在 [docs/adr/](../adr/README.md)，中文摘要与英文规范不一致时以英文为准。
