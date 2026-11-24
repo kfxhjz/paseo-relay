@@ -1,0 +1,7 @@
+# Served at https://kfxhjz.github.io/paseo-relay/robots.txt (copied verbatim by MkDocs).
+# Everything on this documentation site is public; the sitemap pointer lets
+# crawlers discover the pages even before Search Console verification exists.
+User-agent: *
+Allow: /
+
+Sitemap: https://kfxhjz.github.io/paseo-relay/sitemap.xml

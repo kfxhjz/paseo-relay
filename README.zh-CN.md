@@ -18,6 +18,11 @@
 没有 EPMD，没有 node cookie，也没有集群。Paseo 的 payload 端到端加密，relay
 原样转发，不读取内容。
 
+**独立实现说明。** 本项目是 Paseo relay 协议的社区 Rust 实现，是官方 Elixir relay
+（[`getpaseo/paseo-relay`](https://github.com/getpaseo/paseo-relay)）的替代品，而不是
+它的 fork。线协议（v1/v2）一致，官方 Paseo 客户端无需改动即可使用；把 daemon 的
+relay 变量指过来即可，见下文「与 Paseo 配合使用」。
+
 **文档站：** [kfxhjz.github.io/paseo-relay](https://kfxhjz.github.io/paseo-relay/) ·
 **快速开始：** [五分钟 VPS 指南](docs/zh-CN/quickstart.md) ·
 **English:** [English README](README.md)

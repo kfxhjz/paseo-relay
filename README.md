@@ -18,6 +18,12 @@ written in Rust — one static musl binary in a `scratch`, non-root container; n
 Erlang/OTP, no EPMD, no node cookie, no cluster. Paseo payloads are end-to-end
 encrypted and forwarded opaquely.
 
+**Independent implementation.** This is a community Rust implementation of the
+Paseo relay protocol, an alternative to — not a fork of — the official Elixir
+relay ([`getpaseo/paseo-relay`](https://github.com/getpaseo/paseo-relay)). It
+speaks the same wire protocol (v1/v2), so the official Paseo clients work
+unchanged; see **Use it with Paseo** below for the daemon variables.
+
 **Docs:** [kfxhjz.github.io/paseo-relay](https://kfxhjz.github.io/paseo-relay/) ·
 **Quickstart:** [five-minute VPS guide](docs/quickstart.md) ·
 **中文:** [README.zh-CN.md](README.zh-CN.md)
