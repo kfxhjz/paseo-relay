@@ -19,3 +19,8 @@ local/
 # Local documentation build output
 site/
 .tmp-mkdocs/
+
+# Fuzzing output (corpus and crash reproducers are local state)
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/

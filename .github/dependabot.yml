@@ -10,6 +10,15 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+  # The fuzz crate is a separate package with its own lockfile.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    groups:
+      cargo-fuzz:
+        patterns: ["*"]
   # Group every GitHub Actions bump (including majors) into one PR.
   - package-ecosystem: github-actions
     directory: "/"

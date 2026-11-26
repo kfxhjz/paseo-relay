@@ -106,6 +106,31 @@ jobs:
           docker logs "${container}" >&2 || true
           exit 1
 
+  fuzz:
+    name: Fuzz targets (build + smoke run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The fuzz crate is a separate package, so nothing else compiles it: an
+    # API change in the codec could break every target without CI noticing.
+    # This builds all of them and runs each briefly; the weekly Fuzz workflow
+    # runs them for longer.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cargo-fuzz needs nightly for the sanitizer flags. The date is pinned
+      # so a nightly regression cannot fail an unrelated pull request; bump it
+      # deliberately, together with fuzz/README.md.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
+        with:
+          toolchain: nightly-2026-11-20
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
+      - name: Build and run every fuzz target
+        run: scripts/fuzz.sh 20
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -121,3 +146,5 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit --deny warnings
+      # The fuzz crate has its own lockfile (libfuzzer-sys and friends).
+      - run: cargo audit --deny warnings --file fuzz/Cargo.lock

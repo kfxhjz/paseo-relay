@@ -1,0 +1,50 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 5 * * 2"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to run each fuzz target"
+        required: true
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz untrusted-input parsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Keep the nightly date in sync with the fuzz job in ci.yml.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
+        with:
+          toolchain: nightly-2026-11-20
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
+      - name: Run every fuzz target
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '600' }}
+        run: scripts/fuzz.sh "${SECONDS_PER_TARGET}"
+      # A crash leaves its reproducer here; without the upload it would be
+      # lost with the runner.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30
