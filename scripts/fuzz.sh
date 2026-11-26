@@ -3,10 +3,11 @@
 #
 #   scripts/fuzz.sh [seconds-per-target]     (default: 20)
 #
-# Needs a nightly toolchain and cargo-fuzz (see fuzz/README.md). Select the
-# toolchain with RUSTUP_TOOLCHAIN or `rustup override`; CI pins a dated
-# nightly. Exits non-zero as soon as a target crashes; the reproducer is left
-# in fuzz/artifacts/<target>/.
+# Needs a nightly toolchain and cargo-fuzz (see fuzz/README.md). The repository
+# pins stable in rust-toolchain.toml, so select nightly explicitly with
+# RUSTUP_TOOLCHAIN or `rustup override`; CI sets the pinned nightly. Exits
+# non-zero as soon as a target crashes; the reproducer is left in
+# fuzz/artifacts/<target>/.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -14,6 +15,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 readonly seconds="${1:-20}"
 if ! [[ "${seconds}" =~ ^[0-9]+$ ]] || [ "${seconds}" -eq 0 ]; then
   echo "usage: scripts/fuzz.sh [seconds-per-target]" >&2
+  exit 2
+fi
+
+# Fail early instead of letting cargo-fuzz report a cryptic `-Zsanitizer`
+# error against the stable toolchain pinned by rust-toolchain.toml.
+if ! rustc --version 2>/dev/null | grep -q 'nightly'; then
+  echo "scripts/fuzz.sh needs a nightly toolchain; set RUSTUP_TOOLCHAIN=nightly (or run rustup override set nightly)" >&2
+  rustc --version >&2 || true
   exit 2
 fi
 

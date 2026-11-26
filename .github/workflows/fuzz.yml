@@ -37,6 +37,9 @@ jobs:
       - name: Run every fuzz target
         env:
           SECONDS_PER_TARGET: ${{ inputs.seconds || '600' }}
+          # `rust-toolchain.toml` pins stable; select the pinned nightly for
+          # cargo-fuzz's sanitizer flags.
+          RUSTUP_TOOLCHAIN: nightly-2026-11-20
         run: scripts/fuzz.sh "${SECONDS_PER_TARGET}"
       # A crash leaves its reproducer here; without the upload it would be
       # lost with the runner.

@@ -6,9 +6,14 @@ untrusted-input boundaries. Run them with
 
 ```sh
 cargo install cargo-fuzz
-scripts/fuzz.sh 60                          # every target, 60 s each
-cargo +nightly fuzz run frame_reader        # or one target, until stopped
+RUSTUP_TOOLCHAIN=nightly scripts/fuzz.sh 60   # every target, 60 s each
+cargo +nightly fuzz run frame_reader          # or one target, until stopped
 ```
+
+`rust-toolchain.toml` pins the stable toolchain for this repository, and rustup
+prefers it over the installed default. The script therefore needs
+`RUSTUP_TOOLCHAIN=nightly` (or `rustup override set nightly`); `cargo +nightly`
+only applies to that one invocation.
 
 | Target | What it exercises |
 |---|---|
@@ -20,9 +25,10 @@ cargo +nightly fuzz run frame_reader        # or one target, until stopped
 CI builds every target and runs each for 20 seconds on every pull request
 (the `fuzz` job in `.github/workflows/ci.yml`), and for ten minutes each every
 week (`.github/workflows/fuzz.yml`), on a pinned nightly
-(`nightly-2026-11-20`). The date is pinned so a nightly regression cannot fail
-an unrelated pull request; bump it in both workflows together. A crash leaves
-its reproducer in `fuzz/artifacts/<target>/`, which the weekly workflow uploads.
+(`nightly-2026-11-20`, exported as `RUSTUP_TOOLCHAIN` for the run). The date is
+pinned so a nightly regression cannot fail an unrelated pull request; bump it
+in both workflows together. A crash leaves its reproducer in
+`fuzz/artifacts/<target>/`, which the weekly workflow uploads.
 
 The fuzz crate is intentionally outside the root package so normal `cargo test`
 does not require nightly. It has its own `Cargo.lock`; cargo-fuzz has no

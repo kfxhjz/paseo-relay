@@ -129,6 +129,11 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Build and run every fuzz target
+        # `rust-toolchain.toml` pins the stable toolchain for this checkout and
+        # rustup prefers it over the installed default; select the pinned
+        # nightly explicitly so cargo-fuzz can pass `-Zsanitizer`.
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-11-20
         run: scripts/fuzz.sh 20
 
   audit:
