@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -73,6 +73,17 @@ const SIZE_PRIORITY_RATIO: u64 = 8;
 /// Longest and shortest pause between reclaim attempts of one waiter.
 const RECLAIM_GRACE_MAX: Duration = Duration::from_millis(250);
 const RECLAIM_GRACE_MIN: Duration = Duration::from_millis(5);
+
+/// Recover a mutex guard if a previous panic poisoned it.
+///
+/// The guarded values are plain counters, maps and timer slots whose invariants
+/// do not depend on a panicking critical section having completed; recovering
+/// keeps one panic from turning into a permanent outage for every connection.
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BudgetError {
@@ -115,6 +126,35 @@ pub struct Reservation {
     /// Weighted amount the rest of the current frame still needs. Only a hint
     /// that sizes how many stalled holds one reclaim scan frees.
     pub frame_need: u64,
+}
+
+impl Reservation {
+    /// Reservation for the fixed per-message overhead, made before a data
+    /// frame's payload is read.
+    ///
+    /// The reclaim hint is deliberately just this overhead: waiting for about
+    /// 1 KiB must not size a reclaim scan for the whole declared frame.
+    /// Otherwise a peer that sends only a multi-megabyte frame header and then
+    /// stalls could evict many unrelated in-progress messages.
+    pub fn overhead(weighted: u64, class: Class) -> Self {
+        Self {
+            weighted,
+            class,
+            frame_need: weighted,
+        }
+    }
+
+    /// Reservation for one payload chunk of an in-progress frame.
+    ///
+    /// Only this phase may use the weight of the rest of the frame as the
+    /// reclaim hint, because the bytes are actually being transferred.
+    pub fn chunk(weighted: u64, class: Class, frame_need: u64) -> Self {
+        Self {
+            weighted,
+            class,
+            frame_need: frame_need.max(weighted),
+        }
+    }
 }
 
 /// Which ingress pool actually granted a reservation.
@@ -299,18 +339,18 @@ impl InboundHold {
     }
 
     fn view(&self, now: Instant) -> HoldView {
-        self.state.lock().expect("hold state poisoned").view(now)
+        lock_recover(&self.state).view(now)
     }
 
     fn wait_begin(&self, now: Instant) {
-        let mut state = self.state.lock().expect("hold state poisoned");
+        let mut state = lock_recover(&self.state);
         if state.waiting_since.is_none() {
             state.waiting_since = Some(now);
         }
     }
 
     fn wait_end(&self, now: Instant) {
-        let mut state = self.state.lock().expect("hold state poisoned");
+        let mut state = lock_recover(&self.state);
         if let Some(since) = state.waiting_since.take() {
             if state.started.is_some() {
                 state.waited += now.saturating_duration_since(since);
@@ -337,7 +377,7 @@ impl HoldHandle {
     pub fn charged(&self, pool: PoolKind, weighted: u64, payload_bytes: usize) {
         let now = Instant::now();
         {
-            let mut state = self.hold.state.lock().expect("hold state poisoned");
+            let mut state = lock_recover(&self.hold.state);
             state.charged(pool, weighted, payload_bytes as u64, now);
         }
         self.ensure_registered();
@@ -347,7 +387,7 @@ impl HoldHandle {
     /// incomplete hold and cannot be reclaimed.
     pub fn message_done(&self) {
         {
-            let mut state = self.hold.state.lock().expect("hold state poisoned");
+            let mut state = lock_recover(&self.hold.state);
             *state = HoldState::default();
         }
         self.unregister();
@@ -355,19 +395,13 @@ impl HoldHandle {
 
     fn ensure_registered(&self) {
         if !self.registered.swap(true, Ordering::AcqRel) {
-            self.registry
-                .lock()
-                .expect("hold registry poisoned")
-                .insert(self.hold.id, Arc::clone(&self.hold));
+            lock_recover(&self.registry).insert(self.hold.id, Arc::clone(&self.hold));
         }
     }
 
     fn unregister(&self) {
         if self.registered.swap(false, Ordering::AcqRel) {
-            self.registry
-                .lock()
-                .expect("hold registry poisoned")
-                .remove(&self.hold.id);
+            lock_recover(&self.registry).remove(&self.hold.id);
         }
     }
 }
@@ -596,7 +630,7 @@ impl IngressBudget {
     fn reclaim(&self, waiter: &InboundHold, request: &Reservation, patient: bool) {
         let now = Instant::now();
         {
-            let mut clock = self.last_reclaim.lock().expect("reclaim clock poisoned");
+            let mut clock = lock_recover(&self.last_reclaim);
             let slot = match (patient, request.class) {
                 (false, _) => &mut clock.slow,
                 (true, Class::Bulk) => &mut clock.patient_bulk,
@@ -614,7 +648,7 @@ impl IngressBudget {
         let mut old_candidates: Vec<(Duration, Arc<InboundHold>)> = Vec::new();
         let mut largest: Option<(u64, Arc<InboundHold>)> = None;
         {
-            let holds = self.holds.lock().expect("hold registry poisoned");
+            let holds = lock_recover(&self.holds);
             for hold in holds.values() {
                 if hold.id == waiter.id || hold.evicted.is_cancelled() {
                     continue;
@@ -719,7 +753,7 @@ impl IngressBudget {
         let freed = {
             // `message_done` takes the same lock, so a message that has just
             // completed is never mistaken for an incomplete one.
-            let state = hold.state.lock().expect("hold state poisoned");
+            let state = lock_recover(&hold.state);
             let relevant = match class {
                 Class::Bulk => state.bulk_held,
                 Class::Small => state.total_held(),
@@ -885,7 +919,7 @@ impl IpLimiter {
             return Some(IpGuard { tracked: None });
         }
         let key = ip_limit_key(ip);
-        let mut counts = self.counts.lock().expect("per-ip mutex poisoned");
+        let mut counts = lock_recover(&self.counts);
         let count = counts.entry(key).or_insert(0);
         if *count >= self.max {
             return None;
@@ -907,7 +941,7 @@ impl Drop for IpGuard {
         let Some((key, counts)) = self.tracked.take() else {
             return;
         };
-        let mut counts = counts.lock().expect("per-ip mutex poisoned");
+        let mut counts = lock_recover(&counts);
         if let Some(count) = counts.get_mut(&key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -1133,6 +1167,39 @@ mod tests {
             budget.frame_weight(INGRESS_CHUNK_BYTES + 1),
             (INGRESS_CHUNK_BYTES as u64 + 1) * 4 + 2 * INGRESS_CHUNK_OVERHEAD
         );
+    }
+
+    #[test]
+    fn overhead_reservation_does_not_size_a_whole_frame_reclaim() {
+        // A ~1 KiB overhead wait may free only what it needs: one stalled
+        // in-progress message holding 4 KiB is enough. Passing the declared
+        // frame weight here (as the old code did) would evict several
+        // unrelated in-progress messages for a header that never sent payload.
+        let budget = budget(100_000, 0);
+        let _guard = budget.try_reserve(100_000, Class::Bulk).unwrap();
+        let stalled: Vec<HoldHandle> = (0..4)
+            .map(|_| {
+                let hold = budget.register();
+                backdate(&hold, 4096, 1024, Duration::from_secs(5));
+                hold
+            })
+            .collect();
+        let waiter = budget.register();
+        let request = Reservation::overhead(budget.overhead_weight(), Class::Bulk);
+        assert_eq!(request.frame_need, request.weighted);
+        budget.reclaim(&waiter, &request, false);
+        let evicted = stalled
+            .iter()
+            .filter(|hold| hold.evicted().is_cancelled())
+            .count();
+        assert_eq!(
+            evicted, 1,
+            "a 1 KiB overhead wait must not evict a whole frame's worth of victims"
+        );
+
+        // Only the chunk phase sizes the scan for the rest of the frame.
+        let chunk = Reservation::chunk(4096, Class::Bulk, 32 * 1024 * 1024);
+        assert_eq!(chunk.frame_need, 32 * 1024 * 1024);
     }
 
     #[test]

@@ -14,12 +14,12 @@ use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http::{header, Method, StatusCode, Version};
 use http_body_util::Full;
@@ -51,6 +51,18 @@ const OPS_MAX_CONNECTIONS: usize = 64;
 /// How often the TLS certificate and key files are checked for a change.
 const TLS_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long `ServerHandle::shutdown` waits for the operations accept loop and
+/// the TLS watcher before abandoning them.
+///
+/// Both stop on a cancellation token, but either may be parked on blocking
+/// file I/O (for example a hung NFS mount); the process has to exit after the
+/// grace window even then.
+const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Minimum spacing between operations-listener rejection warnings, matching
+/// [`Metrics::shed`].
+const OPS_REJECTION_LOG_INTERVAL_MS: u64 = 10_000;
+
 /// Which endpoints a listener answers. `/health` is served everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
@@ -81,6 +93,11 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     pub conn_shutdown: CancellationToken,
     pub ws_tasks: TaskTracker,
+    /// Milliseconds since `metrics.started` (plus one) of the last
+    /// operations-listener rejection warning; 0 = never.
+    ops_rejection_last_log_ms: AtomicU64,
+    /// Operations-listener rejections since the last warning.
+    ops_rejection_pending: AtomicU64,
 }
 
 impl AppState {
@@ -100,6 +117,8 @@ impl AppState {
             shutdown: CancellationToken::new(),
             conn_shutdown: CancellationToken::new(),
             ws_tasks: TaskTracker::new(),
+            ops_rejection_last_log_ms: AtomicU64::new(0),
+            ops_rejection_pending: AtomicU64::new(0),
         })
     }
 
@@ -110,6 +129,48 @@ impl AppState {
             && self.capacity.websocket_capacity_open()
             && self.sessions.has_capacity()
     }
+
+    /// Count one operations-listener rejection and warn about the peer that
+    /// tripped it at most once per [`OPS_REJECTION_LOG_INTERVAL_MS`].
+    ///
+    /// The operations path has no [`ShedKind`] of its own (that type belongs to
+    /// `metrics.rs`), so the same rate-limiting rule is applied here. The
+    /// warning names the peer, because the whole point is finding who filled
+    /// the small operations allowance.
+    fn note_ops_rejection(&self, peer: SocketAddr) {
+        Metrics::inc(&self.metrics.ops_rejections);
+        self.ops_rejection_pending.fetch_add(1, Ordering::Relaxed);
+        let now = self.metrics.started.elapsed().as_millis() as u64 + 1;
+        let last = self.ops_rejection_last_log_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < OPS_REJECTION_LOG_INTERVAL_MS {
+            return;
+        }
+        if self
+            .ops_rejection_last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let count = self.ops_rejection_pending.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            peer = %peer,
+            count,
+            "rejecting operations connections: {OPS_MAX_CONNECTIONS}-connection allowance reached"
+        );
+    }
+}
+
+/// Lock a mutex, recovering the guard when another thread panicked while
+/// holding it.
+///
+/// The state behind these mutexes is plain data that a panic in a request
+/// handler cannot corrupt; refusing every later connection because of a poison
+/// flag would turn one panic into an outage.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub struct ServerHandle {
@@ -156,6 +217,19 @@ impl ServerHandle {
         Ok(true)
     }
 
+    /// Start a TLS reload without waiting for it.
+    ///
+    /// Returns `None` when native TLS is not configured. The caller owns the
+    /// returned task and should log its result; this is the signal-handler
+    /// path, where a hung certificate mount must not stop SIGTERM/SIGINT from
+    /// being observed.
+    pub fn spawn_tls_reload(&self) -> Option<tokio::task::JoinHandle<Result<bool>>> {
+        let tls = self.tls.as_ref().map(Arc::clone)?;
+        Some(tokio::task::spawn_blocking(move || {
+            tls.reload().map(|()| true)
+        }))
+    }
+
     /// Stop accepting, wait the configured grace period, then close active
     /// sessions with `1012 Relay shutting down`.
     pub async fn shutdown(self) {
@@ -165,7 +239,22 @@ impl ServerHandle {
         // tasks stop even if that loop ended abnormally.
         self.state.conn_shutdown.cancel();
         for task in self.background {
-            let _ = task.await;
+            // A background task may be parked on blocking file I/O (a hung
+            // certificate mount) and never observe the cancellation token:
+            // wait only briefly so the process can still exit after the grace
+            // window instead of requiring SIGKILL.
+            match tokio::time::timeout(BACKGROUND_SHUTDOWN_TIMEOUT, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if !error.is_cancelled() {
+                        tracing::debug!(error = %error, "background task ended");
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    "background task did not stop within {}s; abandoning it so shutdown can finish",
+                    BACKGROUND_SHUTDOWN_TIMEOUT.as_secs()
+                ),
+            }
         }
     }
 }
@@ -437,6 +526,10 @@ async fn ops_accept_loop(listener: TcpListener, state: Arc<AppState>) {
                     }
                 };
                 let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    // A flood of half-open requests against `/ready` or
+                    // `/metrics` used to be invisible: count it and warn with
+                    // the offending peer instead of only writing a 503.
+                    state.note_ops_rejection(peer);
                     reject_tcp(
                         &stream,
                         "503 Service Unavailable",
@@ -789,10 +882,7 @@ async fn handle_ws(
     tracker.spawn(async move {
         match tokio::time::timeout(upgrade_timeout, on_upgrade).await {
             Ok(Ok(upgraded)) => {
-                let tcp_slot = preupgrade_slot
-                    .lock()
-                    .expect("pre-upgrade slot mutex poisoned")
-                    .take();
+                let tcp_slot = lock_unpoisoned(&preupgrade_slot).take();
                 // Hand write-timeout ownership over to FrameWriter now that
                 // the HTTP 101 response has been flushed.
                 write_timeout_active.store(false, Ordering::Relaxed);
@@ -885,6 +975,11 @@ type FileStamp = [(Option<SystemTime>, u64); 2];
 fn file_stamp(cert: &Path, key: &Path) -> Option<FileStamp> {
     let stamp = |path: &Path| {
         let metadata = std::fs::metadata(path).ok()?;
+        // Only regular files are candidates: a FIFO would block the reload
+        // thread on open(), and a directory/socket can never hold PEM data.
+        if !metadata.is_file() {
+            return None;
+        }
         Some((metadata.modified().ok(), metadata.len()))
     };
     Some([stamp(cert)?, stamp(key)?])
@@ -933,11 +1028,7 @@ impl TlsReloader {
     }
 
     fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
-        self.state
-            .lock()
-            .expect("tls state poisoned")
-            .acceptor
-            .clone()
+        lock_unpoisoned(&self.state).acceptor.clone()
     }
 
     fn reload_locked(&self) -> Result<()> {
@@ -945,7 +1036,7 @@ impl TlsReloader {
         // next check sees a newer stamp and loads again.
         let stamp = file_stamp(&self.cert, &self.key);
         let acceptor = load_tls(&self.cert, &self.key)?;
-        let mut state = self.state.lock().expect("tls state poisoned");
+        let mut state = lock_unpoisoned(&self.state);
         state.acceptor = acceptor;
         state.loaded = stamp;
         state.rejected = None;
@@ -953,18 +1044,30 @@ impl TlsReloader {
     }
 
     fn reload(&self) -> Result<()> {
-        let _guard = self.reload_lock.lock().expect("tls reload lock poisoned");
+        let _guard = lock_unpoisoned(&self.reload_lock);
         self.reload_locked()
     }
 
     fn reload_if_changed(&self) {
-        let _guard = self.reload_lock.lock().expect("tls reload lock poisoned");
-        // A file that is briefly missing mid-rotation is not a change.
+        let _guard = lock_unpoisoned(&self.reload_lock);
+        // A file that is briefly missing mid-rotation is not a change. A path
+        // that stopped being a regular file (FIFO, directory) is ignored too:
+        // opening it could block the blocking pool forever.
         let Some(stamp) = file_stamp(&self.cert, &self.key) else {
+            for (path, what) in [(&self.cert, "certificate"), (&self.key, "key")] {
+                let not_a_file = std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file());
+                if not_a_file {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "tls {what} path is not a regular file; ignoring it until it is replaced"
+                    );
+                    break;
+                }
+            }
             return;
         };
         {
-            let state = self.state.lock().expect("tls state poisoned");
+            let state = lock_unpoisoned(&self.state);
             if state.loaded == Some(stamp) || state.rejected == Some(stamp) {
                 return;
             }
@@ -972,7 +1075,7 @@ impl TlsReloader {
         match self.reload_locked() {
             Ok(()) => tracing::info!("tls certificate reloaded"),
             Err(error) => {
-                self.state.lock().expect("tls state poisoned").rejected = Some(stamp);
+                lock_unpoisoned(&self.state).rejected = Some(stamp);
                 tracing::warn!(
                     error = %format!("{error:#}"),
                     "tls certificate changed on disk but could not be loaded; keeping the previous one"
@@ -997,7 +1100,26 @@ async fn tls_watch(tls: Arc<TlsReloader>, shutdown: CancellationToken) {
     }
 }
 
+/// Refuse to read a TLS path that is not a regular file.
+///
+/// `File::open` on a FIFO blocks until a writer appears; because reloads run on
+/// the blocking pool a replaced path would otherwise park that thread forever
+/// (and `shutdown` would then have to abandon it).
+fn require_regular_file(path: &Path, what: &str) -> Result<()> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("checking {what} {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "{what} {} is not a regular file (FIFO, socket or directory); refusing to read it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn load_tls(cert_path: &Path, key_path: &Path) -> Result<tokio_rustls::TlsAcceptor> {
+    require_regular_file(cert_path, "TLS certificate")?;
+    require_regular_file(key_path, "TLS key")?;
     let certs = CertificateDer::pem_file_iter(cert_path)
         .with_context(|| format!("opening TLS certificate {}", cert_path.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1116,11 +1238,11 @@ mod tests {
     }
 
     fn loaded(tls: &TlsReloader) -> Option<FileStamp> {
-        tls.state.lock().unwrap().loaded
+        lock_unpoisoned(&tls.state).loaded
     }
 
     fn rejected(tls: &TlsReloader) -> Option<FileStamp> {
-        tls.state.lock().unwrap().rejected
+        lock_unpoisoned(&tls.state).rejected
     }
 
     #[test]
@@ -1184,6 +1306,98 @@ mod tests {
         tls.reload_if_changed();
         assert_eq!(loaded(&tls), good);
         assert!(rejected(&tls).is_none());
+    }
+
+    #[test]
+    fn tls_watcher_ignores_a_path_that_is_not_a_regular_file() {
+        let pair = Pair::new("nonregular");
+        let tls = pair.reloader();
+        let good = loaded(&tls);
+
+        // A directory in place of the certificate must not be opened (and must
+        // not be treated as a rotation).
+        std::fs::remove_file(&pair.cert).unwrap();
+        std::fs::create_dir(&pair.cert).unwrap();
+        tls.reload_if_changed();
+        assert_eq!(loaded(&tls), good, "the old certificate must stay in use");
+        assert!(rejected(&tls).is_none());
+        assert!(load_tls(&pair.cert, &pair.key).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_reload_does_not_block_on_a_fifo() {
+        let pair = Pair::new("fifo");
+        let tls = pair.reloader();
+        let good = loaded(&tls);
+
+        std::fs::remove_file(&pair.cert).unwrap();
+        let made_fifo = std::process::Command::new("mkfifo")
+            .arg(&pair.cert)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made_fifo {
+            // `mkfifo` is unavailable (unusual); the directory test above still
+            // covers the non-regular-file check.
+            return;
+        }
+        assert!(require_regular_file(&pair.cert, "TLS certificate").is_err());
+
+        // Opening the FIFO would block forever; run the reload on a thread so a
+        // regression fails the test instead of hanging the suite.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let watcher = Arc::clone(&tls);
+        std::thread::spawn(move || {
+            watcher.reload_if_changed();
+            let _ = sender.send(());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a FIFO certificate path must not block the reload");
+        assert_eq!(loaded(&tls), good);
+    }
+
+    #[test]
+    fn lock_recovery_survives_a_poisoned_mutex() {
+        let mutex = Arc::new(Mutex::new(0_u32));
+        let poisoned = Arc::clone(&mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        // The mutex is poisoned, but `lock_unpoisoned` still recovers it.
+        assert!(mutex.lock().is_err());
+        *lock_unpoisoned(&mutex) = 7;
+        assert_eq!(*lock_unpoisoned(&mutex), 7);
+    }
+
+    #[test]
+    fn operations_listener_rejections_are_counted() {
+        let state = AppState::new(Config::default());
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        state.note_ops_rejection(peer);
+        state.note_ops_rejection(peer);
+        assert_eq!(state.metrics.ops_rejections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_a_background_task_that_never_stops() {
+        let handle = ServerHandle {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            ops_addr: None,
+            state: AppState::new(Config::default()),
+            tls: None,
+            join: tokio::spawn(async {}),
+            background: vec![tokio::spawn(std::future::pending::<()>())],
+        };
+        let started = std::time::Instant::now();
+        handle.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must not wait forever for a stalled background task"
+        );
     }
 
     #[test]

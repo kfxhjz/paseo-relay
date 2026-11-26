@@ -71,6 +71,15 @@ pub struct Config {
 
     /// Weighted byte budget for admitted, in-flight WebSocket payloads.
     pub ingress_budget_bytes: u64,
+    /// Optional cap on the weighted ingress bytes one connection may reserve.
+    ///
+    /// `None` derives the cap from the budget (see
+    /// [`Config::auto_per_connection_limit_bytes`]); a configured value is
+    /// clamped to `[one maximum message, ingress_budget_bytes]` so a single
+    /// connection can always make progress and never exceed the global budget.
+    /// A low value bounds how much of the global budget one slow source can
+    /// hold (M-7); a value close to the budget restores the old behaviour.
+    pub per_connection_limit_bytes: Option<usize>,
     /// Conservative memory weight charged per payload byte.
     pub ingress_weight: u32,
     /// Weighted byte budget reserved for messages of at most
@@ -146,6 +155,7 @@ impl Default for Config {
             max_clients_per_connection: 32,
             max_connections_per_session: 512,
             ingress_budget_bytes: 512 * 1024 * 1024,
+            per_connection_limit_bytes: None,
             ingress_weight: 4,
             ingress_small_reserve_bytes: 16 * 1024 * 1024,
             ingress_reclaim_min_rate_bytes: 64 * 1024,
@@ -204,17 +214,7 @@ impl Config {
                 .with_context(|| "PASEO_RELAY_HOST must be an IP address")?;
         }
         if let Some(value) = get(vars, "PASEO_RELAY_PORT") {
-            if value.contains("://") {
-                // Kubernetes injects `<SERVICE>_PORT=tcp://<ip>:<port>` into
-                // every pod for each Service in the namespace. A Service named
-                // `paseo-relay` therefore overwrites this setting.
-                bail!(
-                    "PASEO_RELAY_PORT is {value:?}, which looks like a Kubernetes service link for a \
-                     Service named paseo-relay rather than a port; set PASEO_RELAY_PORT explicitly \
-                     in the pod spec or set enableServiceLinks: false"
-                );
-            }
-            cfg.port = parse_u64("PASEO_RELAY_PORT", &value, 1, 65_535)? as u16;
+            cfg.port = parse_port_var("PASEO_RELAY_PORT", &value)?;
         }
         if let Some(value) = get(vars, "PASEO_RELAY_OPS_HOST") {
             cfg.ops_host = value
@@ -222,7 +222,7 @@ impl Config {
                 .with_context(|| "PASEO_RELAY_OPS_HOST must be an IP address")?;
         }
         if let Some(value) = get(vars, "PASEO_RELAY_OPS_PORT") {
-            cfg.ops_port = Some(parse_u64("PASEO_RELAY_OPS_PORT", &value, 1, 65_535)? as u16);
+            cfg.ops_port = Some(parse_port_var("PASEO_RELAY_OPS_PORT", &value)?);
         }
         if let Some(value) = get(vars, "PASEO_RELAY_DRAIN") {
             cfg.drain = parse_bool("PASEO_RELAY_DRAIN", &value)?;
@@ -252,6 +252,18 @@ impl Config {
                 128 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
             )?;
+        }
+        if let Some(value) = get(vars, "PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES") {
+            // 0 (the default) keeps the derived cap; other values are clamped
+            // below once the budget and message size are known, so an
+            // out-of-range deployment mistake cannot make startup fail.
+            let limit = parse_u64(
+                "PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES",
+                &value,
+                0,
+                u32::MAX as u64,
+            )?;
+            cfg.per_connection_limit_bytes = (limit != 0).then_some(limit as usize);
         }
         if let Some(value) = get(vars, "PASEO_RELAY_INGRESS_WEIGHT") {
             // A weight of 1 cannot cover the transient copy during fragmented
@@ -431,6 +443,7 @@ impl Config {
             };
         }
 
+        cfg.clamp_per_connection_limit();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -483,12 +496,39 @@ impl Config {
         }
         if let Some(ops_port) = self.ops_port {
             // Port 0 asks the OS for a free port (tests); it cannot collide.
-            let same_family = self.ops_host.is_ipv4() == self.host.is_ipv4();
-            let hosts_overlap = self.ops_host == self.host
-                || (same_family && (self.host.is_unspecified() || self.ops_host.is_unspecified()));
+            //
+            // `::` may also own the IPv4 port on Linux unless
+            // `net.ipv6.bindv6only=1`, so it conflicts with any same-port
+            // listener. `0.0.0.0` conflicts only with IPv4 listeners: a
+            // concrete IPv6 listener can coexist with it. Concrete addresses
+            // of different families also coexist.
+            //
+            // Treat v4-mapped IPv6 (`::ffff:a.b.c.d`) as its IPv4 address:
+            // binding it reserves the same IPv4 endpoint, so `0.0.0.0` or an
+            // IPv4 address on the same port would fail with EADDRINUSE.
+            let canonical = |ip: IpAddr| match ip {
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+                IpAddr::V4(v4) => IpAddr::V4(v4),
+            };
+            let host = canonical(self.host);
+            let ops_host = canonical(self.ops_host);
+            let hosts_overlap = host == ops_host
+                || (host.is_unspecified() && (host.is_ipv6() || ops_host.is_ipv4()))
+                || (ops_host.is_unspecified() && (ops_host.is_ipv6() || host.is_ipv4()));
             if ops_port != 0 && ops_port == self.port && hosts_overlap {
                 bail!(
-                    "PASEO_RELAY_OPS_PORT must differ from PASEO_RELAY_PORT when the listeners share or overlap on the same address"
+                    "PASEO_RELAY_OPS_PORT must differ from PASEO_RELAY_PORT when the listeners \
+                     overlap: both use the same address, an IPv6 wildcard (::) is involved, or an \
+                     IPv4 wildcard (0.0.0.0) is paired with an IPv4 or v4-mapped IPv6 address"
+                );
+            }
+        }
+        if let Some(limit) = self.per_connection_limit_bytes {
+            let floor = self.max_message_weighted_charge();
+            if (limit as u64) < floor || (limit as u64) > self.ingress_budget_bytes {
+                bail!(
+                    "PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES must be between {floor} (one maximum \
+                     message at the configured weight) and PASEO_RELAY_INGRESS_BUDGET_BYTES"
                 );
             }
         }
@@ -559,13 +599,52 @@ impl Config {
         self.control_queue_bytes
             .max(self.max_message_bytes.saturating_add(64 * 1024))
     }
+
+    /// Per-connection ingress limit derived from the budget when
+    /// [`Config::per_connection_limit_bytes`] is not configured.
+    ///
+    /// The read-ahead pipeline can hold up to four messages per connection
+    /// (one being handled by the main task, two queued, one being read), so the
+    /// cap is at least four maximum messages and at most the global budget.
+    pub fn auto_per_connection_limit_bytes(&self) -> u64 {
+        let one_max_message = self.max_message_weighted_charge();
+        self.ingress_budget_bytes
+            .min(one_max_message.saturating_mul(4))
+            .max(one_max_message)
+    }
+
+    /// The per-connection ingress limit in effect: the configured value, or the
+    /// derived cap when unset.
+    pub fn effective_per_connection_limit_bytes(&self) -> u64 {
+        self.per_connection_limit_bytes.map_or_else(
+            || self.auto_per_connection_limit_bytes(),
+            |value| value as u64,
+        )
+    }
+
+    /// Clamp a configured per-connection limit to its admissible range.
+    ///
+    /// Values parsed from the environment are clamped rather than rejected so
+    /// an out-of-range tuning value cannot keep the relay from starting;
+    /// [`Config::validate`] still rejects impossible hand-built values.
+    fn clamp_per_connection_limit(&mut self) {
+        let Some(limit) = self.per_connection_limit_bytes else {
+            return;
+        };
+        let one_max_message = self.max_message_weighted_charge();
+        let clamped = (limit as u64)
+            .max(one_max_message)
+            .min(self.ingress_budget_bytes)
+            .min(u32::MAX as u64);
+        self.per_connection_limit_bytes = Some(clamped as usize);
+    }
 }
 
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}:{} ops={} max_connections={} max_sessions={} max_connections_per_session={} ingress_budget={} small_reserve={} weight={} tls={}",
+            "{}:{} ops={} max_connections={} max_sessions={} max_connections_per_session={} ingress_budget={} per_connection_limit={} small_reserve={} weight={} tls={}",
             self.host,
             self.port,
             match self.ops_port {
@@ -576,6 +655,10 @@ impl fmt::Display for Config {
             self.max_sessions,
             self.max_connections_per_session,
             self.ingress_budget_bytes,
+            match self.per_connection_limit_bytes {
+                Some(value) => value.to_string(),
+                None => format!("auto({})", self.auto_per_connection_limit_bytes()),
+            },
             self.ingress_small_reserve_bytes,
             self.ingress_weight,
             self.tls_cert.is_some()
@@ -596,6 +679,7 @@ const KNOWN_VARS: &[&str] = &[
     "PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION",
     "PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION",
     "PASEO_RELAY_INGRESS_BUDGET_BYTES",
+    "PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES",
     "PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES",
     "PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES",
     "PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS",
@@ -713,6 +797,25 @@ impl Config {
         })
     }
 
+    /// A warning when one source can occupy the whole ingress budget.
+    ///
+    /// The derived cap is `min(budget, 4 maximum messages)`, which with the
+    /// default budget equals the budget: one fast connection can then hold all
+    /// of it for a delivery/attach window (M-7). With no per-IP cap a single
+    /// peer can also multiply that across connections.
+    pub fn per_connection_limit_warning(&self) -> Option<String> {
+        let derived_at_budget = self.per_connection_limit_bytes.is_none()
+            && self.auto_per_connection_limit_bytes() == self.ingress_budget_bytes;
+        (derived_at_budget && self.per_ip_max_connections == 0).then(|| {
+            "the derived per-connection ingress limit equals PASEO_RELAY_INGRESS_BUDGET_BYTES and \
+             PASEO_RELAY_PER_IP_MAX_CONNECTIONS is 0 (unlimited): one connection, or one peer with \
+             many connections, can occupy the whole budget for a delivery window; set \
+             PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES lower and/or PASEO_RELAY_PER_IP_MAX_CONNECTIONS \
+             unless an edge already limits per-source traffic"
+                .to_owned()
+        })
+    }
+
     /// A warning when the open-file limit cannot hold the configured sockets.
     ///
     /// Every accepted socket is one descriptor. If the soft limit is below
@@ -745,6 +848,35 @@ fn check_readable_file(path: &std::path::Path, key: &str) -> Result<()> {
     std::fs::File::open(path)
         .with_context(|| format!("{key} must be readable: {}", path.display()))?;
     Ok(())
+}
+
+/// Parse a listener port variable, diagnosing Kubernetes service-link values.
+///
+/// The kubelet injects `<SERVICE>_PORT=tcp://<ip>:<port>` into every pod in the
+/// namespace for each Service; with a Service named `paseo-relay` (or
+/// `paseo-relay-ops`) that overwrites this setting and would otherwise fail
+/// with a bare "must be an integer" error.
+fn parse_port_var(key: &str, value: &str) -> Result<u16> {
+    if value.contains("://") {
+        bail!(
+            "{key} is {value:?}, which looks like a Kubernetes service link for a Service named {} \
+             rather than a port; set {key} explicitly in the pod spec or set enableServiceLinks: false",
+            service_name_for(key)
+        );
+    }
+    Ok(parse_u64(key, value, 1, 65_535)? as u16)
+}
+
+/// The Kubernetes Service name whose service links would collide with `key`.
+///
+/// The kubelet uppercases the Service name and replaces `-` with `_`, so the
+/// Service is the variable name minus `PASEO_RELAY_`/`_PORT` with those
+/// separators restored: `PASEO_RELAY_OPS_PORT` belongs to `paseo-relay-ops`.
+fn service_name_for(key: &str) -> &'static str {
+    match key {
+        "PASEO_RELAY_OPS_PORT" => "paseo-relay-ops",
+        _ => "paseo-relay",
+    }
 }
 
 fn parse_u64(key: &str, value: &str, min: u64, max: u64) -> Result<u64> {
@@ -870,6 +1002,200 @@ mod tests {
     }
 
     #[test]
+    fn per_connection_limit_defaults_are_derived_and_clamped() {
+        let default = Config::default();
+        assert_eq!(default.per_connection_limit_bytes, None);
+        // With the default budget the derived cap is the whole budget; that is
+        // the documented M-7 residual the startup warning points at.
+        assert_eq!(
+            default.auto_per_connection_limit_bytes(),
+            default.ingress_budget_bytes
+        );
+        assert_eq!(
+            default.effective_per_connection_limit_bytes(),
+            default.ingress_budget_bytes
+        );
+        assert!(default.per_connection_limit_warning().is_some());
+
+        // 0 selects the derived cap.
+        let zero =
+            Config::from_map(&map(&[("PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES", "0")])).unwrap();
+        assert_eq!(zero.per_connection_limit_bytes, None);
+
+        // Too small: clamped up to one maximum message so a connection can
+        // always make progress.
+        let small = Config::from_map(&map(&[(
+            "PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES",
+            "1048576",
+        )]))
+        .unwrap();
+        assert_eq!(
+            small.per_connection_limit_bytes,
+            Some(small.max_message_weighted_charge() as usize)
+        );
+        assert!(small.effective_per_connection_limit_bytes() < small.ingress_budget_bytes);
+        assert!(
+            small.per_connection_limit_warning().is_none(),
+            "an explicit limit must silence the derived-limit warning"
+        );
+
+        // Too large: clamped down to the global budget.
+        let large = Config::from_map(&map(&[(
+            "PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES",
+            "4294967295",
+        )]))
+        .unwrap();
+        assert_eq!(
+            large.per_connection_limit_bytes,
+            Some(large.ingress_budget_bytes as usize)
+        );
+
+        // An explicit limit is displayed instead of the derived value.
+        assert!(format!("{small}").contains(&format!(
+            "per_connection_limit={}",
+            small.max_message_weighted_charge()
+        )));
+        assert!(format!("{default}").contains("per_connection_limit=auto("));
+    }
+
+    #[test]
+    fn per_connection_limit_warning_needs_the_derived_budget_and_no_per_ip_cap() {
+        let capped = Config {
+            per_ip_max_connections: 256,
+            ..Config::default()
+        };
+        assert!(
+            capped.per_connection_limit_warning().is_none(),
+            "a per-IP cap already limits one peer"
+        );
+
+        // Four maximum messages of budget makes the derived cap equal the
+        // budget again, so the residual applies.
+        let mut tight = Config {
+            ingress_budget_bytes: Config::default().max_message_weighted_charge() * 4,
+            ..Config::default()
+        };
+        assert_eq!(
+            tight.auto_per_connection_limit_bytes(),
+            tight.ingress_budget_bytes
+        );
+        assert!(tight.per_connection_limit_warning().is_some());
+
+        // A budget above four maximum messages derives a smaller cap, so one
+        // connection cannot take the whole budget and no warning is needed.
+        let roomy = Config {
+            ingress_budget_bytes: Config::default().max_message_weighted_charge() * 8,
+            ..Config::default()
+        };
+        assert!(roomy.auto_per_connection_limit_bytes() < roomy.ingress_budget_bytes);
+        assert!(roomy.per_connection_limit_warning().is_none());
+
+        tight.per_connection_limit_bytes = Some(1);
+        assert!(
+            tight.per_connection_limit_warning().is_none(),
+            "the warning is about the derived cap, not an explicit one"
+        );
+    }
+
+    #[test]
+    fn hand_built_out_of_range_per_connection_limit_is_rejected() {
+        let too_small = Config {
+            per_connection_limit_bytes: Some(1),
+            ..Config::default()
+        };
+        assert!(too_small.validate().is_err());
+
+        let too_large = Config {
+            per_connection_limit_bytes: Some(Config::default().ingress_budget_bytes as usize + 1),
+            ..Config::default()
+        };
+        assert!(too_large.validate().is_err());
+
+        let valid = Config {
+            per_connection_limit_bytes: Some(256 * 1024 * 1024),
+            ..Config::default()
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn wildcard_listeners_on_the_same_port_are_rejected_across_address_families() {
+        // `::` can also own the IPv4 port on dual-stack Linux even when the
+        // operations listener binds an IPv4 loopback.
+        let err = Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "::"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("OPS_PORT"), "{err}");
+
+        // ... and the other way round: an IPv4 wildcard with an IPv6 ops host.
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "127.0.0.1"),
+            ("PASEO_RELAY_OPS_HOST", "::"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_err());
+
+        // A wildcard against a concrete address of the same family still
+        // overlaps.
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "::"),
+            ("PASEO_RELAY_OPS_HOST", "::1"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_err());
+
+        // Port 0 asks the OS for a free port and must stay exempt.
+        let zero_port = Config {
+            host: "0.0.0.0".parse().unwrap(),
+            ops_host: "127.0.0.1".parse().unwrap(),
+            ops_port: Some(0),
+            ..Config::default()
+        };
+        assert!(zero_port.validate().is_ok());
+
+        // `0.0.0.0` is IPv4-only; a concrete IPv6 operations listener may share
+        // the port with it. (A `::` wildcard still conflicts, tested above.)
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "0.0.0.0"),
+            ("PASEO_RELAY_OPS_HOST", "::1"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_ok());
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "::1"),
+            ("PASEO_RELAY_OPS_HOST", "0.0.0.0"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_ok());
+
+        // v4-mapped IPv6 reserves the IPv4 endpoint; pairing it with the IPv4
+        // wildcard (or the same IPv4 address) must be rejected at validate
+        // time instead of failing later with EADDRINUSE.
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "0.0.0.0"),
+            ("PASEO_RELAY_OPS_HOST", "::ffff:127.0.0.1"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_err());
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "::ffff:127.0.0.1"),
+            ("PASEO_RELAY_OPS_HOST", "127.0.0.1"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_err());
+
+        // Distinct concrete addresses on the same port are fine.
+        assert!(Config::from_map(&map(&[
+            ("PASEO_RELAY_HOST", "10.0.0.10"),
+            ("PASEO_RELAY_OPS_HOST", "10.0.0.11"),
+            ("PASEO_RELAY_OPS_PORT", "4000"),
+        ]))
+        .is_ok());
+    }
+
+    #[test]
     fn ops_listener_is_optional_and_must_not_collide() {
         assert_eq!(Config::default().ops_port, None);
 
@@ -960,6 +1286,24 @@ mod tests {
         assert!(
             message.contains("enableServiceLinks") && message.contains("service link"),
             "{message}"
+        );
+        assert!(message.contains("paseo-relay"), "{message}");
+    }
+
+    #[test]
+    fn ops_service_link_port_value_gets_an_actionable_error() {
+        let err = Config::from_map(&map(&[("PASEO_RELAY_OPS_PORT", "tcp://10.96.0.5:4001")]))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("PASEO_RELAY_OPS_PORT")
+                && message.contains("enableServiceLinks")
+                && message.contains("service link"),
+            "{message}"
+        );
+        assert!(
+            message.contains("paseo-relay-ops"),
+            "the diagnostic must name the Service to rename: {message}"
         );
     }
 

@@ -42,6 +42,11 @@ const READ_CHANNEL_CAPACITY: usize = 2;
 /// cannot delay shutdown close frames.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Minimum interval between supplementary `sync` nudges for clients that
+/// attach in a burst. The oldest waiter's `1011` deadline is independent of
+/// this window; see [`Session::watchdog_step`].
+const CONTROL_NUDGE_COALESCE: Duration = Duration::from_millis(250);
+
 enum Inbound {
     Message {
         opcode: OpCode,
@@ -150,11 +155,17 @@ pub async fn run_connection(
     // (one being handled by the main task, two queued, one being read), so the
     // per-connection cap must not be lower than that or a legitimate pipelining
     // source would be closed.
-    let per_connection_limit = state
-        .config
-        .ingress_budget_bytes
-        .min(one_max_message_weighted.saturating_mul(4))
-        .max(one_max_message_weighted);
+    //
+    // `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` overrides the automatic cap; it
+    // is clamped here as well as in config parsing so a directly constructed
+    // `Config` can never admit less than one maximum message or more than the
+    // node-wide budget.
+    let per_connection_limit = match state.config.per_connection_limit_bytes {
+        Some(configured) => (configured as u64)
+            .max(one_max_message_weighted)
+            .min(state.config.ingress_budget_bytes),
+        None => state.config.auto_per_connection_limit_bytes(),
+    };
 
     let (writer, writer_task) = spawn_writer(
         write_half,
@@ -187,12 +198,12 @@ pub async fn run_connection(
     let (session, attach) = match state.sessions.join(&connection, writer.clone(), socket_id) {
         Ok(value) => value,
         Err(error) => {
-            Metrics::inc(&state.metrics.session_rejections);
-            state.metrics.shed(ShedKind::SessionCapacity);
+            note_join_rejection(&state.metrics, &error);
             let reason = match error {
                 JoinError::SessionLimit => "Relay session capacity",
                 JoinError::ClientLimit => "Relay client capacity",
                 JoinError::SessionConnectionLimit => "Relay session connection capacity",
+                JoinError::SyncLimit => "Relay session sync capacity",
             };
             writer.close(1013, reason);
             reader_task.abort();
@@ -215,10 +226,33 @@ pub async fn run_connection(
         replaced.close(1008, "Replaced by new connection");
     }
     if let Some(ids) = attach.sync {
-        if let Ok(payload) = serde_json::to_vec(&json!({"type": "sync", "connectionIds": ids})) {
-            let _ = writer
-                .send_text(Bytes::from(payload), CONTROL_SEND_TIMEOUT)
-                .await;
+        // The session layer only returns a sync list that fits
+        // `CONTROL_FRAME_BYTES`; keep this fail-closed anyway so an invariant
+        // violation can never emit an oversized control frame.
+        match serde_json::to_vec(&json!({"type": "sync", "connectionIds": ids})) {
+            Ok(payload) if payload.len() <= CONTROL_FRAME_BYTES => {
+                if let Err(error) = writer
+                    .send_text(Bytes::from(payload), CONTROL_SEND_TIMEOUT)
+                    .await
+                {
+                    handle_control_send_err(&state, &writer, error);
+                }
+            }
+            Ok(payload) => {
+                tracing::warn!(
+                    bytes = payload.len(),
+                    limit = CONTROL_FRAME_BYTES,
+                    "initial control sync exceeds the control frame limit"
+                );
+                Metrics::inc(&state.metrics.control_send_failures);
+                Metrics::inc(&state.metrics.session_connection_rejections);
+                writer.close(1013, "Relay session sync capacity");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "initial control sync serialization failed");
+                Metrics::inc(&state.metrics.control_send_failures);
+                writer.close(1013, "Relay session sync capacity");
+            }
         }
     }
     if let Some(control) = attach.control {
@@ -384,7 +418,9 @@ async fn finish(
                 result = control
                     .writer
                     .send_json(&notification, CONTROL_SEND_TIMEOUT) => {
-                    let _ = result;
+                    if let Err(error) = result {
+                        handle_control_send_err(state, &control.writer, error);
+                    }
                 }
             }
         }
@@ -509,25 +545,31 @@ async fn deliver_one(
     {
         Ok(()) => Ok(()),
         Err(error) => {
-            match &error {
-                SendError::SlowConsumer => {
+            // A shed is counted exactly once. A frame that never got queued is
+            // only observable here, so the source counts `QueueTimeout`; a
+            // queued frame that misses its write deadline is counted by the
+            // writer task (which also sees it when the source is already gone).
+            let reason = match &error {
+                SendError::QueueTimeout => {
                     Metrics::inc(&state.metrics.slow_consumer_disconnects);
                     Metrics::inc(&state.metrics.delivery_timeouts);
                     state.metrics.shed(ShedKind::SlowConsumer);
+                    "Slow consumer"
                 }
-                SendError::Writer(_) => {
-                    // The writer task's deadline or transport error; not counted
-                    // as a slow consumer because it may be a destination close.
-                    Metrics::inc(&state.metrics.delivery_timeouts);
+                SendError::WriteTimeout => "Slow consumer",
+                SendError::Transport(_) => {
+                    // Peer/transport failure, not a delivery timeout and not a
+                    // slow consumer; the destination socket is already dead.
+                    "Delivery unavailable"
                 }
-                SendError::Closed | SendError::TooLarge => {}
-            }
+                SendError::Closed | SendError::TooLarge => "Delivery unavailable",
+            };
             tracing::debug!(
                 error = %error,
                 destination = destination.writer.id,
                 "destination shed"
             );
-            destination.writer.close(1013, "Slow consumer");
+            destination.writer.close(1013, reason);
             Err("Delivery unavailable")
         }
     }
@@ -544,19 +586,65 @@ fn shed_slow_consumer(state: &Arc<AppState>, writer: &WriterHandle) {
 /// (`SendError::Closed`) as slow-consumer sheds.
 fn handle_control_send_err(state: &Arc<AppState>, writer: &WriterHandle, error: SendError) {
     match error {
-        SendError::SlowConsumer => shed_slow_consumer(state, writer),
+        SendError::QueueTimeout => {
+            // The frame was never queued, so only this side can count the
+            // shed; the control-specific failure is counted as well.
+            Metrics::inc(&state.metrics.control_send_failures);
+            Metrics::inc(&state.metrics.delivery_timeouts);
+            shed_slow_consumer(state, writer);
+        }
+        SendError::WriteTimeout => {
+            // The writer task already counted the slow destination when the
+            // write deadline expired; add only the control failure to avoid
+            // double counting.
+            Metrics::inc(&state.metrics.control_send_failures);
+            writer.close(1013, "Slow consumer");
+        }
         SendError::Closed => {}
-        SendError::Writer(_) | SendError::TooLarge => writer.close(1013, "Delivery unavailable"),
+        SendError::Transport(_) | SendError::TooLarge => {
+            Metrics::inc(&state.metrics.control_send_failures);
+            writer.close(1013, "Delivery unavailable");
+        }
+    }
+}
+
+/// Count one rejected attach under the counter that matches its ceiling.
+///
+/// `session_rejections` stays reserved for the global `MAX_SESSIONS` ceiling;
+/// the per-session connection/sync and per-client ceilings have their own
+/// counters so a hot single session cannot be mistaken for global exhaustion.
+fn note_join_rejection(metrics: &Metrics, error: &JoinError) {
+    match error {
+        JoinError::SessionLimit => {
+            Metrics::inc(&metrics.session_rejections);
+            metrics.shed(ShedKind::SessionCapacity);
+        }
+        JoinError::SessionConnectionLimit => {
+            Metrics::inc(&metrics.session_connection_rejections);
+        }
+        // A sync that no longer fits the control-frame contract is a
+        // per-session control-plane ceiling; it is reported with the
+        // session-connection counter (and spelled out in its HELP) rather than
+        // polluting the global `MAX_SESSIONS` counter.
+        JoinError::SyncLimit => {
+            Metrics::inc(&metrics.session_connection_rejections);
+        }
+        JoinError::ClientLimit => {
+            Metrics::inc(&metrics.client_limit_rejections);
+        }
     }
 }
 
 /// Single deduplicated control watchdog per session.
 ///
 /// Holds only a [`Weak<Session>`] across awaits so an empty session can be
-/// released immediately when its last socket disconnects. Sends at most one
-/// `sync` per `CONTROL_NUDGE_MS` window (bounded by `CONTROL_SEND_TIMEOUT`,
-/// with the JSON Value dropped before awaiting), and closes an unresponsive
-/// control socket with `1011` after `CONTROL_UNRESPONSIVE_MS`.
+/// released immediately when its last socket disconnects. Emits the first
+/// nudge after `CONTROL_NUDGE_MS`, and supplementary nudges for clients that
+/// arrived later, while the oldest waiter's deadline has not passed; those
+/// supplementary nudges are coalesced to at most one per
+/// `CONTROL_NUDGE_COALESCE`, and every send is bounded by
+/// `CONTROL_SEND_TIMEOUT` with the JSON Value dropped before awaiting. Closes an unresponsive control socket with `1011` after
+/// `CONTROL_UNRESPONSIVE_MS` measured from that oldest waiter's start.
 fn spawn_control_watchdog(
     state: Arc<AppState>,
     session: Weak<Session>,
@@ -576,7 +664,8 @@ fn spawn_control_watchdog(
                 let Some(strong) = session.upgrade() else {
                     return;
                 };
-                let step = strong.watchdog_step(nudge_after, unresponsive_after);
+                let step =
+                    strong.watchdog_step(nudge_after, unresponsive_after, CONTROL_NUDGE_COALESCE);
                 drop(strong);
                 step
             };
@@ -612,22 +701,38 @@ fn spawn_control_watchdog(
                     }
                 }
                 WatchdogStep::SendNudge { control, ids } => {
-                    let payload =
-                        serde_json::to_vec(&json!({"type": "sync", "connectionIds": ids}))
-                            .map(Bytes::from);
-                    if let Ok(payload) = payload {
-                        let sent = tokio::select! {
-                            biased;
-                            _ = state.conn_shutdown.cancelled() => {
-                                if let Some(strong) = session.upgrade() {
-                                    strong.mark_watchdog_stopped();
+                    match serde_json::to_vec(&json!({"type": "sync", "connectionIds": ids})) {
+                        Ok(payload) if payload.len() <= CONTROL_FRAME_BYTES => {
+                            let sent = tokio::select! {
+                                biased;
+                                _ = state.conn_shutdown.cancelled() => {
+                                    if let Some(strong) = session.upgrade() {
+                                        strong.mark_watchdog_stopped();
+                                    }
+                                    return;
                                 }
-                                return;
+                                result = control.writer.send_text(Bytes::from(payload), CONTROL_SEND_TIMEOUT) => result,
+                            };
+                            if let Err(error) = sent {
+                                handle_control_send_err(&state, &control.writer, error);
                             }
-                            result = control.writer.send_text(payload, CONTROL_SEND_TIMEOUT) => result,
-                        };
-                        if let Err(error) = sent {
-                            handle_control_send_err(&state, &control.writer, error);
+                        }
+                        Ok(payload) => {
+                            // The session attach path maintains the sync-size
+                            // invariant; fail closed if it is ever violated.
+                            tracing::warn!(
+                                bytes = payload.len(),
+                                limit = CONTROL_FRAME_BYTES,
+                                "control sync nudge exceeds the control frame limit"
+                            );
+                            Metrics::inc(&state.metrics.control_send_failures);
+                            Metrics::inc(&state.metrics.session_connection_rejections);
+                            control.writer.close(1013, "Relay session sync capacity");
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "control sync nudge serialization failed");
+                            Metrics::inc(&state.metrics.control_send_failures);
+                            control.writer.close(1013, "Relay session sync capacity");
                         }
                     }
                 }
@@ -659,7 +764,9 @@ async fn handle_control_input(
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let pong = json!({"type": "pong", "ts": timestamp});
-    if let Err(error) = writer.send_json(&pong, state.config.delivery_timeout).await {
+    // A control pong is a 1 s-at-most courtesy like every other control
+    // notification; the 30 s delivery deadline belongs to relayed data.
+    if let Err(error) = writer.send_json(&pong, CONTROL_SEND_TIMEOUT).await {
         handle_control_send_err(state, writer, error);
     }
 }
@@ -851,13 +958,15 @@ where
                 // Charge the fixed per-message overhead once per message. It is
                 // charged before the payload is read, but it is small (~1 KiB
                 // weighted at the default weight).
+                //
+                // This reservation must not pass the declared frame weight as
+                // its reclaim hint: a peer that sends only a large frame header
+                // and stalls would otherwise be able to make the budget evict
+                // many unrelated in-progress messages for a ~1 KiB wait.
                 let overhead = match bounded_budget_wait(payload_deadline, ctx.wait_timeout) {
                     Ok(wait) => {
-                        let request = Reservation {
-                            weighted: ctx.capacity.ingress.overhead_weight(),
-                            class,
-                            frame_need: ctx.capacity.ingress.frame_weight(header.payload_len),
-                        };
+                        let request =
+                            Reservation::overhead(ctx.capacity.ingress.overhead_weight(), class);
                         match reserve(ctx, request, 0, wait).await {
                             Ok(guard) => guard,
                             Err(failure) => fail!(failure),
@@ -1025,11 +1134,13 @@ where
             ))));
         }
         let wait = bounded_budget_wait(deadline, ctx.wait_timeout)?;
-        let request = Reservation {
-            weighted: ctx.capacity.ingress.chunk_weight(chunk_len),
+        // Only the chunk phase sizes the reclaim scan for the rest of the
+        // frame; the overhead phase only waits for ~1 KiB.
+        let request = Reservation::chunk(
+            ctx.capacity.ingress.chunk_weight(chunk_len),
             class,
-            frame_need: ctx.capacity.ingress.frame_weight(remaining),
-        };
+            ctx.capacity.ingress.frame_weight(remaining),
+        );
         let wait_started = Instant::now();
         let guard = reserve(ctx, request, chunk_len, wait).await?;
         // Relay-imposed budget wait does not count against the sender's stall
@@ -1137,4 +1248,30 @@ async fn finish_message(
         code: 1000,
         reason: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn join_rejections_are_counted_under_their_own_ceiling() {
+        let metrics = Metrics::new();
+        note_join_rejection(&metrics, &JoinError::SessionLimit);
+        note_join_rejection(&metrics, &JoinError::SessionConnectionLimit);
+        note_join_rejection(&metrics, &JoinError::SyncLimit);
+        note_join_rejection(&metrics, &JoinError::ClientLimit);
+        note_join_rejection(&metrics, &JoinError::ClientLimit);
+        // Only the global MAX_SESSIONS ceiling increments session_rejections;
+        // session-level and per-client ceilings have their own counters.
+        assert_eq!(metrics.session_rejections.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .session_connection_rejections
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(metrics.client_limit_rejections.load(Ordering::Relaxed), 2);
+    }
 }

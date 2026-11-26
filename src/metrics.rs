@@ -75,8 +75,13 @@ pub struct Metrics {
     pub bytes_forwarded: AtomicU64,
     pub slow_consumer_disconnects: AtomicU64,
     pub delivery_timeouts: AtomicU64,
+    pub delivery_ack_timeouts: AtomicU64,
+    pub control_send_failures: AtomicU64,
     pub connection_rejections: AtomicU64,
     pub session_rejections: AtomicU64,
+    pub session_connection_rejections: AtomicU64,
+    pub client_limit_rejections: AtomicU64,
+    pub ops_rejections: AtomicU64,
     pub per_ip_rejections: AtomicU64,
     pub tcp_rejections: AtomicU64,
     pub ingress_rejections: AtomicU64,
@@ -116,8 +121,13 @@ impl Metrics {
             bytes_forwarded: AtomicU64::new(0),
             slow_consumer_disconnects: AtomicU64::new(0),
             delivery_timeouts: AtomicU64::new(0),
+            delivery_ack_timeouts: AtomicU64::new(0),
+            control_send_failures: AtomicU64::new(0),
             connection_rejections: AtomicU64::new(0),
             session_rejections: AtomicU64::new(0),
+            session_connection_rejections: AtomicU64::new(0),
+            client_limit_rejections: AtomicU64::new(0),
+            ops_rejections: AtomicU64::new(0),
             per_ip_rejections: AtomicU64::new(0),
             tcp_rejections: AtomicU64::new(0),
             ingress_rejections: AtomicU64::new(0),
@@ -233,13 +243,13 @@ impl Metrics {
         counter(
             &mut out,
             "paseo_relay_frames_forwarded_total",
-            "WebSocket frames forwarded by this node.",
+            "Relayed WebSocket user frames forwarded by this node (control frames such as sync/connected/disconnected/pong are excluded).",
             &self.frames_forwarded,
         );
         counter(
             &mut out,
             "paseo_relay_bytes_forwarded_total",
-            "WebSocket payload bytes forwarded by this node.",
+            "Relayed WebSocket user payload bytes forwarded by this node (control-frame bytes are excluded).",
             &self.bytes_forwarded,
         );
         counter(
@@ -251,8 +261,20 @@ impl Metrics {
         counter(
             &mut out,
             "paseo_relay_delivery_timeouts_total",
-            "Deliveries that exceeded their deadline.",
+            "Shed deliveries (relayed user frames or relay-generated control notifications) that exceeded their deadline (counted once per shed: source for queue waits, writer for write deadlines).",
             &self.delivery_timeouts,
+        );
+        counter(
+            &mut out,
+            "paseo_relay_delivery_ack_timeouts_total",
+            "Source-side acknowledgement waits that expired at the delivery deadline. Overlaps with writer-counted delivery_timeouts_total; a write completed exactly at the boundary still closes the destination as a slow consumer, so this is not a per-shed count.",
+            &self.delivery_ack_timeouts,
+        );
+        counter(
+            &mut out,
+            "paseo_relay_control_send_failures_total",
+            "Control notifications (sync/connected/disconnected/pong) that could not be queued or written to a control socket.",
+            &self.control_send_failures,
         );
         counter(
             &mut out,
@@ -263,8 +285,26 @@ impl Metrics {
         counter(
             &mut out,
             "paseo_relay_session_rejections_total",
-            "Sessions rejected at the configured session ceiling.",
+            "Sessions rejected at the configured global session ceiling (MAX_SESSIONS).",
             &self.session_rejections,
+        );
+        counter(
+            &mut out,
+            "paseo_relay_session_connection_rejections_total",
+            "Sockets rejected at the per-session connection ceiling or because the session sync frame would exceed the control-frame limit.",
+            &self.session_connection_rejections,
+        );
+        counter(
+            &mut out,
+            "paseo_relay_client_limit_rejections_total",
+            "Clients rejected at the per-connectionId client ceiling.",
+            &self.client_limit_rejections,
+        );
+        counter(
+            &mut out,
+            "paseo_relay_ops_rejections_total",
+            "Operations connections rejected by the operations-listener connection allowance.",
+            &self.ops_rejections,
         );
         counter(
             &mut out,
@@ -384,6 +424,12 @@ mod tests {
         assert!(text.contains("paseo_relay_handshake_rejected_total 1"));
         assert!(text.contains("paseo_relay_ingress_reclaims_total 1"));
         assert!(text.contains("paseo_relay_tcp_rejections_total 0"));
+        assert!(text.contains("paseo_relay_session_rejections_total 0"));
+        assert!(text.contains("paseo_relay_session_connection_rejections_total 0"));
+        assert!(text.contains("paseo_relay_client_limit_rejections_total 0"));
+        assert!(text.contains("paseo_relay_ops_rejections_total 0"));
+        assert!(text.contains("paseo_relay_control_send_failures_total 0"));
+        assert!(text.contains("paseo_relay_delivery_ack_timeouts_total 0"));
         assert!(text.contains("# TYPE paseo_relay_ready gauge"));
     }
 

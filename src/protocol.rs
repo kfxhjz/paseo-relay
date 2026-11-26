@@ -61,8 +61,15 @@ pub struct Connection {
     pub server_id: String,
     pub role: Role,
     pub version: Version,
-    /// `None` for v1. For v2 this is `Some`; an empty string identifies the
-    /// daemon's control socket (`role=server` only).
+    /// `None` for v1. For v2 this is always `Some`.
+    ///
+    /// An empty string identifies the daemon's control socket and is only
+    /// valid for `role=server`; omitting `connectionId` (or sending it empty)
+    /// is the documented way to open the control socket. A v2 `role=client`
+    /// that omits `connectionId` (or sends it empty) is assigned a
+    /// relay-generated id. Query values are used verbatim: they are never
+    /// trimmed, and a value that is only whitespace is rejected rather than
+    /// treated as empty.
     pub connection_id: Option<String>,
 }
 
@@ -102,7 +109,10 @@ impl Connection {
         let server_id = server_id.ok_or(ConnectionError::MissingServerId)?;
         validate_route_id(&server_id, IdKind::ServerId)?;
 
-        let version = match version.as_deref().map(str::trim) {
+        // `v` is matched verbatim: RFC 3986 query values arrive already
+        // decoded, and a value such as `" 2"`/`"2 "` is a client error rather
+        // than a second spelling of v2. Only absent/empty keep the v1 default.
+        let version = match version.as_deref() {
             None | Some("") | Some("1") => Version::V1,
             Some("2") => Version::V2,
             Some(_) => return Err(ConnectionError::Version),
@@ -111,7 +121,10 @@ impl Connection {
         let connection_id = match version {
             Version::V1 => None,
             Version::V2 => {
-                let value = connection_id.as_deref().unwrap_or("").trim().to_owned();
+                // Used verbatim as well: pads are not stripped, so `%20`
+                // fails route-id validation below instead of silently turning
+                // the control socket's empty id into a data route.
+                let value = connection_id.as_deref().unwrap_or("").to_owned();
                 if value.len() > MAX_ROUTE_ID_BYTES {
                     return Err(ConnectionError::ConnectionIdTooLong);
                 }
@@ -178,10 +191,12 @@ fn validate_route_id(value: &str, kind: IdKind) -> Result<(), ConnectionError> {
             IdKind::ConnectionId => ConnectionError::ConnectionIdTooLong,
         });
     }
-    // Reject control characters and invalid UTF-8 (Rust `str` is already valid
-    // UTF-8). The query decoder replaces invalid percent-encoding bytes with
-    // replacement characters, but be strict about anything non-printable:
-    // route ids appear in logs at edges and are used as session keys.
+    // Reject control characters and whitespace (Rust `str` already guarantees
+    // valid UTF-8). The query decoder never lossily replaces bytes: invalid
+    // percent-encoding or invalid UTF-8 makes the whole parse fail with
+    // `ConnectionError::Encoding`. Route ids still get this check because they
+    // appear in logs at edges, are used as session keys, and are embedded in
+    // JSON control frames.
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(match kind {
             IdKind::ServerId => ConnectionError::ServerId,
@@ -348,6 +363,55 @@ mod tests {
             ])),
             Err(ConnectionError::ConnectionId)
         ));
+    }
+
+    #[test]
+    fn version_and_connection_id_are_not_trimmed() {
+        // A padded version is not v2; the query decoder maps `+` to a space,
+        // so `v=+2` used to be accepted as v2 by the old `.trim()`.
+        assert_eq!(
+            Connection::from_query("serverId=srv_1&role=server&v=+2").unwrap_err(),
+            ConnectionError::Version
+        );
+        assert_eq!(
+            Connection::from_query(&q(&[
+                ("serverId", "srv_1"),
+                ("role", "server"),
+                ("v", "2 ")
+            ]))
+            .unwrap_err(),
+            ConnectionError::Version
+        );
+        // A whitespace-only connectionId is rejected instead of being
+        // trimmed into the control socket's empty id.
+        assert!(matches!(
+            Connection::from_query("serverId=srv_1&role=server&v=2&connectionId=%20"),
+            Err(ConnectionError::ConnectionId)
+        ));
+        assert!(matches!(
+            Connection::from_query(&q(&[
+                ("serverId", "srv_1"),
+                ("role", "client"),
+                ("v", "2"),
+                ("connectionId", " "),
+            ])),
+            Err(ConnectionError::ConnectionId)
+        ));
+    }
+
+    #[test]
+    fn empty_connection_id_is_control_for_servers_and_generated_for_clients() {
+        // Documented empty-value semantics: for `role=server`, an omitted or
+        // empty connectionId is the control socket.
+        let omitted = Connection::from_query("serverId=srv&role=server&v=2").unwrap();
+        assert!(omitted.is_v2_control());
+        let empty = Connection::from_query("serverId=srv&role=server&v=2&connectionId=").unwrap();
+        assert!(empty.is_v2_control());
+        // For `role=client`, the relay assigns an id instead.
+        let omitted = Connection::from_query("serverId=srv&role=client&v=2").unwrap();
+        assert!(omitted.connection_id().is_some_and(|id| !id.is_empty()));
+        let empty = Connection::from_query("serverId=srv&role=client&v=2&connectionId=").unwrap();
+        assert!(empty.connection_id().is_some_and(|id| !id.is_empty()));
     }
 
     #[test]
