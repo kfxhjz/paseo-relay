@@ -63,8 +63,8 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 `PASEO_RELAY_WS_IDLE_TIMEOUT_MS`。`v0.1.2` 镜像会忽略它们，并且收到 `SIGHUP` 时会直接
 退出而不是重新加载 TLS。详见
 [changelog（英文）](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md)。
-`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 比 `v0.1.3` 更新；更早的镜像会忽略它，继续
-使用旧的派生上限。
+**`v0.1.4` 新增：** `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`。`v0.1.3` 镜像会忽略
+它，继续使用旧的派生上限。
 
 监听冲突会在启动时拒绝：两个 listener 配置在同一个非 0 端口时，只要任一侧绑定通配地址
 （`0.0.0.0` 或 `::`）就拒绝，跨地址族也一样，因为双栈 `::` 绑定也可能占住 IPv4 端口。

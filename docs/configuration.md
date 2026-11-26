@@ -67,8 +67,8 @@ it does not know; see [Startup warnings](#startup-warnings).
 and `PASEO_RELAY_WS_IDLE_TIMEOUT_MS`. The `v0.1.2` image ignores them, and it
 terminates on `SIGHUP` instead of reloading TLS. See the
 [changelog](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md).
-`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` is newer than `v0.1.3`; images that
-predate it ignore it and keep the old derived cap.
+**Added in `v0.1.4`:** `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`. The
+`v0.1.3` image ignores it and keeps the old derived cap.
 
 Listener conflicts are rejected at startup: if both listeners are configured on
 the same non-zero port, any wildcard bind (`0.0.0.0` or `::`) on either side is

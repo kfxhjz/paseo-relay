@@ -34,7 +34,7 @@ docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
 The Compose file pulls the current release,
-`ghcr.io/kfxhjz/paseo-relay:v0.1.3`; `latest` follows the newest stable release
+`ghcr.io/kfxhjz/paseo-relay:v0.1.4`; `latest` follows the newest stable release
 (prerelease tags do not move it). The release workflow smoke-tests and
 signs/attests the image by digest before promoting the version tag or `latest`,
 so following `latest` does not pick up an unverified build. Set

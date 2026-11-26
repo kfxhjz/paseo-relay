@@ -31,7 +31,7 @@ RELAY_DOMAIN=relay.example.com \
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
-Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.3`；`latest` 跟随
+Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.4`；`latest` 跟随
 最新 **stable** release（预发布 tag 不会移动它）。release workflow 会先按 digest
 对镜像做 smoke test、签名/证明，再提升版本 tag 或 `latest`，所以跟随 `latest` 不会
 拿到未验证的构建。可用 `PASEO_RELAY_IMAGE` 覆盖版本；如果需要固定不可变的 digest，

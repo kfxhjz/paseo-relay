@@ -67,7 +67,11 @@ and reloads them when they change. New connections get the new certificate and
 established sessions continue. A pair that cannot be loaded (unreadable,
 malformed, certificate and key not matching) is refused with one `warn` line
 and the previous certificate stays in use. `v0.1.2` and earlier need a restart
-and terminate on `SIGHUP`.
+and terminate on `SIGHUP`. `paseo-relay healthcheck` pins the certificate file,
+not the certificate the listener is currently serving: while a malformed or
+mismatched replacement pair is left on disk, the probe can report unhealthy even
+though the old certificate still serves traffic. Repair or restore the files
+instead of restarting; startup also tries to load that pair and would fail.
 
 ## Draining a node
 

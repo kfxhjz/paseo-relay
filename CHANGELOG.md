@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-27
+
 Fixes for the third (2026-11) review round. No wire-protocol change for normal
 traffic; the v2 control plane now enforces the documented 64 KiB `sync` bound
 and a few operational defaults have safer validation.
@@ -38,6 +40,12 @@ and a few operational defaults have safer validation.
   read, it only probes loopback and fails closed for non-loopback targets. A
   plaintext listener has no certificate to pin: non-loopback probes are allowed
   but unauthenticated.
+- **The TLS healthcheck pin follows the configured certificate file, not the
+  certificate the listener is currently serving.** If a replacement pair is
+  malformed or mismatched, the watcher keeps the previous certificate in use
+  but the probe pins the new file and can report unhealthy until the pair is
+  fixed. Repair or restore the files instead of restarting: startup also tries
+  to load the broken pair and would fail.
 - **Per-connection ingress share is configurable, with a residual-risk
   warning.** `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` (0/unset = auto) clamps a
   configured cap to `[one maximum message, ingress budget]`; the automatic
@@ -495,7 +503,8 @@ invariants.
   their own deadline.
 - Invalid UTF-8 IDs are rejected with HTTP 400, never encoded or crashed on.
 
-[Unreleased]: https://github.com/kfxhjz/paseo-relay/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/kfxhjz/paseo-relay/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.4
 [0.1.3]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1

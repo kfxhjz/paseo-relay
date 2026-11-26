@@ -1,6 +1,6 @@
 [package]
 name = "paseo-relay"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Self-hostable, wire-compatible WebSocket relay for Paseo — one static musl binary, no Erlang/OTP"
 license = "Apache-2.0"

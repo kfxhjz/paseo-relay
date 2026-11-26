@@ -59,7 +59,10 @@ public port with `PASEO_RELAY_OPS_PORT` (below). The built-in
 (DER SHA-256) and accepts only that certificate, so a non-loopback probe target
 cannot be answered by a different local service; if native TLS is configured but
 the certificate cannot be read, it refuses non-loopback targets and only probes
-loopback.
+loopback. The pin is read from the configured files: while a malformed or
+mismatched replacement pair is on disk, the probe can report unhealthy even
+though the listener still serves the previous certificate. Repair or restore the
+pair instead of restarting, because startup also tries to load it.
 
 TLS is not optional for the public internet: although Paseo payloads are
 end-to-end encrypted, `serverId`, connection metadata, and availability are
@@ -126,7 +129,7 @@ than the drain grace window (`--rm` and `--restart` are mutually exclusive):
 
 ```sh
 # Sized for ~512 MB; raise with RAM (see "Capacity sizing").
-docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.3
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.4
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -138,7 +141,7 @@ docker run -d \
   -e PASEO_RELAY_MAX_SESSIONS=4000 \
   -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
   -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.3
+  ghcr.io/kfxhjz/paseo-relay:v0.1.4
 ```
 
 For a one-off foreground check, drop `-d`/`--restart`/`--stop-timeout`, add
@@ -150,7 +153,7 @@ an edge proxy. To serve TLS directly from the relay, mount the PEM files, set
 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`, and publish the TLS port (for
 example `-p 0.0.0.0:443:4000`).
 
-`v0.1.3` is the current release tag and `latest` follows the newest **stable**
+`v0.1.4` is the current release tag and `latest` follows the newest **stable**
 release. Prerelease tags (any tag containing `-`, for example `v0.2.0-rc1`) do
 not move `latest`. Publication is staged so users never pull unverified bits:
 the multi-arch index is first assembled under a temporary candidate tag, then
@@ -160,8 +163,8 @@ eligible, `latest` — promoted to the same digest. A failed build, smoke test o
 signing step therefore leaves the previous `latest` in place. `latest` also
 moves only to a stable version that is at least the highest stable tag on
 `main`, so an out-of-order older release cannot take it over. For an immutable
-reference, pin the multi-arch index digest for `v0.1.3` listed in the
-[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.3)
+reference, pin the multi-arch index digest for `v0.1.4` listed in the
+[release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.4)
 instead of the tag:
 
 ```sh

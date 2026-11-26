@@ -50,7 +50,9 @@ flowchart TD
 移出公网端口（见下文）。内置 `paseo-relay healthcheck` 会固定
 `PASEO_RELAY_TLS_CERT` 的 leaf 证书（DER SHA-256），只接受这一张证书，因此非 loopback
 的探测目标无法由其他本地服务冒充；配置了原生 TLS 但证书不可读时，它会拒绝非 loopback
-目标，只探测 loopback。
+目标，只探测 loopback。pin 来自配置文件：如果磁盘上留着一对格式错误或不匹配的新证书，
+探针可能报不健康，而 listener 仍在使用旧证书服务流量。此时应修复或恢复文件，不要重启，
+因为启动过程也会尝试加载它。
 
 Paseo payload 虽然 E2EE，但 `serverId`、连接元数据和可用性仍会暴露给明文网络上的
 被动/主动攻击者，所以公网不能只跑 `ws://`。
@@ -104,7 +106,7 @@ LB 终止连接后，relay 看到的每个连接都来自代理 IP。此时
 
 ```sh
 # 按约 512 MB 主机设置；提高内存时一起调高（见“容量规划”）。
-docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.3
+docker pull ghcr.io/kfxhjz/paseo-relay:v0.1.4
 docker run -d \
   --name paseo-relay \
   --restart unless-stopped \
@@ -116,7 +118,7 @@ docker run -d \
   -e PASEO_RELAY_MAX_SESSIONS=4000 \
   -e PASEO_RELAY_MAX_TCP_CONNECTIONS=5000 \
   -e PASEO_RELAY_INGRESS_BUDGET_BYTES=135266304 \
-  ghcr.io/kfxhjz/paseo-relay:v0.1.3
+  ghcr.io/kfxhjz/paseo-relay:v0.1.4
 ```
 
 只想临时前台试跑时，去掉 `-d`/`--restart`/`--stop-timeout`、加上 `--rm`，再用
@@ -127,15 +129,15 @@ docker run -d \
 TLS，请挂载 PEM 证书、设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KEY`，并发布
 TLS 端口（例如 `-p 0.0.0.0:443:4000`）。
 
-`v0.1.3` 是当前 release tag，`latest` 跟随最新 **stable** release。预发布 tag
+`v0.1.4` 是当前 release tag，`latest` 跟随最新 **stable** release。预发布 tag
 （任何包含 `-` 的 tag，例如 `v0.2.0-rc1`）不会移动 `latest`。发布是分阶段进行的，
 用户不会拉到未验证的镜像：先以临时 candidate tag 组装多架构 index，按 digest 做 smoke
 test、cosign 签名并生成 GitHub build provenance attestation，全部成功后才把版本 tag
 （以及符合条件时的 `latest`）提升到同一个 digest。因此构建、smoke 或签名任一步失败，
 之前的 `latest` 都会保留。`latest` 也只会移动到不低于 `main` 上最高 stable tag 的稳定
 版本，乱序发布的旧版本无法接管它。如果需要不可变引用，
-请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.3) 中
-`v0.1.3` 对应的多架构 index digest，而不是 tag：
+请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.4) 中
+`v0.1.4` 对应的多架构 index digest，而不是 tag：
 
 ```sh
 # 按约 512 MB 主机设置；提高内存时一起调高（见“容量规划”）。
