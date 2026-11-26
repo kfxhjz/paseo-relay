@@ -262,10 +262,25 @@ impl ConnectionError {
 mod tests {
     use super::*;
 
+    /// `application/x-www-form-urlencoded` query from key/value pairs.
     fn q(pairs: &[(&str, &str)]) -> String {
-        url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(pairs.iter().copied())
-            .finish()
+        fn encode(value: &str) -> String {
+            value
+                .bytes()
+                .map(|byte| match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
+                        char::from(byte).to_string()
+                    }
+                    b' ' => "+".to_owned(),
+                    other => format!("%{other:02X}"),
+                })
+                .collect()
+        }
+        pairs
+            .iter()
+            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
+            .collect::<Vec<_>>()
+            .join("&")
     }
 
     #[test]
