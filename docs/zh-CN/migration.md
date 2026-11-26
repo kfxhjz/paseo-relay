@@ -11,9 +11,12 @@ ownership 部署方式。
   多节点请使用边缘 LB 对 `serverId` 做一致性哈希。
 - 没有 BEAM release、EPMD、distribution、`RELEASE_*` 变量或 cookie。
 - `serverId` / `connectionId` 校验为可打印 UTF-8；非法值返回 HTTP 400，而不是被路由。
-- 新增进程内限制：per-IP WebSocket 上限、session 上限、每 connection client 上限、
-  帧/消息读取 deadline。
-- 可用 rustls 原生 TLS；否则在边缘终止 TLS。
+- 新增进程内限制：per-IP 的 WebSocket/TCP 上限、session 上限、每 connection client
+  上限、帧/消息读取 deadline 和停滞超时。
+- ingress 预算占满时，会先关闭停滞、过慢或传输过久的未完成消息（`1013`
+  "Relay ingress reclaimed"），然后才关闭等待中的 source；客户端应把所有 `1013` 都当作
+  可重试。
+- 可用 rustls 原生 TLS，支持 `SIGHUP` 重新加载证书；否则在边缘终止 TLS。
 - SIGTERM/SIGINT 执行有界 drain；`PASEO_RELAY_DRAIN` 启动即 unready。
 
 ## 环境变量映射

@@ -41,6 +41,33 @@ cargo run --release --example load -- \
 ps -o rss= -p "$(pgrep -f target/release/paseo-relay)"
 ```
 
+## Change since v0.1.2 (unreleased)
+
+Same-host A/B on 2026-11-26 (Apple M3, 8 cores, macOS 27.2.1, Rust 1.99.1):
+`main` at `4a60da1`, whose sources are identical to `v0.1.2`, against the
+unreleased tree. Both are release builds, the runs are interleaved, three runs
+each, with the command above and `--size` varied.
+
+| Workload (100 pairs × 500 round trips) | `v0.1.2` sources | Unreleased |
+|---|---|---|
+| 64 B text | 52.8–55.3k msg/s | 56.3–68.2k msg/s |
+| 1 KiB text | 52.1–58.4k msg/s | 58.5–70.0k msg/s |
+| 16 KiB text | 35.6–36.6k msg/s | 40.1–44.1k msg/s |
+| p50 round trip, 1 KiB | 1.78–1.83 ms | 1.42–1.68 ms |
+| Relay RSS after the 1 KiB run | ~7.5 MiB | ~7.8 MiB |
+| Memory per idle WebSocket (4,000 idle sockets) | ~13.5 KiB | ~14.3 KiB |
+
+The throughput gain comes from the codec: a frame header and a small payload
+are now read with one socket read instead of three, and a frame's header and
+payload are written with one write instead of two. The extra ~0.8 KiB per idle
+socket is the reader's 256-byte read-ahead buffer plus the per-connection
+bookkeeping for budget reclaim and the idle clock.
+
+The `v0.1.2` column is faster here than in the table above, which was measured
+on 2026-11-07: absolute numbers on a laptop move with the OS version and
+machine state. Only the same-run comparison is meaningful, and the binary
+size, image size and start-up figures above were not re-measured.
+
 ## Caveats
 
 - Client and relay share one machine, so CPU, loopback networking, and the

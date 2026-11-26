@@ -40,6 +40,29 @@ cargo run --release --example load -- \
 ps -o rss= -p "$(pgrep -f target/release/paseo-relay)"
 ```
 
+## v0.1.2 之后的变化（未发布）
+
+2026-11-26 同机 A/B 对比（Apple M3，8 核，macOS 27.2.1，Rust 1.99.1）：`main` 的
+`4a60da1`（源码与 `v0.1.2` 完全相同）对比未发布的代码。两者都是 release 构建，交替
+运行，各跑三次，命令同上，只改变 `--size`。
+
+| 负载（100 个 pair × 500 次往返） | `v0.1.2` 源码 | 未发布 |
+|---|---|---|
+| 64 B 文本 | 52.8–55.3k msg/s | 56.3–68.2k msg/s |
+| 1 KiB 文本 | 52.1–58.4k msg/s | 58.5–70.0k msg/s |
+| 16 KiB 文本 | 35.6–36.6k msg/s | 40.1–44.1k msg/s |
+| 1 KiB 的 p50 往返延迟 | 1.78–1.83 ms | 1.42–1.68 ms |
+| 1 KiB 负载后的 relay RSS | 约 7.5 MiB | 约 7.8 MiB |
+| 每个 idle WebSocket 的内存（4,000 个 idle socket） | 约 13.5 KiB | 约 14.3 KiB |
+
+吞吐的提升来自 codec：帧头和小 payload 现在一次 socket 读取就能读到（原来三次），帧头
+和 payload 一次写出（原来两次）。每个 idle socket 多出的约 0.8 KiB，是 reader 的
+256 字节预读缓冲，加上预算回收和 idle 时钟所需的每连接记账。
+
+这里 `v0.1.2` 一列比上面表格（2026-11-07 测得）更快：笔记本上的绝对数字会随系统版本
+和机器状态变化。只有同一轮内的对比才有意义；上面的二进制大小、镜像大小和启动时间没有
+重新测量。
+
 ## 注意事项
 
 - 客户端和 relay 同机，CPU、loopback 网络和调度都会影响结果。

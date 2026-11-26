@@ -68,9 +68,16 @@ no clustering, ownership registry, reroute protocol, or cross-node frame path.
   `PASEO_RELAY_TLS_CERT` and `PASEO_RELAY_TLS_KEY` are set (both or neither;
   startup rejects a half-configured pair). ALPN is limited to `http/1.1`.
   Otherwise the listener is plaintext and TLS must be terminated at the edge.
-- **Operations endpoints** share the listener: `GET`/`HEAD` `/health`, `/ready`,
-  and `/metrics`. They are unauthenticated by design, so deployments must keep
-  them on an internal network or filter them at the edge.
+  The certificate and key are re-read on `SIGHUP` and when the files change
+  (checked every 30 s); the acceptor is swapped for new connections only, and
+  a pair that fails to load leaves the previous one in use.
+- **Operations endpoints** (`GET`/`HEAD` `/health`, `/ready`, `/metrics`,
+  `/version`) share the listener by default. They are unauthenticated by
+  design, so deployments must keep them on an internal network or filter them
+  at the edge. With `PASEO_RELAY_OPS_PORT` they move to a second, plaintext
+  listener and the public one keeps only `/ws` and `/health`. That listener has
+  its own small connection allowance and outlives the public listener during a
+  drain, so probes do not depend on public capacity.
 
 ### 2.2 Connection lifecycle
 
@@ -84,17 +91,20 @@ flowchart TD
   B -->|pass| D["Admission: WS slot then session slot then per-IP slot"]
   D --> E["101 upgrade"]
   E --> F["Split reader and writer tasks over a bounded queue"]
-  F --> G["Detach and cleanup: return capacity tokens and idle sweep"]
+  F --> G["Detach and cleanup: return capacity tokens and release the session"]
   G --> H["Drain: SIGTERM and /ready 503 and close 1012"]
 ```
 
 1. **TCP accept.** The listener acquires a TCP slot (`MAX_TCP_CONNECTIONS`)
    before reading a request and holds it for the whole socket lifetime,
    including after the WebSocket upgrade, so `MAX_TCP_CONNECTIONS` is the total
-   OS-socket cap. The HTTP header phase is bounded by a header timeout and by
-   hyper's request limits (`max_buf_size` 16 KiB, `max_header_size` 16 KiB,
-   `max_headers` 64), so a slow client cannot hold a slot indefinitely or make
-   the pre-upgrade path allocate without bound. Each idle accepted socket still
+   OS-socket cap. The pre-upgrade HTTP phase is bounded by
+   `HTTP_HEADER_TIMEOUT_MS` on both header reads and stalled HTTP response
+   writes (disabled once a socket upgrades to WebSocket) and by hyper's request
+   limits (`max_buf_size` 16 KiB, `max_header_size` 16 KiB, `max_headers` 64),
+   so a slow client—or one pipelining `/metrics` requests without reading—cannot
+   hold a slot indefinitely or make the pre-upgrade path allocate without bound.
+   Each idle accepted socket still
    costs roughly 23 KiB when the relay is plaintext behind an edge (hyper
    read/write buffers plus the task), or ~33 KiB with native TLS (rustls
    buffers); plan for `MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB`
@@ -102,21 +112,25 @@ flowchart TD
    native TLS at the 25,000 default, so a 512 MB node must lower the caps. Keep
    `MAX_TCP_CONNECTIONS` above `MAX_CONNECTIONS` (at least 64–128 spare slots,
    more for probe bursts) so a full WebSocket load cannot consume every TCP slot
-   and reject `/health`, `/ready`, `/metrics`, and k8s probes at accept. The
-   per-IP WebSocket slot (`PER_IP_MAX_CONNECTIONS`, 0 = unlimited) is acquired
-   during admission, before the upgrade is completed.
+   and reject `/health`, `/ready`, `/metrics`, and k8s probes at accept (or
+   give probes their own listener with `PASEO_RELAY_OPS_PORT`). When
+   `PER_IP_MAX_CONNECTIONS` is set (0 = unlimited), a per-IP TCP slot is taken
+   at accept as well, sized at the WebSocket cap plus a quarter (at least 8) so
+   one client cannot hold every TCP slot with sockets that never upgrade; the
+   per-IP WebSocket slot is acquired during admission, before the upgrade is
+   completed. Both count IPv6 clients per /64.
 2. **Request classification.** `GET /ws` is the only upgradeable route; other
    paths return `404`, and operations endpoints are read-only. `/health` is
    independent of readiness so liveness probes cannot cause restarts during a
    drain.
 3. **Pre-upgrade validation.** Before any relay state is allocated the
    request must pass:
-   - method/path and WebSocket upgrade headers (`Connection: upgrade`,
+   - method/path, HTTP/1.1 version, and WebSocket upgrade headers (`Connection: upgrade`,
      `Upgrade: websocket`, `Sec-WebSocket-Version: 13`);
    - a `Sec-WebSocket-Key` that is canonical padded Base64 for exactly 16 bytes;
    - query validation of `serverId` (1..=256 bytes, valid UTF-8, no control or
      whitespace characters), `role=server|client`, and `v=1|2`;
-   - the optional Origin allowlist.
+   - the optional Origin allowlist (rejecting duplicate or unparseable `Origin` headers).
    Failures return `426` when the request is not an upgrade, `400` for an
    invalid upgrade/query, `403` for a disallowed Origin, or `404` for an unknown
    path — **without creating a session, writer, WebSocket slot, or per-IP
@@ -132,8 +146,8 @@ flowchart TD
    exerts backpressure instead of creating an unbounded buffer.
 6. **Detach and cleanup.** On close, the connection runner detaches the socket
    from the session topology exactly once (socket IDs make stale or duplicate
-   detaches harmless), returns capacity tokens, and lets the idle sweep remove
-   an empty session after the grace period.
+   detaches harmless), returns capacity tokens, and removes the session at
+   once if this was its last socket.
 
 ### 2.3 Session registry
 
@@ -159,9 +173,16 @@ kill; this is the structural fix for shared-owner failure modes.
   socket as `connected`; the last client detach removes the data socket (close
   `1001`) and notifies the control socket with `disconnected`. A data socket
   that dies closes its clients with `1012` ("Server disconnected").
-- **Idle sweep.** An empty session is removed after the configured idle grace
-  period. `MAX_SESSIONS` bounds the number of `serverId` entries; a session at
-  its per-`connectionId` client cap rejects further attaches.
+- **Session lifetime.** A session is removed as soon as its last socket has
+  left and no connection task still references it, so `MAX_SESSIONS` counts
+  `serverId`s that somebody is attached to; an empty session holds no state
+  worth keeping. The removal runs under the registry shard lock and checks the
+  reference count, and a joiner takes its reference under the same lock before
+  attaching, so a session about to gain a socket is never removed. A periodic
+  sweep remains as a safety net. Each session caps both distinct v2
+  `connectionId`s (`MAX_CONNECTIONS_PER_SESSION`, default `512`) and clients
+  per `connectionId` (`MAX_CLIENTS_PER_CONNECTION`), and runs at most one
+  deduplicated control watchdog holding only a `Weak<Session>` across awaits.
 - **No cross-session effects.** Operations under the session lock are short and
   synchronous (no `.await` while holding it); protocol actions that affect other
   sockets (replacement, data death, last client) are computed under the lock and
@@ -182,18 +203,27 @@ The relay's core reliability rule is **source backpressure, not buffering**:
    one connection can hold; the 4× factor covers the reader's pipelining of up
    to four messages per connection.
 2. It resolves the destination from the registry and enqueues the frame on the
-   destination's writer queue, waiting for a bounded byte permit.
-3. The writer writes and flushes the frame, then acknowledges; the routing task
-   awaits that acknowledgement (bounded by the delivery deadline) and the
-   two-message read-ahead hand-off blocks the reader while it waits. Kernel TCP
-   send pressure therefore reaches the producer as TCP receive-window pressure
-   instead of being absorbed into relay memory.
+   destination's writer queue together with an `Arc<BudgetHold>` of the frame's
+   ingress budget guards and an absolute delivery deadline, waiting for a
+   bounded byte permit.
+3. The writer enforces that absolute deadline while writing and flushing the
+   frame, releases the frame's `BudgetHold` only once written or dropped, and
+   acknowledges; the routing task awaits that acknowledgement (bounded by the
+   delivery deadline) and the two-message read-ahead hand-off blocks the reader
+   while it waits. Even if the source socket disconnects or is replaced while
+   frames remain queued, the destination writer retains both the ingress budget
+   and the delivery deadline so slow consumers cannot hold unbudgeted memory
+   past `DELIVERY_TIMEOUT_MS`. Kernel TCP send pressure therefore reaches the
+   producer as TCP receive-window pressure instead of being absorbed into relay
+   memory.
 4. If the budget cannot be reserved within the effective ingress wait
    (`min(INGRESS_WAIT_TIMEOUT_MS, remaining frame/message read deadline)`), or
    the writer queue/write does not make progress within the delivery deadline,
-   the source (or the slow destination) is closed with retryable `1013`. A
-   frame/message read timeout also closes the source with `1013`; waiting for
-   budget never extends the read deadline.
+   the source (or the slow destination) is closed with retryable `1013`. While
+   a source waits, the budget first reclaims unfinished messages of other
+   connections (section 2.5). A frame/message read timeout, or a message that
+   makes no payload progress for `READ_STALL_TIMEOUT_MS`, also closes the
+   source with `1013`; waiting for budget never extends the read deadline.
 
 Per-destination writer queues are bounded twice: a 1024-message mpsc cap plus a
 byte semaphore whose size is `max(control_queue_bytes, max_message_bytes +
@@ -228,6 +258,46 @@ with the fixed maximum of 1024 fragments per message, these bounds limit what a
 stalled frame or a flood of empty fragments can reserve: the declared length of
 a frame is not charged until its bytes actually arrive.
 
+**Two pools.** The main pool (`INGRESS_BUDGET_BYTES`) admits every message. A
+second pool (`INGRESS_SMALL_RESERVE_BYTES`) admits only complete single-frame
+messages of at most 64 KiB, which are charged to it first and to the main pool
+when it is full. Fragmented messages always draw from the main pool so a peer
+cannot lock small-reserve bytes behind a large continuation stream. Handshakes
+and ordinary small frames therefore do not queue behind large transfers that
+have filled the main pool.
+
+**Reclaim.** A reservation is released only when the writer finishes or drops
+the queued frame, and delivery is bounded by the relay (delivery and
+data-attach deadlines). The exception is a message that is still arriving: only
+its sender decides when it completes. Left alone, that lets a peer hold budget
+by starting messages and not finishing them. So a connection registers its
+active hold only while receiving a message (separately tracking main-pool vs
+small-reserve weighted bytes, age, and a one-to-two-second receive rate on a
+clock that stops while the connection itself waits for budget), and a source
+that has to wait for budget may cancel unfinished messages on other connections
+that actually hold bytes in a pool the waiter can use:
+
+1. those that have stalled or are arriving at or below
+   `INGRESS_RECLAIM_MIN_RATE_BYTES` per second, largest first, until enough is
+   freed (continuing to rules 2–3 if slow holds alone were not enough);
+2. after half of its wait, the oldest one that has been arriving for longer
+   than `INGRESS_RECLAIM_AFTER_MS` and longer than the waiter's own message;
+3. after half of its wait, and only if the waiter is a small message, the
+   largest one if it holds at least eight times what the waiter would.
+
+Rule 1 makes holding budget cost continuous upload. Rule 2 bounds how long any
+one message can hold it against a waiter, so trickling just above the rate
+floor does not work either; comparing ages keeps two long transfers from
+displacing each other in turn. Rule 3 keeps small frames ahead of a large
+transfer when both pools are full. Nothing is reclaimed unless somebody is
+waiting, completely received messages are never reclaimed, and the decision to
+cancel is taken under the same lock that marks a message complete. Scans are
+rate-limited independently for slow scans vs patient main/small evictions so
+impatient waiters cannot starve eligible ones. Independently of pressure,
+`READ_STALL_TIMEOUT_MS` closes a message that fails to make at least 8 KiB of
+payload progress (stopping both silent stalls and 0-/1-byte continuation
+keepalives). What this does not cover is listed in section 9.
+
 `PASEO_RELAY_MAX_MESSAGE_BYTES` validation uses the worst-case weighted charge
 for one maximum-size message: payload weight plus the 256-byte per-message
 overhead plus 192 per chunk, including the 1024-fragment worst case. The
@@ -241,12 +311,18 @@ configuration-reviewable constants, not measured allocator costs.
 
 ### 2.6 Lifecycle and graceful shutdown
 
-- `SIGTERM`/`SIGINT` start a drain: the listener stops accepting, `/ready`
-  returns `503`, new upgrades are rejected with `503`, existing sessions keep
-  working for the configured grace window, then remaining sockets are closed
-  with `1012` ("Relay shutting down") and the process exits after a short
-  window for close frames to flush. `SIGKILL` is never required as a first
-  signal.
+- `SIGTERM`/`SIGINT` start a drain: `/ready` flips to `503` and new `/ws`
+  upgrades are rejected with `503`; existing sessions keep working for the
+  configured grace window. With `PASEO_RELAY_OPS_PORT` set, the public listener
+  closes immediately while the operations listener stays up through the grace
+  window; in shared-port mode, the listener stays open during the grace window
+  so `/ready` (`503`), `/health` (`200`), and `/metrics` remain reachable while
+  `/ws` returns `503`. When the grace window ends, the listener closes,
+  remaining sockets close with `1012` ("Relay shutting down"), and the process
+  exits after a short window for close frames to flush. `SIGKILL` is never
+  required as a first signal.
+- `SIGHUP` reloads the TLS certificate and key (section 2.1); it does not
+  affect sessions.
 - `PASEO_RELAY_DRAIN=true` starts the process already draining (useful to take
   a node out of rotation before stopping it).
 - Sessions are node-local and ephemeral; a restart is always safe because Paseo
@@ -268,7 +344,11 @@ configuration-reviewable constants, not measured allocator costs.
   `hello`/`e2ee_hello` handshakes; only then are they parsed, and their `key`
   must be canonical padded Base64 for a canonical 32-byte X25519 public key.
   This is protocol hygiene, not a security boundary; a failure closes the client
-  with `1008` and is never forwarded.
+  with `1008` and is never forwarded. A frame that this parser rejects but a
+  more lenient one accepts (a lone surrogate escape, a number outside `f64`
+  range, very deep nesting) is forwarded uninspected, as is anything above
+  64 KiB: the check stops well-formed mistakes, not a client that wants a bad
+  key delivered.
 
 ### 3.2 v1
 
@@ -309,6 +389,7 @@ session topology is unaffected).
 | I8 | Topology races cannot remove a newer socket. | Per-session mutex with no awaits; socket IDs checked on detach; replacement closes are performed outside the lock. |
 | I9 | Admission happens before allocation. | Capacity and per-IP semaphores, upgrade validation, and session caps are checked before expensive state is created. |
 | I10 | Observability never leaks routing secrets. | `/metrics` is aggregate-only (no `serverId` labels); logs never include `serverId`, `connectionId`, or payloads. |
+| I11 | Ingress budget cannot be held for free by a sender. | An unfinished message must keep arriving (`READ_STALL_TIMEOUT_MS`); under pressure, stalled, slow, and long-running unfinished messages are reclaimed for the waiter; small messages have a separate reserve. Completed messages are released by relay-bounded delivery. |
 
 ## 5. Failure semantics
 
@@ -319,7 +400,8 @@ session topology is unaffected).
 | Invalid `serverId`, `role`, `v`, `connectionId`, or invalid upgrade headers | HTTP `400`, no session/writer/WebSocket/per-IP state created |
 | Origin not in `PASEO_RELAY_ALLOWED_ORIGINS`, or Origin present but unparseable | HTTP `403`, no session/writer/WebSocket/per-IP state created |
 | WS capacity full, session cap reached, or draining | HTTP `503` (no upgrade) |
-| Per-IP connection cap exceeded | HTTP `429` (no upgrade) |
+| Per-IP connection cap exceeded | HTTP `429` (no upgrade); at accept, `429` on a plaintext listener or a plain close on a native-TLS listener |
+| TCP capacity reached at accept | HTTP `503` on a plaintext listener, or a plain close on a native-TLS listener |
 | TLS handshake failure (native TLS mode) | TCP connection dropped before HTTP |
 | Client frame/message exceeds configured limit | WebSocket close `1009` |
 | Malformed frame, bad masking, bad close payload/code, non-minimal 126/127 length encoding, or more than 1024 fragments | WebSocket close `1002` |
@@ -327,6 +409,9 @@ session topology is unaffected).
 | Replaced by a newer socket | WebSocket close `1008` |
 | Invalid Paseo handshake key | WebSocket close `1008` |
 | Ingress budget exhausted past the effective wait (budget wait or remaining read deadline) | WebSocket close `1013`, "Relay ingress capacity" |
+| Unfinished message reclaimed to free budget for a waiting source | WebSocket close `1013`, "Relay ingress reclaimed" |
+| Frame/message read deadline passed, or no payload progress for the stall timeout | WebSocket close `1013`, "Relay read timeout" |
+| No frame in either direction for the optional idle timeout | WebSocket close `1013`, "Idle timeout" |
 | Delivery deadline exceeded / slow destination | WebSocket close `1013`, "Slow consumer" / "Delivery unavailable" |
 | v2 client has no data socket within the attach timeout | WebSocket close `1013`, "Data route unavailable" |
 | Graceful drain / server restart | WebSocket close `1012`, "Relay shutting down" |
@@ -351,15 +436,17 @@ contract; see README.)
   distribution ports.
 - **TLS.** Terminated at the edge or natively with rustls and mounted PEM files.
   Plaintext is acceptable only on loopback/private networks.
-- **Rate limits.** Per-IP connection limits, global WebSocket/TCP/session caps,
-  bounded handshake phases, and the ingress budget; additional per-IP and
-  request-rate limits belong at the edge.
+- **Rate limits.** Per-IP WebSocket and TCP limits (per /64 for IPv6, off by
+  default because a proxy hides client addresses), global WebSocket/TCP/session
+  caps, bounded handshake phases, and the ingress budget with its reclaim
+  policy; additional per-IP and request-rate limits belong at the edge.
 - **Secret hygiene.** `serverId`, `connectionId`, and payloads are never logged. Metrics carry
   aggregate counters only; Prometheus must not be exposed to the public
   internet.
 - **Handshake validation is hygiene.** It rejects malformed X25519 encodings
   cheaply (only small JSON-looking client frames), but it does not authenticate
-  peers and must not be described as a security control.
+  peers, can be bypassed by JSON that only a more lenient parser accepts, and
+  must not be described as a security control.
 
 ## 7. Hardening decisions
 
@@ -376,7 +463,7 @@ implementation.
 | Runtime | No Erlang/OTP, EPMD, cookie, or distribution; static musl binary; optional native TLS. |
 | Observability | Aggregate metrics only; structured logs without `serverId`, `connectionId`, or payload. |
 | Lifecycle | Bounded SIGTERM/SIGINT drain; readiness flips; remaining sockets close with `1012`. |
-| Supply chain | Scratch non-root runtime; digest-pinned builder; SHA-pinned CI actions; per-platform provenance/SBOM attestations. |
+| Supply chain | Scratch non-root runtime; digest-pinned builder; SHA-pinned CI actions; per-platform provenance/SBOM attestations; the multi-arch image is signed (cosign, keyless) and carries a GitHub build provenance attestation; fuzz targets build and run in CI. |
 
 ## 8. Non-goals
 
@@ -402,15 +489,27 @@ implementation.
   removal.
 - **Availability is the residual risk.** With no authentication, anyone who
   learns a `serverId` can disrupt that session. This is accepted and mitigated
-  by keeping `serverId`s secret and rate-limiting at the edge. A peer that can
-  send real traffic within the configured caps can also saturate the shared
-  ingress budget: roughly four connections each sending a ~32 MiB fragmented
-  message and leaving it unfinished can hold about 512 MiB weighted for up to
-  `MESSAGE_READ_TIMEOUT_MS`. This is bounded by the documented budget and read
-  deadlines, not eliminated; mitigate with edge bandwidth/rate limits. The
-  default 512 MiB global budget is slightly smaller than four maximum messages'
-  weighted charge, so a maximal four-message pipeline can see normal `1013`
-  budget backpressure.
+  by keeping `serverId`s secret and rate-limiting at the edge. A peer that
+  sends real traffic within the configured caps can also occupy the shared
+  ingress budget; reclaim (section 2.5) sets the price. Unfinished messages
+  have to be re-sent about once per `INGRESS_RECLAIM_AFTER_MS` to keep the main
+  pool full (roughly 17 Mbit/s for the 512 MiB default). Completely received
+  messages are not reclaimed: sent to a destination that does not read, or to
+  a v2 data route that never attaches, they hold their budget for the delivery
+  (30 s) or data-attach (15 s) deadline, which costs about one budget of
+  payload per 15–30 s to sustain (roughly 35–70 Mbit/s at the default). While
+  the main pool is full, other sources' messages above 64 KiB may be closed
+  `1013`; smaller ones use the reserve. Shedding undelivered messages under
+  pressure would close this gap but changes delivery semantics and is left as
+  future work. The default 512 MiB global budget is slightly smaller than four
+  maximum messages' weighted charge, so a maximal four-message pipeline can see
+  normal `1013` budget backpressure.
+- **Reclaim is a policy, and policies have losers.** On a node whose budget is
+  genuinely too small for its traffic, a large upload that is slower than the
+  rate floor or older than the age limit is closed in favour of a newer one
+  instead of the newer one timing out. The thresholds are configurable and the
+  rules apply only while somebody is waiting, but a slow uplink on a saturated
+  node will see retryable `1013` closes it did not see before.
 - **Per-IP limits are coarse.** NATed users share an IP, so the limit must be
   sized for the deployment (or disabled with `0`). Per-`serverId` quotas and
   connect-rate limits are intentionally not implemented in-process.
@@ -445,6 +544,17 @@ The test suite uses real listeners and real WebSocket clients
   Origin allowlisting for native vs browser clients, a stalled frame payload,
   chunked ingress charging, the 1024-fragment policy, non-minimal length
   rejection, invalid close codes, and session-capacity admission.
+- regression tests for the 2026-11 review cover budget reclaim end to end
+  (stalled, trickled, and oversized unfinished messages; the small-message
+  reserve; the original two-connection attack at production settings), the
+  stall and optional idle timeouts, immediate session release under churn, the
+  per-IP TCP cap, the operations listener (including a full public listener),
+  and native TLS: serving, the TLS healthcheck, and certificate reload without
+  dropping sessions. The codec has randomised round-trip tests over a reader
+  that delivers bytes in arbitrary pieces.
+- four `cargo-fuzz` targets (frame reader, handshake classifier, query parser,
+  upgrade validation) are built and run briefly in CI on every pull request
+  and for longer weekly (`scripts/fuzz.sh`).
 - container smoke tests in CI and `scripts/ci.sh` build the static image and
   poll `/health` from the host, since the scratch image has no shell.
 

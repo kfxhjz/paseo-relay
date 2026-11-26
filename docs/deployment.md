@@ -48,6 +48,14 @@ Public deployments must serve `wss://`. Either:
   the files must be regular, readable files for the relay user (UID 65532 in
   the image); `paseo-relay --check-config` verifies that.
 
+With native TLS the relay re-reads the certificate and key on `SIGHUP`, and on
+its own within 30 seconds of the files changing, without dropping sessions
+(releases after `v0.1.2`; see
+[operations.md](operations.md#rotating-the-tls-certificate)). Clients then
+connect to the relay directly, so also set
+`PASEO_RELAY_PER_IP_MAX_CONNECTIONS` and move the operations endpoints off the
+public port with `PASEO_RELAY_OPS_PORT` (below).
+
 TLS is not optional for the public internet: although Paseo payloads are
 end-to-end encrypted, `serverId`, connection metadata, and availability are
 still exposed to a passive or active network attacker on plaintext `ws://`.
@@ -68,8 +76,9 @@ Examples:
 
 - Nginx: [examples/nginx.conf](https://github.com/kfxhjz/paseo-relay/blob/main/examples/nginx.conf) — TLS edge, consistent
   hashing, per-IP connection/rate limits, `/metrics` and `/version` blocked with
-  `/ready` limited to private ranges, and an access log that omits the query
-  string.
+  `/ready` limited to private ranges, an access log that omits the query
+  string, and `error_log` at `crit`, because nginx's error log always includes
+  the full request line.
 - HAProxy: [examples/haproxy.cfg](https://github.com/kfxhjz/paseo-relay/blob/main/examples/haproxy.cfg) — consistent hashing,
   `/ready` checks, operations endpoints denied, per-source connection/rate
   limits, and a log format that omits the query string.
@@ -100,7 +109,8 @@ the proxy IP. The relay's `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` therefore applies
 to the **proxy**, not the end user. Keep the default `0` (unlimited) behind a
 proxy and enforce per-client limits at the edge. If the relay is directly
 exposed without a proxy, set a value appropriate for your users (for example
-`256`).
+`256`). The setting then also caps that client's open TCP sockets, and IPv6
+clients are counted per /64.
 
 ## Single-node container
 
@@ -204,6 +214,12 @@ Key settings:
 
 ## systemd
 
+The example unit sets `LimitNOFILE=65536`: every connection is a file
+descriptor and systemd's default soft limit of 1024 is far below the relay's
+connection caps. It also defines `ExecReload` as `SIGHUP`, which reloads the
+TLS certificate in releases after `v0.1.2` (earlier versions terminate on
+`SIGHUP`; remove that line for them).
+
 An example unit is provided at
 [examples/paseo-relay.service](https://github.com/kfxhjz/paseo-relay/blob/main/examples/paseo-relay.service). Set
 `EnvironmentFile=` with the runtime contract values, use `Restart=always`, and
@@ -243,6 +259,25 @@ sequenceDiagram
 
 ## Metrics and alerting
 
+### Operations listener (releases after `v0.1.2`)
+
+By default `/ready`, `/metrics` and `/version` share the public port, and
+keeping them private depends on an edge rule or a network policy being right.
+Setting `PASEO_RELAY_OPS_PORT` (for example `4001`) serves them on a separate
+plaintext listener instead; the public port then answers only `/ws` and
+`/health`. `PASEO_RELAY_OPS_HOST` defaults to `127.0.0.1`, which is enough for
+the container healthcheck; set it to a private address, or to `0.0.0.0` in a
+pod or container that does not publish that port, so probes and Prometheus can
+reach it. Then:
+
+- point Kubernetes probes, load-balancer health checks and Prometheus at the
+  operations port (the examples carry the lines to uncomment);
+- let a NetworkPolicy/security group admit the ingress to the public port and
+  monitoring to the operations port: the split is now a port, which L3/L4
+  policy can enforce;
+- probes keep passing when the public listener is at its connection cap, so a
+  full relay is reported unready rather than restarted.
+
 Scrape `/metrics` from an internal network. The metrics are aggregate-only and
 contain no `serverId` labels. See
 [examples/prometheus.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/prometheus.yml) and
@@ -280,7 +315,13 @@ Memory has two parts: idle/pre-upgrade sockets and in-flight payload accounting.
   `/ready`, `/metrics`, the image HEALTHCHECK, and k8s probes are rejected at
   accept. The examples use 4000/5000 and 8000/10000; the built-in defaults are
   20000/25000.
-- `PASEO_RELAY_MAX_SESSIONS` (default 20,000) bounds idle `serverId` entries.
+- `PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES` (default 16 MiB weighted, about
+  4 MiB of payload) is a second pool for messages of at most 64 KiB; add it to
+  the ingress budget when sizing memory.
+- `PASEO_RELAY_MAX_SESSIONS` (default 20,000) bounds live `serverId` entries; a
+  session is removed when its last socket closes.
+- The process's open-file limit must exceed `PASEO_RELAY_MAX_TCP_CONNECTIONS`
+  (`LimitNOFILE=` under systemd, `ulimits.nofile` in Compose).
 - `PASEO_RELAY_CONTROL_QUEUE_BYTES` / writer queues bound per-destination
   buffering.
 

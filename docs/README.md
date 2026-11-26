@@ -13,7 +13,7 @@ Paseo's daemon connects **outbound** to a relay; clients meet it there. This pro
 - **One static binary + scratch image** — no BEAM, no EPMD, no node cookie, no cluster.
 - **Bounded by default** — chunked ingress accounting, connection/session/frame limits, bounded queues, read deadlines.
 - **Fail closed** — explicit HTTP status and WebSocket close codes; no half-open state.
-- **Operations ready** — health/readiness/metrics/version endpoints, graceful drain, built-in healthcheck, multi-arch image with per-platform provenance and SBOM attestations.
+- **Operations ready** — health/readiness/metrics/version endpoints, graceful drain, built-in healthcheck, optional private operations listener, multi-arch image with per-platform provenance and SBOM attestations (signed, with build provenance, in releases after `v0.1.2`).
 
 ## Start here
 

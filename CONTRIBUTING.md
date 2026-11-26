@@ -19,7 +19,12 @@ cargo test --locked
 cargo build --release --locked
 python3 scripts/check-docs.py   # local links + Chinese/English pairing
 scripts/ci.sh          # includes the same checks plus a container smoke test
+scripts/fuzz.sh 60     # optional: all fuzz targets, needs nightly + cargo-fuzz
 ```
+
+Changes to the frame codec, the handshake classifier, the query parser or
+upgrade validation should be fuzzed before review (`fuzz/README.md`); CI builds
+and briefly runs every fuzz target as well.
 
 The test suite uses real listeners and real WebSocket clients
 (`tokio-tungstenite`), not mocks. Please keep that property: new protocol

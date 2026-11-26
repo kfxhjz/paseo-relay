@@ -34,9 +34,10 @@ disclosure.
 ## Audit status
 
 There has been **no independent third-party security audit** of this relay.
-The repository contains code review notes, real-socket tests, fuzzing targets,
-and Paseo compatibility evidence; those are not a substitute for an audit.
-Treat v0.1.2 as early software and review the threat model for your deployment.
+The repository contains code review notes, real-socket tests, fuzzing targets
+(built and run briefly on every pull request, and for longer weekly), and Paseo
+compatibility evidence; those are not a substitute for an audit. Treat v0.1.2
+as early software and review the threat model for your deployment.
 
 ## Threat model
 
@@ -53,14 +54,49 @@ treat pairing links and QR codes as secrets. There is no relay-level
 authentication by design; deployments that need stronger isolation should put
 the relay behind a VPN/mTLS or an authenticated edge.
 
-**Residual availability risk.** A peer that can send real traffic within the
-configured caps can still saturate the shared ingress budget: roughly four
-connections each sending a ~32 MiB fragmented message and leaving it unfinished
-can hold about 512 MiB weighted for up to `MESSAGE_READ_TIMEOUT_MS`. This is
-bounded by the documented budget and read deadlines, not eliminated; mitigate
-with edge bandwidth/rate limits. The default 512 MiB global budget is slightly
-smaller than four maximum messages' weighted charge, so a maximal four-message
-pipeline can see normal `1013` budget backpressure.
+**Residual availability risk.** The relay has no authentication, so a peer
+that sends real traffic within the configured caps can still occupy the shared
+ingress budget. What the relay controls is the price of doing so and how much
+of the node it takes down. (Figures are for the defaults; they scale with the
+budget and the timeouts.)
+
+- *Unfinished messages.* A message that is started and never finished must be
+  kept arriving: one that goes silent is closed after
+  `READ_STALL_TIMEOUT_MS` (30 s), and within about two seconds once another
+  source is waiting for budget. One that is kept trickling gives way to a
+  waiter after `INGRESS_RECLAIM_AFTER_MS` (60 s). Keeping the main budget full
+  this way therefore means re-sending what it holds about once a minute:
+  roughly 17 Mbit/s for the 512 MiB default, 4.5 Mbit/s for the 129 MiB budget
+  of the Compose/Kubernetes examples. Up to and including v0.1.2 the same
+  budget could be held for ten minutes by sending it once and going idle.
+- *Messages that are never delivered.* Completely received messages are not
+  reclaimed. A peer that sends large messages to a destination that does not
+  read them (its own second socket), or as a v2 client whose data socket never
+  attaches, holds their budget until `DELIVERY_TIMEOUT_MS` (30 s) or
+  `DATA_ATTACH_TIMEOUT_MS` (15 s) expires—including after the source socket
+  disconnects or is replaced, because each queued outbound frame carries both
+  its ingress budget guard and its absolute delivery deadline. One connection
+  may hold up to its in-flight cap, which is the whole budget at the defaults.
+  Sustaining that costs about one budget of payload every 15–30 s: roughly
+  35–70 Mbit/s at the default, 9–18 Mbit/s at 129 MiB. Lowering those two
+  timeouts shortens the window.
+- *What it denies.* While the main budget is full, other sources' messages
+  larger than 64 KiB (and fragmented messages) wait and may be closed `1013`
+  (retryable). Complete single-frame messages of at most 64 KiB, which is every
+  handshake and most ordinary traffic, are served from the separate
+  small-message reserve and, if that is full too, displace the largest
+  unfinished message. Denying them as well requires filling both pools with
+  messages that are never delivered. Control-socket `sync` notifications cannot
+  bypass this budget: each session caps distinct v2 `connectionId`s
+  (`PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`, default `512`) and runs a single
+  deduplicated control watchdog.
+
+This is bounded by the documented budgets and deadlines, not eliminated.
+Mitigate with edge bandwidth/rate limits, and alert on
+`paseo_relay_ingress_rejections_total` (sources actually dropped) and on a
+sustained rise of `paseo_relay_ingress_reclaims_total`. The default 512 MiB
+budget is slightly smaller than four maximum messages' weighted charge, so a
+maximal four-message pipeline can see normal `1013` budget backpressure.
 
 In scope:
 
@@ -86,9 +122,42 @@ See the hardening checklist in [README.md](README.md) and the deployment
 examples in [docs/deployment.md](docs/deployment.md). At minimum: terminate TLS,
 do not expose `/metrics` or `/ready` publicly, apply per-IP limits at the edge,
 run the container read-only as the provided non-root user, and keep the relay
-and Rust toolchain up to date. Size the connection caps to host memory: an idle
+and Rust toolchain up to date. In releases after v0.1.2, set
+`PASEO_RELAY_OPS_PORT` so the operations endpoints are not on the public port
+at all, and when the relay is directly exposed (native TLS, no proxy in front)
+set `PASEO_RELAY_PER_IP_MAX_CONNECTIONS`: it is off by default because behind a
+proxy every client shares the proxy's address. Keep the process's open-file
+limit above `PASEO_RELAY_MAX_TCP_CONNECTIONS`. Size the connection caps to host memory: an idle
 accepted socket costs roughly 23 KiB when the relay is plaintext behind an edge,
 or ~33 KiB with native TLS, so plan for
 `PASEO_RELAY_MAX_TCP_CONNECTIONS × ~30 KiB` (plaintext) or `× ~35 KiB` (native
 TLS); the built-in 25,000-socket default needs ~700–800 MiB plaintext or
 ~850–900 MiB with native TLS, so lower the caps on small nodes.
+
+## Verifying a release
+
+Releases after v0.1.2 are signed and attested when they are built. Verify the
+image you are about to run against this repository's release workflow:
+
+```sh
+IMAGE=ghcr.io/kfxhjz/paseo-relay@sha256:<digest>   # from the release notes
+
+cosign verify "$IMAGE" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/kfxhjz/paseo-relay/\.github/workflows/release\.yml@refs/tags/v'
+
+gh attestation verify "oci://$IMAGE" --repo kfxhjz/paseo-relay
+```
+
+The first command checks a keyless Sigstore signature on the multi-arch image;
+the second checks GitHub's build provenance attestation, which records the
+commit and workflow that produced that digest.
+
+v0.1.2 and earlier cannot be verified this way. The v0.1.2 release has an
+`image-digest.txt` asset with a detached signature, but that signs a text file
+containing the digest, not the image. Its `provenance.intoto.jsonl` asset was
+written by hand in a workflow, is unsigned, and is **not** build provenance; do
+not rely on it. v0.1.0 and v0.1.1 have no signature assets. (The release
+workflow did ask buildx to attach per-platform provenance and SBOM
+attestations to the images in the registry; those are produced by the build
+itself.)

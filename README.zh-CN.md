@@ -139,17 +139,21 @@ relay，选这个。如果你不想维护带 `serverId` 亲和性的边缘代理
 - **默认有界**：2 万 WebSocket/session；payload 到达时按 8 KiB chunk 计入加权
   ingress 预算（每连接最多一个 8 KiB chunk 尚未计费，另有每 chunk 记账）；每消息
   固定 256 字节开销只计一次；每连接 in-flight 上限；每条消息最多 1024 个分片；
-  每 destination writer 队列有界；帧/消息读取有 deadline。
+  每 destination writer 队列有界；帧/消息读取有 deadline 和停滞超时。预算占满时，
+  停滞、过慢或传输过久的未完成消息会被回收给正在等待的一方，不超过 64 KiB 的消息还有
+  自己的预留池。
 - **Fail closed**：明确的 HTTP 状态码或 WebSocket close code；不留下半开状态；
   非法 ID 直接 `400`。
-- **运维**：`/health`、`/ready`、`/metrics`、`/version`，文本或 JSON 结构化日志，
-  SIGTERM/SIGINT 优雅 drain，内置容器 healthcheck。
+- **运维**：`/health`、`/ready`、`/metrics`、`/version`（可选放到独立的内网监听上），
+  文本或 JSON 结构化日志，节点开始丢弃工作时有限频的告警日志，SIGTERM/SIGINT 优雅
+  drain，不断开会话的 TLS 证书重新加载，内置容器 healthcheck。
 - **安全面**：无 Erlang distribution；可选原生 TLS；可选 Origin allowlist；
-  per-IP WebSocket 上限；日志不记录 ID/payload。
+  per-IP 的 WebSocket 和 TCP 上限（IPv6 按 /64）；日志不记录 ID/payload。
 - **无账号、无遥测、无外呼**：relay 只监听，不注册、不统计、不 phone-home
   （Paseo 配对是端到端的）。
 - **部署**：固定 digest 的 builder、多架构发布工作流（每个平台独立的
-  provenance 和 SBOM attestation）、scratch 非 root 运行时、read-only 友好。
+  provenance 和 SBOM attestation）、带签名的镜像和构建来源证明（`v0.1.2` 之后的
+  版本）、scratch 非 root 运行时、read-only 友好。
 
 ## 一图看懂架构
 
@@ -202,6 +206,11 @@ docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.2
 如果部署策略要求不可变引用，请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2)
 中 `v0.1.2` 对应的多架构 index digest，而不是 tag。
 
+`v0.1.2` 之后的 release 带签名（cosign keyless），并且在多架构 index 上附有 GitHub
+构建来源证明，所以部署前可以针对本仓库的 release workflow 验证镜像；命令见
+[SECURITY.zh-CN.md](SECURITY.zh-CN.md) 的"验证发布产物"。`v0.1.2` 及更早版本无法用
+这种方式验证。
+
 两种拓扑使用同一个镜像；区别在于前置的边缘如何做路由亲和：
 
 ```mermaid
@@ -241,13 +250,16 @@ SHA-pinned CI actions），不宣称跨主机 bit-for-bit 完全一致。
 ## 运维与指标
 
 `/metrics` 是只含聚合值的 Prometheus 文本（没有 `serverId` label）：readiness/
-draining、活跃 WebSocket/session、ingress 已预留/预算字节、转发帧/字节、slow
-consumer、delivery timeout、拒绝数、handshake 结果、最大帧、uptime、build info。见
+draining、活跃 WebSocket/session、两个池的 ingress 已预留/预算字节、转发帧/字节、slow
+consumer、delivery timeout、各类拒绝数（WebSocket、session、per-IP、TCP、ingress）、
+ingress 回收数、读超时和 idle 超时、handshake 结果、最大帧、uptime、build info。见
 [docs/zh-CN/operations.md](docs/zh-CN/operations.md)、
 [examples/prometheus.yml](examples/prometheus.yml)、
 [examples/alerts.yml](examples/alerts.yml)。
 
-请把 `/metrics` 和 `/ready` 放在内网。relay 的运维端点没有认证。
+请把 `/metrics` 和 `/ready` 放在内网。relay 的运维端点没有认证。`v0.1.2` 之后的版本
+可以设置 `PASEO_RELAY_OPS_PORT`，把它们放到独立的内网监听上：它们就完全不在公网端口上，
+公网端口打满时探针也照常工作。
 
 ## 内存模型与滥用上限
 
@@ -268,6 +280,12 @@ payload 记账是增量的：data frame payload 按 8 KiB chunk 在字节到达�
 空槽），保证满 WebSocket 负载下健康/readiness 探针仍能拿到 slot。完整限制见
 [docs/zh-CN/configuration.md](docs/zh-CN/configuration.md) 和
 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)。
+
+一条开始了却不发完的消息不能免费占着预算：它必须持续有数据到达
+（`PASEO_RELAY_READ_STALL_TIMEOUT_MS`）；当别的 source 在等预算时，relay 关闭的是
+停滞、过慢或传输过久的未完成消息（`1013` "Relay ingress reclaimed"），而不是等待方。
+不超过 64 KiB 的消息还有独立的预留池，所以大传输占满主预算时握手和普通帧照常通过。
+这套机制能防什么、不能防什么，见 [SECURITY.zh-CN.md](SECURITY.zh-CN.md)。
 
 ## 性能基准
 
@@ -294,11 +312,13 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 - **per-IP 限制较粗**：默认 `0`，因为文档推荐拓扑使用边缘代理；直连部署时再启用
   并按用户规模设置。
 - **大消息占用预算**：少数最大消息可能吃掉配置的 ingress 预算（单连接上限为
-  `min(budget, 4 × 一条最大消息的计费)`）；可以提高预算或在边缘限流。
+  `min(budget, 4 × 一条最大消息的计费)`）。未完成的消息在有压力时会被回收，小消息也
+  有自己的预留池，但如果有 peer 持续发送没人读取的大消息，仍然可以拖慢其他大传输；
+  可以提高预算或在边缘限制带宽。
 - **没有 per-user 配额/relay 认证**：公共运营者必须在边缘做限制并提供隐私/滥用
   政策；见 [operator-policy.md](docs/zh-CN/operator-policy.md)。
-- **没有第三方安全审计**：这里的证据是代码评审、真实 socket 测试、fuzz scaffold
-  和 Paseo 兼容性套件。v0.1.2 是早期软件，依赖前请先阅读威胁模型。
+- **没有第三方安全审计**：这里的证据是代码评审、真实 socket 测试、在 CI 中运行的
+  fuzz target 和 Paseo 兼容性套件。v0.1.2 是早期软件，依赖前请先阅读威胁模型。
 - **尚未在互联网规模验证**：仓库 benchmark 是 loopback；大规模公开部署前请自己
   做容量测试并持续监控。
 

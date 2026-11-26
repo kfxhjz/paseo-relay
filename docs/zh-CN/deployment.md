@@ -43,6 +43,12 @@ flowchart TD
   是 relay 用户（镜像内 UID 65532）可读的常规文件，`paseo-relay --check-config`
   会校验。
 
+使用原生 TLS 时，relay 会在收到 `SIGHUP` 时重新读取证书和私钥，也会在文件变化后
+30 秒内自行重新加载，不会断开已有会话（`v0.1.2` 之后的版本；见
+[operations.md](operations.md) 的"轮换 TLS 证书"）。此时客户端直接连到 relay，所以还
+应设置 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS`，并用 `PASEO_RELAY_OPS_PORT` 把运维端点
+移出公网端口（见下文）。
+
 Paseo payload 虽然 E2EE，但 `serverId`、连接元数据和可用性仍会暴露给明文网络上的
 被动/主动攻击者，所以公网不能只跑 `ws://`。
 
@@ -61,7 +67,8 @@ LB 必须：
 
 - Nginx：[examples/nginx.conf](https://github.com/kfxhjz/paseo-relay/blob/main/examples/nginx.conf) —— TLS 边缘、一致性哈希、
   per-IP 连接/速率限制、屏蔽 `/metrics` 与 `/version` 且 `/ready` 只允许私网范围，
-  访问日志不记录 query string。
+  访问日志不记录 query string，并把 `error_log` 设为 `crit`（nginx 的 error log 总是
+  带完整请求行）。
 - HAProxy：[examples/haproxy.cfg](https://github.com/kfxhjz/paseo-relay/blob/main/examples/haproxy.cfg) —— 一致性哈希、
   `/ready` 检查、拒绝运维端点、per-source 连接/速率限制，日志格式不记录 query string。
 - Kubernetes + ingress-nginx：Ingress annotation 设为
@@ -177,6 +184,11 @@ docker compose -f examples/docker-compose.yml \
 
 ## systemd
 
+示例 unit 设置了 `LimitNOFILE=65536`：每个连接占一个文件描述符，而 systemd 默认的
+软限制 1024 远低于 relay 的连接上限。它还把 `ExecReload` 定义为 `SIGHUP`，在
+`v0.1.2` 之后的版本里用于重新加载 TLS 证书（更早的版本收到 `SIGHUP` 会退出，对它们请
+删掉这一行）。
+
 示例 unit 见 [examples/paseo-relay.service](https://github.com/kfxhjz/paseo-relay/blob/main/examples/paseo-relay.service)。
 用 `EnvironmentFile=` 提供 runtime contract，`Restart=always`，并给
 `TimeoutStopSec` 留出大于 drain grace 的时间（例如 `TimeoutStopSec=30`）。
@@ -212,6 +224,21 @@ sequenceDiagram
 
 ## 指标与告警
 
+### 运维监听（`v0.1.2` 之后的版本）
+
+默认情况下 `/ready`、`/metrics`、`/version` 与公网端口共用，它们能否保持私有取决于边缘
+规则或网络策略是否配对。设置 `PASEO_RELAY_OPS_PORT`（例如 `4001`）后，它们改由一个
+独立的明文监听提供；公网端口只回答 `/ws` 和 `/health`。`PASEO_RELAY_OPS_HOST` 默认是
+`127.0.0.1`，这对容器 healthcheck 已经足够；要让探针和 Prometheus 访问，请设为内网
+地址，或在不对外发布该端口的 pod/容器里设为 `0.0.0.0`。然后：
+
+- 把 Kubernetes 探针、负载均衡健康检查和 Prometheus 指向运维端口（示例里有可以取消
+  注释的配置行）；
+- 让 NetworkPolicy/安全组只放行 ingress 到公网端口、监控到运维端口：现在的划分是端口，
+  L3/L4 策略可以强制执行；
+- 公网监听打满连接上限时探针仍然通过，所以"满了"的 relay 会被报告为 unready，而不是
+  被重启。
+
 从内网抓取 `/metrics`。指标只有聚合值，没有 `serverId` label。示例见
 [examples/prometheus.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/prometheus.yml)、
 [examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml)，指标说明见
@@ -242,7 +269,12 @@ sequenceDiagram
   余量（至少 64–128 个空槽，探针突发时更多）：否则满 WebSocket 负载会占满 TCP
   slot，`/health`、`/ready`、`/metrics`、镜像 HEALTHCHECK 和 k8s 探针都会在 accept
   阶段被拒绝。仓库示例使用 4000/5000 和 8000/10000；内置默认值是 20000/25000。
-- `PASEO_RELAY_MAX_SESSIONS`（默认 20,000）限制 idle `serverId` 条目。
+- `PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES`（默认 16 MiB 加权，约 4 MiB payload）是
+  给不超过 64 KiB 的消息用的第二个池；规划内存时要把它加到 ingress 预算上。
+- `PASEO_RELAY_MAX_SESSIONS`（默认 20,000）限制存活的 `serverId` 条目；session 在最后
+  一个 socket 关闭时移除。
+- 进程的 open-file 上限必须高于 `PASEO_RELAY_MAX_TCP_CONNECTIONS`（systemd 用
+  `LimitNOFILE=`，Compose 用 `ulimits.nofile`）。
 - `PASEO_RELAY_CONTROL_QUEUE_BYTES` / writer 队列限制每 destination 缓冲。
 
 relay 自身内存与活跃 socket 和排队 payload 成正比；请用 `/metrics` 和容器

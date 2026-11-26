@@ -64,6 +64,12 @@ fragments per message. Payload bytes are charged in 8 KiB chunks as they arrive
 as `chunk_bytes × weight + 192` weighted units (192 is per-chunk bookkeeping);
 the 256-byte per-message overhead is charged once, and one connection can hold
 at most `min(budget, 4 × one-max-message charge)` of the ingress budget.
+Messages of at most 64 KiB also have a 16 MiB (weighted) reserve of their own.
+When the budget is full, the relay closes stalled, slow (≤ 64 KiB/s), or
+long-running (> 60 s) unfinished messages of other connections before it closes
+the source that is waiting, and a message that makes no progress for 30 s is
+closed regardless. All of these are configurable; see
+[configuration.md](configuration.md).
 
 Some policies are fixed rather than configurable: the 1024-fragment cap per
 message, the 64 KiB v2 control-frame cap, the 64 KiB handshake-hygiene cap, the

@@ -12,9 +12,13 @@ deployment-compatible with the Elixir relay's cluster/ownership features.
 - No BEAM release, EPMD, distribution, `RELEASE_*` variables, or cookie.
 - `serverId` / `connectionId` are validated as printable UTF-8; invalid values
   return HTTP 400 instead of being routed.
-- New in-process limits: per-IP WebSocket cap, session cap, per-connection
-  client cap, frame/message read deadlines.
-- Native TLS via rustls is available; otherwise terminate at the edge.
+- New in-process limits: per-IP WebSocket/TCP cap, session cap, per-connection
+  client cap, frame/message read deadlines and a stall timeout.
+- A full ingress budget closes stalled, slow, or long-running unfinished
+  messages (`1013` "Relay ingress reclaimed") before it closes a waiting
+  source; clients should treat every `1013` as retryable.
+- Native TLS via rustls is available, with certificate reload on `SIGHUP`;
+  otherwise terminate at the edge.
 - SIGTERM/SIGINT perform a bounded drain; `PASEO_RELAY_DRAIN` starts unready.
 
 ## Environment variable mapping

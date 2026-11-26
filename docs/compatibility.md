@@ -45,9 +45,13 @@ Payloads are opaque and end-to-end encrypted; the relay never decrypts them.
 | Clustering | Syn ownership + 409 `x-reroute-target` reroute, partition behavior | Single node only; edge consistent hashing required |
 | Config | `PASEO_RELAY_CLUSTER_*`, `RELEASE_*`, acceptors, watermark, ownership target | Different, smaller env contract; see README |
 | IDs | Any bytes up to 256 for `serverId`/`connectionId` | Valid UTF-8, printable, no whitespace; invalid → HTTP 400 |
-| Per-IP limits | None in-process | Optional `PER_IP_MAX_CONNECTIONS`, default 0 (edge recommended) |
+| Per-IP limits | None in-process | Optional `PER_IP_MAX_CONNECTIONS`, default 0 (edge recommended); when set it caps WebSockets and TCP sockets per client, IPv6 per /64 |
 | Client cap per connectionId | Unbounded broadcast set | Configurable cap, default 32 |
-| Close on read stall | No source frame read deadline | `FRAME_READ_TIMEOUT_MS` / `MESSAGE_READ_TIMEOUT_MS` → `1013` |
+| Close on read stall | No source frame read deadline | `FRAME_READ_TIMEOUT_MS` / `MESSAGE_READ_TIMEOUT_MS`, and `READ_STALL_TIMEOUT_MS` for a message that makes no progress → `1013` |
+| Full ingress budget | Capacity ledger | The waiting source is closed `1013` only if nothing can be reclaimed: stalled, slow, or long-running unfinished messages of other connections are closed first (`1013` "Relay ingress reclaimed"), and messages up to 64 KiB have a separate reserve |
+| Empty sessions | Owner process lifetime | Removed when the last socket closes |
+| Idle sockets | Transport idle timeout | Never closed by default; optional `WS_IDLE_TIMEOUT_MS` (`1013` "Idle timeout") |
+| Operations endpoints | Separate from the relay socket | Shared listener by default; optional private listener with `OPS_PORT` |
 | TLS | Typically terminated at edge; listener is plaintext | Edge termination or native rustls |
 | Runtime | BEAM release + Cowboy/Ranch | Static Rust binary + hyper/custom RFC 6455 codec |
 | Metrics | Different metric families/names | Documented in README/OPERATIONS |

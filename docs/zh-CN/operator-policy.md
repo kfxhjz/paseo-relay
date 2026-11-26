@@ -27,7 +27,8 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
   `/metrics` 与 `/version`、`/ready` 只允许私网、不记录 query string 的日志；
   请按自己的流量调整阈值。Caddy 示例没有进程内 per-IP 限流，需要配合外部 CDN/WAF。
   LB 终止连接时，进程内 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` 看到的是代理 IP；
-  请在边缘后保持 `0`，在边缘限制。
+  请在边缘后保持 `0`，在边缘限制。如果 relay 直接暴露（原生 TLS），请设置它：这是唯一
+  能阻止单个客户端占满所有连接槽位的机制。
 - 按主机规模设置 `PASEO_RELAY_MAX_CONNECTIONS`、`MAX_TCP_CONNECTIONS`、
   `MAX_SESSIONS` 和 ingress 预算；监控 `/ready` 和 `/metrics`。一个 idle 已接受
   socket 在明文时约占 23 KiB，原生 TLS 时约 33 KiB，因此
@@ -39,7 +40,10 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
 - 客户端应只发送一个未编码的 `serverId`。重复 query key 在 relay 侧是 last-wins，
   而边缘一致性哈希通常使用原始 query 值，因此重复或 percent-encoded 的值可能把
   同一 session 的两端路由到不同 relay 节点。
-- `/metrics` 只放内网，并限制访问。
+- `/metrics` 只放内网，并限制访问。`v0.1.2` 之后的版本可以用
+  `PASEO_RELAY_OPS_PORT` 把 `/ready`、`/metrics`、`/version` 完全移出公网端口。
+- 对 `paseo_relay_ingress_rejections_total`（因 ingress 预算不足被丢弃的 source）以及
+  `paseo_relay_ingress_reclaims_total` 的持续上升设置告警；它们是有人在占用预算的特征。
 - 使用提供的 scratch 镜像：read-only、非 root、drop capabilities；保持工具链/
   镜像更新。
 - 不要添加 Erlang distribution；本 relay 没有。
@@ -84,6 +88,7 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
 - [ ] abuse 联系方式和隐私/保留说明已发布。
 - [ ] `/metrics` 和 `/ready` 仅内网。
 - [ ] 容量限制和告警已配置。
-- [ ] 镜像按 digest 固定，并在安全更新时升级。
+- [ ] 镜像按 digest 固定，验证过签名和来源证明（`v0.1.2` 之后的版本；见
+  SECURITY.zh-CN.md），并在安全更新时升级。
 - [ ] 演练过 incident/回滚流程（SIGTERM drain、恢复旧镜像）。
 - [ ] 明确声明：社区 relay，不是 Paseo 托管 relay，无 SLA。

@@ -152,17 +152,23 @@ the Elixir relay if you need its built-in cluster/ownership/reroute behavior.
   connection uncharged, plus per-chunk bookkeeping), a fixed 256-byte
   per-message overhead charged once, a per-connection in-flight cap, a
   1024-fragment message limit, bounded per-destination writer queues,
-  frame/message read deadlines.
+  frame/message read deadlines and a stall timeout. When the budget is full,
+  stalled, slow, or long-running unfinished messages are reclaimed for whoever
+  is waiting, and messages up to 64 KiB have their own reserve.
 - **Fail closed**: explicit HTTP status or WebSocket close codes; no half-open
   state; invalid IDs are rejected with `400`.
-- **Operations**: `/health`, `/ready`, `/metrics`, `/version`, structured text
-  or JSON logs, graceful SIGTERM/SIGINT drain, built-in container healthcheck.
+- **Operations**: `/health`, `/ready`, `/metrics`, `/version` (optionally on a
+  separate private listener), structured text or JSON logs with rate-limited
+  warnings when the node sheds work, graceful SIGTERM/SIGINT drain, TLS
+  certificate reload without dropping sessions, built-in container healthcheck.
 - **Security surface**: no Erlang distribution; optional native TLS; optional
-  Origin allowlist; per-IP WebSocket cap; no IDs or payloads in logs.
+  Origin allowlist; per-IP WebSocket and TCP caps (per /64 for IPv6); no IDs or
+  payloads in logs.
 - **No account, no telemetry, no outbound calls**: the relay only listens; there
   is no signup, analytics, or phone-home (Paseo pairing is end-to-end).
 - **Deployment**: digest-pinned builder, multi-arch release workflow with
-  per-platform provenance and SBOM attestations, scratch non-root runtime,
+  per-platform provenance and SBOM attestations, a signed image and build
+  provenance attestation (releases after `v0.1.2`), scratch non-root runtime,
   read-only friendly.
 
 ## Architecture in one picture
@@ -227,6 +233,12 @@ for `v0.1.2` from the
 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2)
 instead of the tag.
 
+Releases after `v0.1.2` are signed (cosign, keyless) and carry a GitHub build
+provenance attestation on the multi-arch index, so the image can be verified
+against this repository's release workflow before it is deployed; the commands
+are in [SECURITY.md](SECURITY.md#verifying-a-release). `v0.1.2` and earlier
+cannot be verified that way.
+
 Both topologies use the same image; the edge in front of it does the routing
 affinity:
 
@@ -270,14 +282,18 @@ across nodes will not pair. If you operate a public relay, read
 
 `/metrics` is aggregate-only Prometheus text (no `serverId` labels):
 readiness/draining, active WebSockets/sessions, ingress reserved and budget
-bytes, forwarded frames/bytes, slow consumers, delivery timeouts, rejections,
-handshake outcomes, max frame, uptime, build info. See
+bytes for both pools, forwarded frames/bytes, slow consumers, delivery
+timeouts, rejections (WebSocket, session, per-IP, TCP, ingress), ingress
+reclaims, read and idle timeouts, handshake outcomes, max frame, uptime, build
+info. See
 [docs/operations.md](docs/operations.md),
 [examples/prometheus.yml](examples/prometheus.yml), and
 [examples/alerts.yml](examples/alerts.yml).
 
 Keep `/metrics` and `/ready` on an internal network. The relay has no
-authentication on ops endpoints.
+authentication on ops endpoints. In releases after `v0.1.2`, set
+`PASEO_RELAY_OPS_PORT` to serve them on a separate private listener, so they
+are not on the public port at all and probes keep working when it is full.
 
 ## Memory model and abuse limits
 
@@ -302,6 +318,14 @@ it never sends, and the fragment cap bounds empty-fragment floods. Keep
 spare slots) so health/readiness probes still get a slot under a full WebSocket
 load. See [docs/configuration.md](docs/configuration.md) and
 [DESIGN.md](DESIGN.md) for the full limits.
+
+A message that is started and not finished cannot hold budget for free: it must
+keep arriving (`PASEO_RELAY_READ_STALL_TIMEOUT_MS`), and while another source
+is waiting for budget the relay closes stalled, slow, or long-running
+unfinished messages (`1013` "Relay ingress reclaimed") instead of the waiter.
+Messages of at most 64 KiB also have a separate reserve, so handshakes and
+ordinary frames keep flowing while large transfers fill the main budget. What
+this does and does not prevent is spelled out in [SECURITY.md](SECURITY.md).
 
 ## Benchmarks
 
@@ -334,11 +358,14 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
   an edge proxy; enable and size them for direct exposure.
 - **Large in-flight messages**: a few maximum-size messages can consume the
   configured ingress budget (one connection is capped at `min(budget, 4 ×
-  one-max-message charge)`); raise the budget or limit at the edge.
+  one-max-message charge)`). Unfinished ones are reclaimed under pressure and
+  small messages have their own reserve, but a peer that keeps sending large
+  messages nobody reads can still delay other large transfers; raise the
+  budget or limit bandwidth at the edge.
 - **No per-user quotas or relay auth**: public operators must provide edge
   limits and a privacy/abuse policy; see [operator-policy.md](docs/operator-policy.md).
 - **No third-party security audit**: the evidence here is code review,
-  real-socket tests, fuzzing scaffolds, and the Paseo compatibility suite. Treat
+  real-socket tests, fuzz targets run in CI, and the Paseo compatibility suite. Treat
   v0.1.2 as early software and review the threat model before relying on it.
 - **Not proven at internet scale**: the included benchmark is loopback; run your
   own capacity tests and monitor before a large public deployment.

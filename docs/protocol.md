@@ -81,9 +81,13 @@ Behavior:
 - Client frames wait for their data socket for up to
   `DATA_ATTACH_TIMEOUT_MS` (default 15 s); if it never attaches, the client is
   closed with `1013` "Data route unavailable".
-- While a client is waiting for data, the control watchdog re-sends `sync`
-  after `CONTROL_NUDGE_MS` and closes a still-unresponsive control socket with
-  `1011` after `CONTROL_UNRESPONSIVE_MS`.
+- Each session caps distinct v2 `connectionId`s at
+  `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` (default `512`); excess connections
+  are closed with `1013` "Relay session connection capacity".
+- While one or more clients are waiting for data, a single deduplicated control
+  watchdog per session re-sends `sync` after `CONTROL_NUDGE_MS` and closes a
+  still-unresponsive control socket with `1011` after
+  `CONTROL_UNRESPONSIVE_MS`.
 - Control input is ignored except text `{"type":"ping"}`, answered with
   `{"type":"pong","ts":<unix ms>}`. Binary frames on the control socket are
   ignored.
@@ -131,11 +135,13 @@ sequenceDiagram
 | Masking | Client frames must be masked; unmasked closes `1002` |
 | Invalid UTF-8 in a text message | Closes `1007` |
 | Fragmented messages | Reassembled and forwarded as one message; opcode preserved |
-| Frame payload read | Must complete within `FRAME_READ_TIMEOUT_MS`; closes `1013` |
-| Fragmented message | Must complete within `MESSAGE_READ_TIMEOUT_MS` of the first fragment header (the clock starts when that header arrives); closes `1013` |
-| Idle/header timeout between frames | None between WebSocket frames; idle connections hold their slots by design, so enforce idle limits at the edge |
+| Frame payload read | Must complete within `FRAME_READ_TIMEOUT_MS`, and every 8 KiB of it must arrive within `READ_STALL_TIMEOUT_MS` of the previous one; closes `1013` "Relay read timeout" |
+| Fragmented message | Must complete within `MESSAGE_READ_TIMEOUT_MS` of the first fragment header (the clock starts when that header arrives), and payload progress of at least 8 KiB must arrive within `READ_STALL_TIMEOUT_MS` (pings and tiny empty/1-byte continuations do not reset the stall timer); closes `1013` "Relay read timeout" |
+| Idle timeout between messages | None by default: idle connections hold their slots, so enforce idle limits at the edge. With `PASEO_RELAY_WS_IDLE_TIMEOUT_MS` set, a socket with no frame received and no data frame relayed to it for that long is closed `1013` "Idle timeout" |
 | Source payload accounting | Data payload is read in 8 KiB chunks and each chunk is charged after it arrives as `chunk_bytes × weight + 192` (per-chunk bookkeeping); at most one 8 KiB chunk per connection is allocated before charging |
-| Ingress budget wait | Limited to `min(INGRESS_WAIT_TIMEOUT_MS, remaining frame/message read deadline)`; budget exhaustion and a read timeout both close the source `1013` |
+| Ingress budget wait | Limited to `min(INGRESS_WAIT_TIMEOUT_MS, remaining frame/message read deadline)`. While a source waits, unfinished messages of other connections are reclaimed (next row); a waiter for which nothing could be freed is closed `1013` "Relay ingress capacity" |
+| Budget reclaim | Only while another source waits for budget: an unfinished message that is stalled or slower than `INGRESS_RECLAIM_MIN_RATE_BYTES`/s, one that has been arriving for longer than `INGRESS_RECLAIM_AFTER_MS`, or (for a waiting message of at most 64 KiB) one at least 8× larger, is closed `1013` "Relay ingress reclaimed". Completely received messages are never reclaimed |
+| Small-message reserve | Complete single-frame messages of at most 64 KiB are charged to `INGRESS_SMALL_RESERVE_BYTES` first and to the main budget only when the reserve is full; fragmented messages always use the main budget |
 | Per-connection in-flight cap | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)` |
 | Slow destination | Bounded writer queue + deadline; destination sheds `1013` |
 
@@ -160,8 +166,18 @@ and must not be a known low-order/unsupported point. A mismatch closes `1008`
 "Invalid handshake key" and is not forwarded.
 
 This is protocol hygiene, **not** a security boundary: Paseo's E2EE handshake is
-authenticated by the endpoints, and the relay is untrusted by design. Frames
-larger than 64 KiB that look like JSON are not inspected by this check.
+authenticated by the endpoints, and the relay is untrusted by design. The check
+stops well-formed handshakes with a bad key; it does not stop a client that
+wants a bad key to reach the daemon. A frame is forwarded uninspected when:
+
+- it is larger than 64 KiB; or
+- the relay's JSON parser rejects it although a more lenient parser (such as
+  JavaScript's `JSON.parse`) accepts it: a lone surrogate escape such as
+  `"\ud800"`, a number outside the `f64` range such as `1e999`, or nesting
+  deeper than the parser's recursion limit.
+
+The daemon must therefore validate the key it receives, exactly as it must
+with a relay it does not trust.
 
 ## Close codes
 
@@ -175,7 +191,7 @@ larger than 64 KiB that look like JSON are not inspected by this check.
 | `1009` | Frame or message too large |
 | `1011` | Control socket unresponsive |
 | `1012` | Relay shutting down, or v2 server data socket disconnected |
-| `1013` | Ingress budget/read timeout, data route unavailable, or delivery unavailable (retryable) |
+| `1013` | Retryable: ingress budget exhausted ("Relay ingress capacity"), unfinished message reclaimed under budget pressure ("Relay ingress reclaimed"), per-session v2 connection cap reached ("Relay session connection capacity"), frame/message read or stall timeout ("Relay read timeout"), optional idle timeout ("Idle timeout"), data route unavailable, or delivery unavailable |
 
 Valid close codes are `1000..=1003`, `1007..=1014`, and `3000..=4999`. An empty
 close payload is allowed; a one-byte payload is not. `1005`/`1006`/`1015` are
@@ -194,10 +210,20 @@ contract; the relay closes the socket and does not retry.
 - `GET /ws` — WebSocket upgrade.
 - Anything else — 404.
 
+With `PASEO_RELAY_OPS_PORT` set, `/ready`, `/metrics` and `/version` are served
+only on that plaintext operations listener (which also answers `/health` and
+has no `/ws`); on the public listener they return 404 and only `/ws` and
+`/health` remain.
+
 Admission failures for the upgrade: `400` invalid query/handshake, `403`
 disallowed Origin, `414` request target too long, `426` not an upgrade, `429`
 per-IP WebSocket limit, `431` request headers too large, `503`
 draining/capacity.
+
+A connection can also be refused when it is accepted, before any request is
+read: `503` at `PASEO_RELAY_MAX_TCP_CONNECTIONS`, or `429` when the client
+already holds its per-IP share of TCP sockets. A plaintext listener sends that
+status and closes; a native-TLS listener closes without a TLS handshake.
 
 The `414`/`431` responses come from the HTTP parser before the relay sees the
 request: request headers are capped at 16 KiB and 64 fields (hyper

@@ -18,7 +18,11 @@ cargo test --locked
 cargo build --release --locked
 python3 scripts/check-docs.py   # 本地链接 + 中英文配对检查
 scripts/ci.sh          # 与 CI 相同，包含容器 smoke test
+scripts/fuzz.sh 60     # 可选：运行全部 fuzz target，需要 nightly 和 cargo-fuzz
 ```
+
+改动 frame codec、handshake 分类器、query 解析器或 upgrade 校验时，请在评审前先跑
+fuzz（见 `fuzz/README.md`，英文）；CI 也会构建并短时间运行每个 fuzz target。
 
 测试使用真实 listener 和真实 WebSocket client（`tokio-tungstenite`），不是 mock。
 新增协议行为请加集成测试到 `tests/relay_integration.rs`，纯逻辑加模块内单元测试。

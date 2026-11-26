@@ -31,7 +31,9 @@ That has consequences:
   thresholds for your traffic. The Caddy example has no in-process per-IP
   limiting, so pair it with an external CDN/WAF. In-process
   `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` sees the proxy IP when an LB terminates
-  connections; leave it at `0` behind a proxy and limit at the edge.
+  connections; leave it at `0` behind a proxy and limit at the edge. If you
+  expose the relay directly (native TLS), set it: it is the only thing that
+  stops one client from taking every connection slot.
 - Set `PASEO_RELAY_MAX_CONNECTIONS`, `MAX_TCP_CONNECTIONS`, `MAX_SESSIONS`, and
   the ingress budget for your host size; monitor `/ready` and `/metrics`. An idle
   accepted socket costs ~23 KiB plaintext or ~33 KiB with native TLS, so
@@ -45,7 +47,13 @@ That has consequences:
   last-wins at the relay, while edge consistent hashing normally uses the raw
   query value, so duplicate or percent-encoded values can route the two sides of
   a session to different relay nodes.
-- Keep `/metrics` on an internal network and rotate/restrict access.
+- Keep `/metrics` on an internal network and rotate/restrict access. In
+  releases after `v0.1.2`, `PASEO_RELAY_OPS_PORT` takes `/ready`, `/metrics`
+  and `/version` off the public port altogether.
+- Alert on `paseo_relay_ingress_rejections_total` (sources dropped for lack of
+  ingress budget) and on a sustained rise of
+  `paseo_relay_ingress_reclaims_total`; they are the signature of someone
+  occupying the budget.
 - Run the provided scratch image read-only, non-root, drop capabilities; keep
   the toolchain/image updated.
 - Do not add Erlang distribution; there is none in this relay.
@@ -100,6 +108,7 @@ That has consequences:
 - [ ] Abuse contact and privacy/retention note published.
 - [ ] `/metrics` and `/ready` internal only.
 - [ ] Capacity limits and alerts configured.
-- [ ] Image pinned by digest and updated on security releases.
+- [ ] Image pinned by digest, its signature and provenance verified
+  (releases after `v0.1.2`; see SECURITY.md), and updated on security releases.
 - [ ] Incident/rollback procedure tested (SIGTERM drain, restore previous image).
 - [ ] Clear statement: community relay, not the managed Paseo relay; no SLA.

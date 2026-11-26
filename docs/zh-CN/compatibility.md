@@ -43,9 +43,13 @@
 | 集群 | Syn ownership + 409 `x-reroute-target` reroute、分区处理 | 单节点；需要边缘一致性哈希 |
 | 配置 | `PASEO_RELAY_CLUSTER_*`、`RELEASE_*`、acceptors、watermark、ownership target | 更小的环境变量契约；见 README |
 | ID | `serverId`/`connectionId` 任意字节，最多 256 | 合法 UTF-8、可打印、无空白；非法 → HTTP 400 |
-| per-IP 限制 | 进程内无 | 可选 `PER_IP_MAX_CONNECTIONS`，默认 0（推荐边缘） |
+| per-IP 限制 | 进程内无 | 可选 `PER_IP_MAX_CONNECTIONS`，默认 0（推荐边缘）；设置后同时限制每个客户端的 WebSocket 和 TCP socket 数，IPv6 按 /64 |
 | 每个 connectionId 的 client 上限 | 无界 broadcast set | 可配置上限，默认 32 |
-| 读停滞关闭 | 无 source frame read deadline | `FRAME_READ_TIMEOUT_MS` / `MESSAGE_READ_TIMEOUT_MS` → `1013` |
+| 读停滞关闭 | 无 source frame read deadline | `FRAME_READ_TIMEOUT_MS` / `MESSAGE_READ_TIMEOUT_MS`，以及针对毫无进展的消息的 `READ_STALL_TIMEOUT_MS` → `1013` |
+| ingress 预算占满 | capacity ledger | 只有在什么都回收不了时才以 `1013` 关闭等待中的 source：先关闭其他连接上停滞、过慢或传输过久的未完成消息（`1013` "Relay ingress reclaimed"），不超过 64 KiB 的消息另有独立预留池 |
+| 空 session | 随 owner 进程生命周期 | 最后一个 socket 关闭时移除 |
+| idle socket | 传输层 idle timeout | 默认从不关闭；可选 `WS_IDLE_TIMEOUT_MS`（`1013` "Idle timeout"） |
+| 运维端点 | 与 relay socket 分离 | 默认共用 listener；可用 `OPS_PORT` 启用独立的内网 listener |
 | TLS | 通常在边缘终止；listener 明文 | 边缘终止或原生 rustls |
 | 运行时 | BEAM release + Cowboy/Ranch | 静态 Rust 二进制 + hyper/自定义 RFC 6455 codec |
 | 指标 | 不同指标族/名称 | 见 README/OPERATIONS |
