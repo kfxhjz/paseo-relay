@@ -1,4 +1,12 @@
-name: Sign release digest
+name: Sign release image
+
+# Sign an already published release image. Releases made by release.yml are
+# signed and attested when they are built; this workflow exists for a release
+# that predates image signing, or to repeat a signing step that failed.
+#
+# It adds a signature only. It does not create build provenance: provenance is
+# a statement about a build, and this workflow did not build the image. For
+# provenance, cut a new release.
 
 on:
   workflow_dispatch:
@@ -6,7 +14,6 @@ on:
       tag:
         description: "Existing release tag to sign (e.g. v0.1.2)"
         required: true
-        default: v0.1.2
 
 permissions:
   contents: read
@@ -17,58 +24,79 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      packages: write
       id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: "v2.4.1"
-      - name: Sign the published image digest
+      - name: Resolve the image digest from the registry
+        id: image
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          # The release body records the immutable multi-arch index digest.
-          digest="$(gh release view "${TAG}" --json body --jq .body \
-            | grep -o 'sha256:[0-9a-f]\{64\}' | head -1)"
-          test -n "${digest}"
-          printf '%s\n' "${digest}" > image-digest.txt
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "not a release tag: ${TAG}" >&2
+            exit 1
+          fi
+          name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # Ask the registry what the tag points at. The release notes also
+          # quote a digest, but they are editable text: signing whatever they
+          # say would let anyone who can edit a release get an arbitrary
+          # digest signed as this repository.
+          digest="$(docker buildx imagetools inspect "${name}:${TAG}" | awk '/^Digest:/ {print $NF; exit}')"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "could not resolve ${name}:${TAG}" >&2
+            exit 1
+          fi
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: Sign the image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Sign the image digest file and update the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${DIGEST}" > image-digest.txt
           cosign sign-blob --yes \
             --output-signature image-digest.txt.sig \
             --output-certificate image-digest.txt.pem \
             image-digest.txt
-          DIGEST="${digest}" python3 - > provenance.intoto.jsonl <<'PY'
-          import json, os
-          digest = os.environ["DIGEST"]
-          statement = {
-              "_type": "https://in-toto.io/Statement/v1",
-              "subject": [{
-                  "name": "ghcr.io/kfxhjz/paseo-relay",
-                  "digest": {"sha256": digest.split(":", 1)[1]},
-              }],
-              "predicateType": "https://slsa.dev/provenance/v1",
-              "predicate": {
-                  "buildDefinition": {
-                      "buildType": "https://github.com/actions/runner",
-                      "externalParameters": {"tag": os.environ.get("TAG")},
-                      "internalParameters": {},
-                      "resolvedDependencies": [],
-                  },
-                  "runDetails": {
-                      "builder": {"id": "https://github.com/actions/runner"},
-                      "metadata": {
-                          "invocationId": os.environ.get("GITHUB_RUN_ID", ""),
-                          "startedOn": "",
-                          "finishedOn": "",
-                      },
-                      "byproducts": [],
-                  },
-              },
-          }
-          print(json.dumps(statement, separators=(",", ":")))
-          PY
-          gh release upload "${TAG}" \
-            image-digest.txt image-digest.txt.sig image-digest.txt.pem \
-            provenance.intoto.jsonl --clobber
-          echo "Signed ${TAG} image digest ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+            image-digest.txt image-digest.txt.sig image-digest.txt.pem
+          # Earlier versions of this workflow uploaded a hand-written,
+          # unsigned `provenance.intoto.jsonl`. It was not build provenance;
+          # remove it so nobody relies on it.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets \
+              --jq '.assets[].name' | grep -qx 'provenance.intoto.jsonl'; then
+            gh release delete-asset "${TAG}" provenance.intoto.jsonl \
+              --repo "${GITHUB_REPOSITORY}" --yes
+            echo "Removed the unsigned provenance.intoto.jsonl asset from ${TAG}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "Signed \`${{ steps.image.outputs.name }}@${DIGEST}\` (${TAG})."
+            echo ""
+            echo "Verify with:"
+            echo ""
+            echo '```sh'
+            echo "cosign verify ${{ steps.image.outputs.name }}@${DIGEST} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity-regexp '^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/sign-release\.yml@'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
