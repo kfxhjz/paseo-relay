@@ -2125,3 +2125,49 @@ async fn healthcheck_ignores_empty_tls_vars_and_follows_bound_host() {
     );
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn truncated_control_or_continuation_frame_still_hits_stall_timeout() {
+    let mut config = test_config();
+    config.read_stall_timeout = Duration::from_millis(400);
+    config.frame_read_timeout = Duration::from_secs(30);
+    config.message_read_timeout = Duration::from_secs(60);
+    let (server, addr) = start(config).await;
+
+    // 1) Non-final fragment followed by a Ping header whose 1-byte payload
+    //    never arrives must close at read_stall_timeout (400 ms), not
+    //    frame_read_timeout (30 s).
+    let mut ping_stall = park_unfinished_fragment(addr, "ping-stall", 16).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let truncated_ping = frame_header(true, 0x9, 1);
+    ping_stall.write_all(&truncated_ping).await.unwrap();
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        raw_close(&mut ping_stall, Duration::from_secs(2)).await,
+        Some((1013, "Relay read timeout".to_owned()))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "truncated Ping must not extend stall timeout to frame_read_timeout"
+    );
+
+    // 2) Non-final fragment followed near the end of read_stall_timeout by a
+    //    truncated 1-byte continuation header must not grant a fresh stall
+    //    window on top of the elapsed time.
+    let mut cont_stall = park_unfinished_fragment(addr, "cont-stall", 16).await;
+    let open_at = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let truncated_cont = frame_header(false, 0x0, 1);
+    cont_stall.write_all(&truncated_cont).await.unwrap();
+    assert_eq!(
+        raw_close(&mut cont_stall, Duration::from_secs(2)).await,
+        Some((1013, "Relay read timeout".to_owned()))
+    );
+    assert!(
+        open_at.elapsed() < Duration::from_millis(600),
+        "truncated continuation header must not reset the stall deadline (elapsed {:?})",
+        open_at.elapsed()
+    );
+
+    server.shutdown().await;
+}

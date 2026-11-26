@@ -780,17 +780,19 @@ async fn handle_ws(
         .body(Full::new(Bytes::new()))
         .expect("valid websocket upgrade response");
 
-    // Move the pre-upgrade TCP slot into the upgraded connection so
-    // MAX_TCP_CONNECTIONS stays the total open-socket cap.
-    let tcp_slot = preupgrade_slot
-        .lock()
-        .expect("pre-upgrade slot mutex poisoned")
-        .take();
+    // Keep the pre-upgrade TCP slot in `preupgrade_slot` until `on_upgrade`
+    // actually succeeds, so a stalled 101 write never releases the TCP / per-IP
+    // slot while `serve_http` still holds the OS socket open.
+    let upgrade_timeout = state.config.http_header_timeout.max(Duration::from_secs(1));
     let state = Arc::clone(&state);
     let tracker = state.ws_tasks.clone();
     tracker.spawn(async move {
-        match tokio::time::timeout(Duration::from_secs(10), on_upgrade).await {
+        match tokio::time::timeout(upgrade_timeout, on_upgrade).await {
             Ok(Ok(upgraded)) => {
+                let tcp_slot = preupgrade_slot
+                    .lock()
+                    .expect("pre-upgrade slot mutex poisoned")
+                    .take();
                 // Hand write-timeout ownership over to FrameWriter now that
                 // the HTTP 101 response has been flushed.
                 write_timeout_active.store(false, Ordering::Relaxed);

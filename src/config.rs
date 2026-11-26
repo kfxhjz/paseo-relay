@@ -565,7 +565,7 @@ impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}:{} ops={} max_connections={} max_sessions={} ingress_budget={} small_reserve={} weight={} tls={}",
+            "{}:{} ops={} max_connections={} max_sessions={} max_connections_per_session={} ingress_budget={} small_reserve={} weight={} tls={}",
             self.host,
             self.port,
             match self.ops_port {
@@ -574,6 +574,7 @@ impl fmt::Display for Config {
             },
             self.max_connections,
             self.max_sessions,
+            self.max_connections_per_session,
             self.ingress_budget_bytes,
             self.ingress_small_reserve_bytes,
             self.ingress_weight,

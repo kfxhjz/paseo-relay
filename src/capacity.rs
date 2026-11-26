@@ -655,12 +655,16 @@ impl IngressBudget {
 
         let need = request.frame_need.max(request.weighted);
         let mut freed = 0u64;
+        let mut victims = 0usize;
         if !slow.is_empty() {
             slow.sort_unstable_by_key(|(held, _)| std::cmp::Reverse(*held));
             for (_, hold) in slow.into_iter().take(RECLAIM_MAX_VICTIMS) {
-                freed = freed.saturating_add(self.evict(&hold, request.class).unwrap_or(0));
-                if freed >= need {
-                    return;
+                if let Some(bytes) = self.evict(&hold, request.class) {
+                    freed = freed.saturating_add(bytes);
+                    victims += 1;
+                    if freed >= need || victims >= RECLAIM_MAX_VICTIMS {
+                        return;
+                    }
                 }
             }
         }
@@ -672,17 +676,24 @@ impl IngressBudget {
         // A message that has been arriving for a long time yields to a newer
         // one. Without this a sender could keep budget indefinitely by
         // trickling just above the slow threshold; with it, holding budget
-        // costs re-sending the held bytes every `reclaim_after`. Reaching here
-        // even when `slow` freed a little prevents tiny stalled decoys from
-        // shielding an old large hold.
+        // costs re-sending the held bytes every `reclaim_after`. Continue until
+        // `freed >= need` (bounded by `RECLAIM_MAX_VICTIMS`) so tiny old holds
+        // cannot shield a large old hold across the waiter's timeout window.
         if !old_candidates.is_empty() {
             old_candidates.sort_unstable_by_key(|(age, _)| std::cmp::Reverse(*age));
             for (_, hold) in old_candidates {
+                if victims >= RECLAIM_MAX_VICTIMS {
+                    return;
+                }
                 if hold.evicted.is_cancelled() {
                     continue;
                 }
-                if self.evict(&hold, request.class).is_some() {
-                    return;
+                if let Some(bytes) = self.evict(&hold, request.class) {
+                    freed = freed.saturating_add(bytes);
+                    victims += 1;
+                    if freed >= need {
+                        return;
+                    }
                 }
             }
         }
@@ -1567,6 +1578,33 @@ mod tests {
         assert!(
             old.evicted().is_cancelled(),
             "evicting a tiny decoy below `need` must not stop the age rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_old_holds_do_not_shield_a_large_old_hold() {
+        let budget = budget(100_000, 0);
+        let _guard = budget.try_reserve(100_000, Class::Bulk).unwrap();
+
+        // Twelve slightly older tiny holds (not slow) sit ahead of a large old
+        // hold in age order; evicting them one-by-one per tick would starve the
+        // waiter across its timeout window.
+        let mut tiny_holds = Vec::new();
+        for _ in 0..12 {
+            let h = budget.register();
+            receiving_for(&h, 512, Duration::from_secs(120), 1024 * 1024);
+            tiny_holds.push(h);
+        }
+        let large_old = budget.register();
+        receiving_for(&large_old, 93_856, Duration::from_secs(90), 1024 * 1024);
+
+        let waiter = budget.register();
+        let _ = budget
+            .reserve(&waiter, bulk(20_000), Duration::from_millis(300))
+            .await;
+        assert!(
+            large_old.evicted().is_cancelled(),
+            "old_candidates must keep evicting until `need` is satisfied"
         );
     }
 

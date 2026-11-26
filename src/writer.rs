@@ -23,6 +23,9 @@ use crate::ws::{FrameWriter, OpCode, WsError};
 
 static NEXT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Upper bound for flushing a final WebSocket close frame once cancelled.
+const CLOSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
     #[error("destination closed")]
@@ -271,9 +274,15 @@ where
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
+                    // Drain queued frames before flushing the close frame so
+                    // byte permits and ingress BudgetHolds are released at
+                    // once even if the peer's TCP send buffer is full.
+                    rx.close();
+                    while rx.try_recv().is_ok() {}
                     let close = close_state.lock().expect("close state poisoned").take();
                     if let Some((code, reason)) = close {
-                        let _ = tokio::time::timeout(write_timeout, async {
+                        let close_timeout = write_timeout.min(CLOSE_WRITE_TIMEOUT);
+                        let _ = tokio::time::timeout(close_timeout, async {
                             writer.write_close(code, &reason).await?;
                             writer.flush().await
                         })
@@ -297,18 +306,34 @@ where
                             // keep a slow destination alive for minutes/hours.
                             let remaining =
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
-                            let result = if remaining.is_zero() {
-                                Err(WsError::Closed)
+                            let (result, timed_out, cancelled_mid_write) = if remaining.is_zero() {
+                                (Err(WsError::Closed), true, false)
                             } else {
-                                tokio::time::timeout(remaining, async {
+                                let write_fut = tokio::time::timeout(remaining, async {
                                     writer.write_frame(true, opcode, &payload).await?;
                                     writer.flush().await
-                                })
-                                .await
-                                .unwrap_or(Err(WsError::Closed))
+                                });
+                                tokio::pin!(write_fut);
+                                tokio::select! {
+                                    biased;
+                                    outcome = &mut write_fut => match outcome {
+                                        Ok(res) => (res, false, false),
+                                        Err(_) => (Err(WsError::Closed), true, false),
+                                    },
+                                    _ = cancel.cancelled() => {
+                                        // Socket was cancelled while stalled mid-write:
+                                        // drop queued frames/budgets immediately rather
+                                        // than blocking for the remaining delivery window.
+                                        (Err(WsError::Closed), false, true)
+                                    }
+                                }
                             };
                             drop(_permit);
                             drop(_budget);
+                            if cancelled_mid_write {
+                                let _ = ack.send(result);
+                                break;
+                            }
                             if result.is_ok() {
                                 Metrics::add(&metrics.bytes_forwarded, payload.len() as u64);
                                 activity.touch();
@@ -317,7 +342,7 @@ where
                             let caller_gone = ack.is_closed();
                             let _ = ack.send(result);
                             if failed {
-                                if caller_gone {
+                                if timed_out && caller_gone {
                                     Metrics::inc(&metrics.slow_consumer_disconnects);
                                     Metrics::inc(&metrics.delivery_timeouts);
                                     metrics.shed(ShedKind::SlowConsumer);
@@ -502,5 +527,100 @@ mod tests {
         assert!(writer.is_closed());
         assert_eq!(budget.reserved_bytes(), 0);
         assert!(metrics.slow_consumer_disconnects.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_releases_queued_budget_immediately_even_if_socket_stalls() {
+        use crate::capacity::{Class, ConnIngress, IngressBudget, Reservation};
+        let (_client, server) = tokio::io::duplex(1);
+        let metrics = Arc::new(Metrics::new());
+        let budget = IngressBudget::new(16 * 1024, 0, 4, 0, Duration::ZERO, Arc::clone(&metrics));
+        let hold = budget.register();
+        let scope = Arc::new(ConnIngress::new(16 * 1024));
+        let guard = budget
+            .reserve(
+                &hold,
+                Reservation {
+                    weighted: 4096,
+                    class: Class::Bulk,
+                    frame_need: 4096,
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let msg_budget = BudgetHold::new(vec![scope.try_scope(guard).unwrap()]);
+
+        let (writer, task) = spawn_writer(
+            server,
+            64 * 1024,
+            Duration::from_secs(30),
+            Arc::clone(&metrics),
+        );
+        let send = writer.send_frame(
+            OpCode::Binary,
+            Bytes::from(vec![0u8; 2048]),
+            Duration::from_secs(30),
+            Some(Arc::clone(&msg_budget)),
+        );
+        drop(msg_budget);
+        let _ = tokio::time::timeout(Duration::from_millis(20), send).await;
+        assert_eq!(budget.reserved_bytes(), 4096);
+
+        // Cancelling the writer must unblock the stalled write and free the
+        // held budget immediately rather than waiting 30 s.
+        writer.close(1013, "Slow consumer");
+        tokio::time::timeout(Duration::from_millis(300), task)
+            .await
+            .expect("writer task must exit promptly on cancel")
+            .unwrap();
+        assert_eq!(budget.reserved_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_disconnect_after_source_leaves_does_not_count_as_slow_consumer() {
+        use crate::capacity::{Class, ConnIngress, IngressBudget, Reservation};
+        let (client, server) = tokio::io::duplex(1);
+        let metrics = Arc::new(Metrics::new());
+        let budget = IngressBudget::new(16 * 1024, 0, 4, 0, Duration::ZERO, Arc::clone(&metrics));
+        let hold = budget.register();
+        let scope = Arc::new(ConnIngress::new(16 * 1024));
+        let guard = budget
+            .reserve(
+                &hold,
+                Reservation {
+                    weighted: 4096,
+                    class: Class::Bulk,
+                    frame_need: 4096,
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let msg_budget = BudgetHold::new(vec![scope.try_scope(guard).unwrap()]);
+
+        let (writer, task) = spawn_writer(
+            server,
+            64 * 1024,
+            Duration::from_secs(10),
+            Arc::clone(&metrics),
+        );
+        let send = writer.send_frame(
+            OpCode::Binary,
+            Bytes::from(vec![0u8; 2048]),
+            Duration::from_secs(10),
+            Some(Arc::clone(&msg_budget)),
+        );
+        drop(msg_budget);
+        let _ = tokio::time::timeout(Duration::from_millis(20), send).await;
+
+        // Peer disconnects cleanly before the delivery deadline.
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("writer exits on peer EOF")
+            .unwrap();
+        assert_eq!(budget.reserved_bytes(), 0);
+        assert_eq!(metrics.slow_consumer_disconnects.load(Ordering::Relaxed), 0);
     }
 }

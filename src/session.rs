@@ -103,9 +103,11 @@ struct SessionState {
     waiting_since: std::collections::HashMap<String, Instant>,
     /// Whether the single per-session control watchdog task is currently alive.
     watchdog_running: bool,
-    /// Whether a nudge `sync` has been sent to the current control socket for
-    /// the current waiting batch.
-    nudged: bool,
+    /// When the last nudge `sync` was sent to the current control socket.
+    /// A waiting client whose `waiting_since` is after `nudged_at` was not yet
+    /// covered by that nudge and must receive its own `sync` before closing
+    /// the control socket with `1011`.
+    nudged_at: Option<Instant>,
     last_active: Instant,
 }
 
@@ -136,7 +138,7 @@ impl Session {
                 clients: std::collections::HashMap::new(),
                 waiting_since: std::collections::HashMap::new(),
                 watchdog_running: false,
-                nudged: false,
+                nudged_at: None,
                 last_active: Instant::now(),
             }),
             data_ready: Notify::new(),
@@ -174,7 +176,7 @@ impl Session {
                 for since in state.waiting_since.values_mut() {
                     *since = now;
                 }
-                state.nudged = false;
+                state.nudged_at = None;
                 if !state.waiting_since.is_empty() && !state.watchdog_running {
                     state.watchdog_running = true;
                     result.start_watchdog = true;
@@ -257,7 +259,7 @@ impl Session {
                     .is_some_and(|socket| socket.id == socket_id)
                 {
                     state.control = None;
-                    state.nudged = false;
+                    state.nudged_at = None;
                     wake_watchdog = true;
                 }
             } else if let Some(connection_id) = connection.connection_id() {
@@ -335,7 +337,7 @@ impl Session {
         waiting_since.retain(|id, _| clients.contains_key(id) && !data.contains_key(id));
         if state.waiting_since.is_empty() {
             state.watchdog_running = false;
-            state.nudged = false;
+            state.nudged_at = None;
             return WatchdogStep::Exit;
         }
         let Some(control) = state
@@ -344,7 +346,7 @@ impl Session {
             .filter(|socket| !socket.writer.is_closed())
             .cloned()
         else {
-            state.nudged = false;
+            state.nudged_at = None;
             return WatchdogStep::WaitForChange;
         };
         let earliest = state
@@ -353,21 +355,35 @@ impl Session {
             .min()
             .copied()
             .expect("waiting_since is non-empty");
-        let elapsed = Instant::now().saturating_duration_since(earliest);
-        if !state.nudged {
-            if elapsed >= nudge_after {
-                state.nudged = true;
-                let mut ids: Vec<String> = state.clients.keys().cloned().collect();
-                ids.sort();
-                WatchdogStep::SendNudge { control, ids }
-            } else {
-                WatchdogStep::Sleep(nudge_after.saturating_sub(elapsed))
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(earliest);
+        let nudged_at = state.nudged_at.filter(|&at| at >= earliest);
+        match nudged_at {
+            None => {
+                if elapsed >= nudge_after {
+                    state.nudged_at = Some(now);
+                    let mut ids: Vec<String> = state.clients.keys().cloned().collect();
+                    ids.sort();
+                    WatchdogStep::SendNudge { control, ids }
+                } else {
+                    WatchdogStep::Sleep(nudge_after.saturating_sub(elapsed))
+                }
             }
-        } else if elapsed >= unresponsive_after {
-            state.nudged = false;
-            WatchdogStep::CloseUnresponsive { control }
-        } else {
-            WatchdogStep::Sleep(unresponsive_after.saturating_sub(elapsed))
+            Some(nudged_at) => {
+                // Always grant the daemon at least `unresponsive_after - nudge_after`
+                // after a nudge is emitted, even if the nudge ran late.
+                let post_nudge_grace = unresponsive_after.saturating_sub(nudge_after);
+                let wait_unresponsive = unresponsive_after.saturating_sub(elapsed);
+                let wait_grace =
+                    post_nudge_grace.saturating_sub(now.saturating_duration_since(nudged_at));
+                let remaining = wait_unresponsive.max(wait_grace);
+                if remaining.is_zero() {
+                    state.nudged_at = None;
+                    WatchdogStep::CloseUnresponsive { control }
+                } else {
+                    WatchdogStep::Sleep(remaining)
+                }
+            }
         }
     }
 
@@ -375,7 +391,7 @@ impl Session {
     pub fn mark_watchdog_stopped(&self) {
         let mut state = self.state.lock().expect("session state poisoned");
         state.watchdog_running = false;
-        state.nudged = false;
+        state.nudged_at = None;
     }
 
     /// Wait until a v2 daemon data socket for `connection_id` is attached.
@@ -430,24 +446,6 @@ impl Session {
     pub fn control(&self) -> Option<SocketHandle> {
         let state = self.state.lock().expect("session state poisoned");
         state.control.clone()
-    }
-
-    pub fn connection_ids(&self) -> Vec<String> {
-        let state = self.state.lock().expect("session state poisoned");
-        let mut ids: Vec<String> = state.clients.keys().cloned().collect();
-        ids.sort();
-        ids
-    }
-
-    /// True when at least one v2 client is attached for `connection_id` but no
-    /// daemon data socket is attached yet. Used by the control watchdog.
-    pub fn waiting_for_data(&self, connection_id: &str) -> bool {
-        let state = self.state.lock().expect("session state poisoned");
-        let has_clients = state
-            .clients
-            .get(connection_id)
-            .is_some_and(|clients| !clients.is_empty());
-        has_clients && !state.data.contains_key(connection_id)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -796,6 +794,70 @@ mod tests {
         let data_detach = session.session.detach(&data.connection, data.id);
         assert!(data_detach.closes.is_empty());
         assert!(session.session.data_socket("conn_a").is_none());
+    }
+
+    #[tokio::test]
+    async fn watchdog_nudges_newly_arrived_client_after_earlier_client_resolves() {
+        let session = Session::new("srv".into(), 8, 512);
+        let control = SocketHandle {
+            id: 1,
+            connection: conn(Role::Server, Version::V2, Some("")),
+            writer: writer(),
+        };
+        session.attach(control).unwrap();
+
+        let c1 = SocketHandle {
+            id: 2,
+            connection: conn(Role::Client, Version::V2, Some("c1")),
+            writer: writer(),
+        };
+        session.attach(c1).unwrap();
+
+        // Wait past `nudge_after` and fire the first nudge for `c1`.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(matches!(
+            session.watchdog_step(Duration::from_millis(10), Duration::from_millis(60)),
+            WatchdogStep::SendNudge { .. }
+        ));
+
+        // A second client `c2` arrives AFTER the nudge, and `c1` gets its data
+        // socket shortly after.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let c2 = SocketHandle {
+            id: 3,
+            connection: conn(Role::Client, Version::V2, Some("c2")),
+            writer: writer(),
+        };
+        session.attach(c2).unwrap();
+        let d1 = SocketHandle {
+            id: 4,
+            connection: conn(Role::Server, Version::V2, Some("c1")),
+            writer: writer(),
+        };
+        session.attach(d1).unwrap();
+
+        // Even once `c2` exceeds `unresponsive_after`, it was never covered by
+        // `c1`'s earlier sync nudge, so the watchdog must nudge first instead
+        // of immediately closing the healthy control socket with 1011.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            matches!(
+                session.watchdog_step(Duration::from_millis(10), Duration::from_millis(20)),
+                WatchdogStep::SendNudge { ref ids, .. } if ids == &vec!["c1".to_owned(), "c2".to_owned()]
+            ),
+            "client arriving after an earlier nudge must receive a sync nudge before 1011"
+        );
+        // Even right after a late nudge, the daemon still gets the full
+        // `unresponsive_after - nudge_after` grace window before `1011`.
+        assert!(matches!(
+            session.watchdog_step(Duration::from_millis(10), Duration::from_millis(20)),
+            WatchdogStep::Sleep(delay) if !delay.is_zero()
+        ));
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(matches!(
+            session.watchdog_step(Duration::from_millis(10), Duration::from_millis(20)),
+            WatchdogStep::CloseUnresponsive { .. }
+        ));
     }
 
     struct Sequence {

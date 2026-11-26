@@ -226,13 +226,12 @@ pub async fn run_connection(
             "type": "connected",
             "connectionId": connection.connection_id().unwrap_or_default(),
         });
-        if control
+        if let Err(error) = control
             .writer
             .send_json(&connected, CONTROL_SEND_TIMEOUT)
             .await
-            .is_err()
         {
-            shed_slow_consumer(&state, &control.writer);
+            handle_control_send_err(&state, &control.writer, error);
         }
     }
 
@@ -541,6 +540,16 @@ fn shed_slow_consumer(state: &Arc<AppState>, writer: &WriterHandle) {
     writer.close(1013, "Slow consumer");
 }
 
+/// Handle a failed control-socket send without miscounting normal disconnects
+/// (`SendError::Closed`) as slow-consumer sheds.
+fn handle_control_send_err(state: &Arc<AppState>, writer: &WriterHandle, error: SendError) {
+    match error {
+        SendError::SlowConsumer => shed_slow_consumer(state, writer),
+        SendError::Closed => {}
+        SendError::Writer(_) | SendError::TooLarge => writer.close(1013, "Delivery unavailable"),
+    }
+}
+
 /// Single deduplicated control watchdog per session.
 ///
 /// Holds only a [`Weak<Session>`] across awaits so an empty session can be
@@ -617,8 +626,8 @@ fn spawn_control_watchdog(
                             }
                             result = control.writer.send_text(payload, CONTROL_SEND_TIMEOUT) => result,
                         };
-                        if sent.is_err() {
-                            shed_slow_consumer(&state, &control.writer);
+                        if let Err(error) = sent {
+                            handle_control_send_err(&state, &control.writer, error);
                         }
                     }
                 }
@@ -650,12 +659,8 @@ async fn handle_control_input(
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let pong = json!({"type": "pong", "ts": timestamp});
-    if writer
-        .send_json(&pong, state.config.delivery_timeout)
-        .await
-        .is_err()
-    {
-        shed_slow_consumer(state, writer);
+    if let Err(error) = writer.send_json(&pong, state.config.delivery_timeout).await {
+        handle_control_send_err(state, writer, error);
     }
 }
 
@@ -685,6 +690,9 @@ where
             // message and the budget guards it held.
         };
         if reclaimed {
+            // Unregister immediately rather than keeping the evicted hold in
+            // the active map while waiting for `tx.send` under backpressure.
+            ctx.hold.message_done();
             let _ = tx.send(Inbound::Failed(Failure::Reclaimed)).await;
         }
     })
@@ -761,10 +769,32 @@ where
         }
         let payload_deadline = Instant::now() + payload_timeout;
 
+        // Control payloads are at most 125 bytes: never allow a truncated
+        // Ping/Pong/Close frame to stretch an open message's stall timeout out
+        // to the full 300 s frame_read_timeout.
+        let control_payload_timeout = || -> Result<Duration, Failure> {
+            match message_started {
+                Some(_) => {
+                    let stall_left = ctx
+                        .read_stall_timeout
+                        .saturating_sub(last_progress.elapsed());
+                    if stall_left.is_zero() {
+                        Err(Failure::ReadTimeout)
+                    } else {
+                        Ok(payload_timeout.min(stall_left))
+                    }
+                }
+                None => Ok(payload_timeout.min(ctx.read_stall_timeout)),
+            }
+        };
+
         match header.opcode {
             OpCode::Close => {
-                let payload = match read_small_payload(&mut reader, &header, payload_timeout).await
-                {
+                let timeout = match control_payload_timeout() {
+                    Ok(timeout) => timeout,
+                    Err(failure) => fail!(failure),
+                };
+                let payload = match read_small_payload(&mut reader, &header, timeout).await {
                     Ok(payload) => payload,
                     Err(failure) => fail!(failure),
                 };
@@ -779,8 +809,11 @@ where
                 return;
             }
             OpCode::Ping => {
-                let payload = match read_small_payload(&mut reader, &header, payload_timeout).await
-                {
+                let timeout = match control_payload_timeout() {
+                    Ok(timeout) => timeout,
+                    Err(failure) => fail!(failure),
+                };
+                let payload = match read_small_payload(&mut reader, &header, timeout).await {
                     Ok(payload) => payload,
                     Err(failure) => fail!(failure),
                 };
@@ -789,9 +822,11 @@ where
                 }
             }
             OpCode::Pong => {
-                if let Err(failure) =
-                    read_small_payload(&mut reader, &header, payload_timeout).await
-                {
+                let timeout = match control_payload_timeout() {
+                    Ok(timeout) => timeout,
+                    Err(failure) => fail!(failure),
+                };
+                if let Err(failure) = read_small_payload(&mut reader, &header, timeout).await {
                     fail!(failure);
                 }
                 if tx.send(Inbound::Pong).await.is_err() {
@@ -830,6 +865,10 @@ where
                     }
                     Err(failure) => fail!(failure),
                 };
+                // Start the stall clock after overhead admission so any
+                // relay-imposed budget wait never eats into `read_stall_timeout`.
+                last_progress = Instant::now();
+                progress_bytes = 0;
                 let mut message = Assembling {
                     opcode: header.opcode,
                     payload: Vec::new(),
@@ -969,7 +1008,10 @@ where
     while remaining > 0 {
         let chunk_len = remaining.min(INGRESS_CHUNK_BYTES);
         let chunk = &mut scratch[..chunk_len];
-        let read_deadline = deadline.min(Instant::now() + ctx.read_stall_timeout);
+        // Bound every read by the remaining stall window since the last full
+        // 8 KiB of payload progress, so sending a tiny continuation header near
+        // the end of the stall window cannot grant another full stall timeout.
+        let read_deadline = deadline.min(*last_progress + ctx.read_stall_timeout);
         let read =
             match tokio::time::timeout_at(read_deadline, reader.read_payload_chunk(chunk)).await {
                 Ok(Ok(read)) => read,
@@ -988,7 +1030,14 @@ where
             class,
             frame_need: ctx.capacity.ingress.frame_weight(remaining),
         };
+        let wait_started = Instant::now();
         let guard = reserve(ctx, request, chunk_len, wait).await?;
+        // Relay-imposed budget wait does not count against the sender's stall
+        // window.
+        let wait_elapsed = wait_started.elapsed();
+        if !wait_elapsed.is_zero() {
+            *last_progress = (*last_progress + wait_elapsed).min(Instant::now());
+        }
         message.payload.extend_from_slice(chunk);
         message.guards.push(guard);
         *progress_bytes = progress_bytes.saturating_add(chunk_len);
