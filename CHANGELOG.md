@@ -6,6 +6,194 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Fixes for the 2026-11 security and project review. No wire-protocol change:
+Paseo's `relay-transport` E2E suite passes unchanged (9 passed, 2 skipped, as
+before). Read "Changed" before upgrading; a few defaults behave differently.
+
+### Security
+
+- **Control-socket `sync` amplification could exhaust memory outside the
+  ingress budget.** Previously, every waiting v2 client spawned its own control
+  watchdog that built and queued a full `sync` JSON list over a 30 s write
+  timeout, and a single `serverId` session had no cap on distinct
+  `connectionId`s—producing quadratic ($O(K^2)$) memory growth (~810 MiB at
+  1,200 idle connections). Now each session enforces
+  `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` (default `512`, excess closes
+  `1013` "Relay session connection capacity") and runs a single deduplicated
+  control watchdog holding only a `Weak<Session>` across awaits, with a 1 s
+  control send timeout and pre-serialized `Bytes`.
+- **Replacing or dropping a source socket could release ingress budget while
+  frames stayed queued in the destination writer.** Queued frames in a slow
+  destination's writer channel now carry both an `Arc<BudgetHold>` of their
+  ingress budget guards and an absolute delivery deadline; the writer enforces
+  that deadline independently even after the source disconnects or is replaced,
+  shedding stalled destinations and returning the budget to zero.
+- **Ingress reclaim and stall-timeout hardening.**
+  - Split `HoldState` tracking into `bulk_held` vs `small_held` so main-pool
+    waiters never evict small-reserve-only holds, and continue past slow holds
+    when they free fewer bytes than needed so tiny stalled decoys cannot shield
+    older bulk holds from the 60 s age rule.
+  - Separated reclaim throttle clocks (`slow`, `patient_bulk`, `patient_small`)
+    so impatient or bulk waiters cannot starve eligible patient/small waiters.
+  - Indexed only connections actively receiving a message in `IngressBudget`
+    rather than scanning all idle sockets under the global lock.
+  - Fragmented messages (`!fin` and continuations) now always charge the main
+    pool rather than locking `small` reserve bytes behind an opening fragment.
+  - Stall progress (`PASEO_RELAY_READ_STALL_TIMEOUT_MS`) now requires at least
+    8 KiB of cumulative payload progress, closing both 0-byte and 1-byte
+    continuation keepalive bypasses.
+- **Pre-upgrade HTTP response write timeout and handshake hardening.**
+  - Pre-upgrade HTTP streams now enforce `PASEO_RELAY_HTTP_HEADER_TIMEOUT_MS`
+    on stalled response writes (such as pipelined `/metrics` requests whose peer
+    stops reading) and disable the timer once a WebSocket upgrade completes.
+  - `accept_loop` and `ops_accept_loop` now reap completed `JoinSet` tasks ahead
+    of accepting new sockets.
+  - `/ws` now requires HTTP/1.1 (`400` otherwise) and rejects duplicate `Origin`
+    headers with `403` using a precomputed `HashSet`.
+  - Release verification now runs `cargo audit --deny warnings` on both lockfiles
+    and smoke-tests the published image by immutable `@sha256:` digest.
+- **Ingress budget could be held for free.** Two connections that each sent an
+  unfinished ~32 MiB fragment and then went idle reserved the whole 129 MiB
+  budget of the Compose/Kubernetes examples (four connections for the 512 MiB
+  default) for up to ten minutes, and every other session that sent data was
+  closed `1013` after 5 s. Now:
+  - a message that makes no payload progress for
+    `PASEO_RELAY_READ_STALL_TIMEOUT_MS` (30 s) is closed;
+  - while another source waits for budget, the relay reclaims budget from
+    unfinished messages of other connections instead of only closing the
+    waiter: stalled or slow ones (`PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES`,
+    64 KiB/s), ones that have been arriving for longer than
+    `PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS` (60 s), and, for a waiting message
+    of at most 64 KiB, one that is at least 8× larger. Reclaimed sources are
+    closed `1013` "Relay ingress reclaimed";
+  - messages of at most 64 KiB have a separate reserve
+    (`PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES`, 16 MiB weighted), so handshakes
+    and ordinary frames keep flowing while large transfers fill the main
+    budget.
+
+  Not covered: completely received messages that are never delivered still
+  hold budget for the delivery or data-attach deadline. `SECURITY.md` states
+  the remaining cost of occupying the budget.
+- **Session slots outlived their sockets.** An empty session was kept for
+  `PASEO_RELAY_SESSION_IDLE_MS` (30 s), so one client limited to a single
+  concurrent WebSocket could fill `PASEO_RELAY_MAX_SESSIONS` by cycling through
+  `serverId`s, after which `/ready` returned 503 and new daemons were refused.
+  A session is now removed when its last socket closes.
+- **Per-IP limit did not cover pre-upgrade sockets or IPv6 prefixes.** With
+  `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` set, one client could still hold every
+  TCP slot with keep-alive HTTP connections (making `/health` fail), and an
+  IPv6 client could use a new address from its prefix for every connection.
+  The setting now also caps a client's TCP sockets (the WebSocket cap plus a
+  quarter, at least 8 more), IPv6 clients are counted per /64, and IPv4-mapped
+  addresses count as IPv4.
+- **Operations endpoints could not be taken off the public port.**
+  `PASEO_RELAY_OPS_PORT` / `PASEO_RELAY_OPS_HOST` serve `/ready`, `/metrics`
+  and `/version` on a separate plaintext listener; the public listener then
+  answers only `/ws` and `/health`. The operations listener has its own
+  connection allowance and keeps answering during a drain, and
+  `paseo-relay healthcheck` follows it, so a relay whose public listener is
+  full is reported unready instead of failing its liveness probe.
+- **Release provenance was not provenance.** The `provenance.intoto.jsonl`
+  asset on the v0.1.2 release was written by hand in a workflow and is
+  unsigned, and the release workflow listed it without producing it. Releases
+  now sign the multi-arch image (cosign, keyless) and attach a GitHub build
+  provenance attestation to it; the manual signing workflow reads the digest
+  from the registry instead of from the editable release notes, no longer
+  writes a provenance file, and removes the old asset from a release it signs.
+  Verification commands are in `SECURITY.md` and in each release's notes.
+- Handshake key hygiene is documented for what it is. The v0.1.2 notes said it
+  had "no bypassable byte prefilters"; a frame the relay's JSON parser rejects
+  but a more lenient parser accepts (lone surrogate escape, a number outside
+  `f64` range, very deep nesting), or any frame above 64 KiB, is forwarded
+  uninspected. The check was never a security boundary and the behaviour is
+  unchanged; it is now pinned by a test and stated in `docs/protocol.md`.
+- `examples/nginx.conf` sets `error_log ... crit`: nginx's error log always
+  contains the full request line, so rate-limit rejections and upstream errors
+  wrote `serverId` to disk even though the access log omitted it.
+
+### Added
+
+- `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` (default `512`): caps distinct v2
+  `connectionId`s per `serverId` session.
+- `PASEO_RELAY_WS_IDLE_TIMEOUT_MS`: optional idle timeout (off by default). A
+  socket with no frame received and no data frame relayed to it for that long
+  is closed `1013` "Idle timeout".
+- TLS certificate reload without dropping sessions: on `SIGHUP`, and
+  automatically within 30 s of the certificate or key file changing. A pair
+  that cannot be loaded leaves the previous certificate in use.
+- Startup and `--check-config` warnings for an unknown `PASEO_RELAY_*`
+  variable (a misspelled name used to be ignored silently), for an open-file
+  limit below `PASEO_RELAY_MAX_TCP_CONNECTIONS` (Linux), and for native TLS
+  without a per-IP cap. Kubernetes service-link variables are recognised, and
+  a service-link value in `PASEO_RELAY_PORT` gets an error that explains it.
+- Rate-limited `warn` logs (one line per reason per 10 s, with an event count)
+  when the relay sheds work: ingress exhausted or reclaimed, read or idle
+  timeouts, slow consumers, and WebSocket/session/TCP/per-IP rejections.
+- Metrics: `paseo_relay_ingress_reclaims_total`,
+  `paseo_relay_ingress_rejections_total`, `paseo_relay_read_timeouts_total`,
+  `paseo_relay_idle_timeouts_total`, `paseo_relay_tcp_rejections_total`,
+  `paseo_relay_ingress_small_reserved_bytes` and
+  `paseo_relay_ingress_small_budget_bytes`; two matching example alerts.
+- Tests: regression tests for every finding above against real sockets,
+  native TLS (serving, the TLS healthcheck, certificate reload), the
+  operations listener, and randomised codec round trips. CI now builds all
+  four fuzz targets and runs each briefly on every pull request, and a weekly
+  workflow runs them for longer (`scripts/fuzz.sh`).
+
+### Changed
+
+- **Shared-port drain keeps operations endpoints reachable during the grace
+  window.** When `PASEO_RELAY_OPS_PORT` is unset, `SIGTERM`/`SIGINT` keeps the
+  listener open for `PASEO_RELAY_SHUTDOWN_GRACE_MS` so `/ready` (`503`),
+  `/health` (`200`), and `/metrics` remain observable while `/ws` rejects new
+  upgrades with `503`.
+- **Configuration, TLS reload, and healthcheck fixes.** `Config::validate` now
+  rejects wildcard/specific IP collisions on the same port and address family
+  (matching Linux `EADDRINUSE`); `TlsReloader` serialises reloads across
+  `SIGHUP` (now run via `spawn_blocking`) and the 30 s watcher; `src/main.rs`
+  adds `#![forbid(unsafe_code)]`; `paseo-relay healthcheck` ignores empty
+  `PASEO_RELAY_TLS_CERT`/`KEY` values, ignores port `0`, brackets IPv6 `Host`
+  headers, and defaults to `PASEO_RELAY_OPS_HOST`/`PASEO_RELAY_HOST` when bound
+  to a non-wildcard IP; `tokio` production features are narrowed from `full` to
+  the exact modules used.
+- **Unfinished messages can be closed where they were not before.** A message
+  that stalls for 30 s is closed even on an idle node, and on a node whose
+  ingress budget is full a large upload that is slower than 64 KiB/s or has
+  been arriving for more than 60 s gives way to a newer one (`1013`,
+  retryable). Raise `PASEO_RELAY_READ_STALL_TIMEOUT_MS`,
+  `PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS` or the budget, or lower
+  `PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES`, for slow links.
+- **`SIGHUP` reloads TLS instead of terminating the process.** Earlier
+  versions did not handle the signal.
+- The small-message reserve is extra budget: worst-case in-flight accounting
+  is now `INGRESS_BUDGET_BYTES + INGRESS_SMALL_RESERVE_BYTES` (16 MiB weighted,
+  about 4 MiB of payload, by default). Set the reserve to `0` for the old
+  total.
+- `paseo_relay_active_sessions` no longer includes empty sessions, and
+  `PASEO_RELAY_SESSION_IDLE_MS` only governs a safety-net sweep.
+- A connection refused at accept on a native-TLS listener is closed without a
+  response; it used to get a plaintext `503` that a TLS client cannot read.
+- Faster forwarding: a frame header and a small payload are read with one
+  socket read instead of three, and a frame's header and payload are written
+  with one write instead of two. Same-host A/B, 100 pairs: 52–58k → 58–70k
+  round trips/s at 1 KiB (`docs/benchmarks.md`). An idle WebSocket costs about
+  0.8 KiB more (13.5 → 14.3 KiB on macOS/arm64); the `× ~30 KiB` planning
+  figure is unchanged.
+- Dependencies: `url` was used only by one test helper and `serde`'s derive
+  feature not at all; removing them takes 28 packages (the ICU/IDNA tree) out
+  of the build, 135 → 107. `rcgen` is a new dev-dependency for the TLS tests.
+- The library's supported surface is `Config`, `serve` and `ServerHandle`
+  (plus the `config` module). The other modules remain public for the fuzz
+  targets but are hidden from the documentation and may change in any
+  release. `ServerHandle` gains `ops_local_addr` and `reload_tls`.
+- Examples: the systemd unit sets `LimitNOFILE=65536` (the default soft limit
+  of 1024 is far below the relay's connection caps) and `ExecReload`; the
+  Kubernetes example sets `enableServiceLinks: false`, because a Service named
+  `paseo-relay` otherwise injects `PASEO_RELAY_PORT=tcp://...` into the pod;
+  nginx answers its own rate limits with `429`. Operations-listener settings
+  are included commented out, because the pinned `v0.1.2` image predates
+  them.
+
 ## [0.1.2] - 2026-11-08
 
 ### Security
