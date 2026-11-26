@@ -26,6 +26,15 @@ if ! rustc --version 2>/dev/null | grep -q 'nightly'; then
   exit 2
 fi
 
+# cargo-fuzz defaults to the target its own binary was built for. The prebuilt
+# binary installed in CI is a musl build, and ASan cannot link against musl's
+# static libc; always build and fuzz for the host target instead.
+host="$(rustc -vV | sed -n 's/^host: //p')"
+if [[ -z "${host}" ]]; then
+  echo "could not determine the host target from rustc -vV" >&2
+  exit 2
+fi
+
 # The four untrusted-input boundaries. Keep in sync with fuzz/Cargo.toml.
 readonly targets=(frame_reader handshake protocol upgrade)
 
@@ -33,7 +42,7 @@ for target in "${targets[@]}"; do
   echo "==> fuzz ${target} (${seconds}s)"
   # Inputs are capped at 64 KiB: every parser here is driven by a few header
   # bytes, and long inputs only slow the search down.
-  cargo fuzz run "${target}" -- \
+  cargo fuzz run --target "${host}" "${target}" -- \
     -max_total_time="${seconds}" -max_len=65536 -print_final_stats=1
 done
 
