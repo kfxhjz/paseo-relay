@@ -41,14 +41,14 @@ cargo run --release --example load -- \
 ps -o rss= -p "$(pgrep -f target/release/paseo-relay)"
 ```
 
-## Change since v0.1.2 (unreleased)
+## Change since v0.1.2 (0.1.3)
 
 Same-host A/B on 2026-11-26 (Apple M3, 8 cores, macOS 27.2.1, Rust 1.99.1):
-`main` at `4a60da1`, whose sources are identical to `v0.1.2`, against the
-unreleased tree. Both are release builds, the runs are interleaved, three runs
+`main` at `4a60da1`, whose sources are identical to `v0.1.2`, against
+`0.1.3`. Both are release builds, the runs are interleaved, three runs
 each, with the command above and `--size` varied.
 
-| Workload (100 pairs × 500 round trips) | `v0.1.2` sources | Unreleased |
+| Workload (100 pairs × 500 round trips) | `v0.1.2` sources | 0.1.3 |
 |---|---|---|
 | 64 B text | 52.8–55.3k msg/s | 56.3–68.2k msg/s |
 | 1 KiB text | 52.1–58.4k msg/s | 58.5–70.0k msg/s |

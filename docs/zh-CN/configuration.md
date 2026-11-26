@@ -54,7 +54,7 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 | `PASEO_RELAY_HEALTHCHECK_HOST` | 监听地址 / `127.0.0.1` | `paseo-relay healthcheck` 自检使用的 host 覆盖项。未设置时，若监听绑定到具体 IP 则跟随 `PASEO_RELAY_OPS_HOST`（启用 `PASEO_RELAY_OPS_PORT` 时）或 `PASEO_RELAY_HOST`；绑定通配地址时回退到 `127.0.0.1`（`::` 回退到 `::1`）。 |
 | `PASEO_RELAY_BUILD_REVISION` | 构建时推导 | 嵌入 `/version` 和指标的 revision；覆盖 git 推导值。 |
 
-**`v0.1.2` 之后新增：** `PASEO_RELAY_OPS_HOST`、`PASEO_RELAY_OPS_PORT`、
+**`v0.1.3` 新增：** `PASEO_RELAY_OPS_HOST`、`PASEO_RELAY_OPS_PORT`、
 `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`、
 `PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES`、
 `PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES`、

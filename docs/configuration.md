@@ -58,7 +58,7 @@ it does not know; see [Startup warnings](#startup-warnings).
 | `PASEO_RELAY_HEALTHCHECK_HOST` | listener host / `127.0.0.1` | Host override for the `paseo-relay healthcheck` self-probe. When unset, follows `PASEO_RELAY_OPS_HOST` (if `PASEO_RELAY_OPS_PORT` is set) or `PASEO_RELAY_HOST` when bound to a specific IP, falling back to `127.0.0.1` (or `::1` for `::`) on wildcard binds. |
 | `PASEO_RELAY_BUILD_REVISION` | build-derived | Build-time revision embedded in `/version` and metrics; overrides the git-derived value. |
 
-**Added after `v0.1.2`:** `PASEO_RELAY_OPS_HOST`, `PASEO_RELAY_OPS_PORT`,
+**Added in `v0.1.3`:** `PASEO_RELAY_OPS_HOST`, `PASEO_RELAY_OPS_PORT`,
 `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`,
 `PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES`,
 `PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES`,

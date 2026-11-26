@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-26
+
 Fixes for the 2026-11 security and project review. No wire-protocol change:
 Paseo's `relay-transport` E2E suite passes unchanged (9 passed, 2 skipped, as
 before). Read "Changed" before upgrading; a few defaults behave differently.
@@ -52,6 +54,25 @@ before). Read "Changed" before upgrading; a few defaults behave differently.
     headers with `403` using a precomputed `HashSet`.
   - Release verification now runs `cargo audit --deny warnings` on both lockfiles
     and smoke-tests the published image by immutable `@sha256:` digest.
+- **Watchdog nudges, write cancellation, and stall accounting had edge cases.**
+  - A v2 client that attached after the session's single control watchdog had
+    already sent its nudge could be closed `1011` without a `sync` of its own.
+    The watchdog now records when the nudge was sent, nudges later arrivals,
+    and always grants a full post-nudge grace window.
+  - Cancelling a destination writer now drains its queue before flushing the
+    close frame, so byte permits and ingress budget guards are released at once
+    even when the peer stopped reading. The close flush is capped at two
+    seconds, and a cancel during a stalled write returns the budget instead of
+    waiting out the delivery window. An ordinary control-socket disconnect is
+    no longer counted as a slow-consumer shed.
+  - Control-frame payload reads (Ping/Pong/Close) are bounded by the remaining
+    stall window, and a one-byte continuation header no longer restarts it;
+    relay-imposed budget waits do not count against the sender's stall clock.
+    Under pressure, reclaim keeps evicting until the waiter's need is met, up
+    to the victim cap, so tiny old holds cannot shield a large one.
+  - The pre-upgrade TCP and per-IP slot is released only after the HTTP `101`
+    upgrade completes, with the wait bounded by `HTTP_HEADER_TIMEOUT_MS`
+    instead of a fixed ten seconds.
 - **Ingress budget could be held for free.** Two connections that each sent an
   unfinished ~32 MiB fragment and then went idle reserved the whole 129 MiB
   budget of the Compose/Kubernetes examples (four connections for the 512 MiB
@@ -345,7 +366,8 @@ invariants.
   their own deadline.
 - Invalid UTF-8 IDs are rejected with HTTP 400, never encoded or crashed on.
 
-[Unreleased]: https://github.com/kfxhjz/paseo-relay/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/kfxhjz/paseo-relay/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.0
