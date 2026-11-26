@@ -6,17 +6,18 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
-      - "assets/logo.svg"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 # Build the MkDocs site and publish it to GitHub Pages. Pages must be enabled
 # with "GitHub Actions" as the source (Settings -> Pages), which also provides
-# the deployment URL and token used below.
+# the deployment URL and token used by the deploy job.
+#
+# Least privilege: the build job only reads the repository. Only the deploy job
+# gets the Pages/OIDC permissions it needs, so a compromised docs dependency or
+# theme cannot rewrite the site (or obtain an OIDC token) during the build.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -27,10 +28,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The docs build does not need a push-capable git credential; do not
+          # leave the workflow token in `.git/config` inside the mounted repo.
+          persist-credentials: false
       - name: Build documentation
+        # Mount only what the build reads (docs and mkdocs.yml, read-only) plus
+        # the output directory. The rest of the checkout — including `.git` and
+        # the workflow token, if any — is not visible to the third-party
+        # container, which runs plugins/theme hooks that are effectively code.
         run: |
+          set -euo pipefail
+          mkdir -p site
           docker run --rm \
-            --volume "$PWD:/docs" \
+            --volume "$PWD/docs:/docs/docs:ro" \
+            --volume "$PWD/mkdocs.yml:/docs/mkdocs.yml:ro" \
+            --volume "$PWD/site:/docs/site" \
             --workdir /docs \
             --env NO_MKDOCS_2_WARNING=1 \
             squidfunk/mkdocs-material@sha256:f797da217ff01b20b298d2185eb9d88fb81f5a322c439eba854f2e4de8a48e65 \
@@ -42,6 +55,11 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow defaults: the deploy action
+    # needs exactly these two scopes (and no repository write access).
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

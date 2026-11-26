@@ -16,6 +16,34 @@ groups:
           severity: warning
         annotations:
           summary: "Relay {{ $labels.instance }} is rejecting WebSocket upgrades"
+      # Per-session and per-connection caps are counted separately from the
+      # global MAX_SESSIONS ceiling (session_rejections_total). A sustained
+      # stream from either one is single-tenant abuse or a mis-sized limit, not
+      # cluster capacity exhaustion.
+      - alert: PaseoRelaySessionConnectionRejections
+        expr: increase(paseo_relay_session_connection_rejections_total[5m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} is rejecting clients over a session connection cap"
+      - alert: PaseoRelayClientLimitRejections
+        expr: increase(paseo_relay_client_limit_rejections_total[5m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} is rejecting clients over a per-connection client cap"
+      # The operations listener has its own small connection budget. Rejections
+      # here mean /ready, /metrics and container probes may be unreachable even
+      # though the public listener is fine.
+      - alert: PaseoRelayOpsRejections
+        expr: increase(paseo_relay_ops_rejections_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} is rejecting operations-listener connections"
       - alert: PaseoRelaySlowConsumers
         expr: increase(paseo_relay_slow_consumer_disconnects_total[5m]) > 10
         for: 5m

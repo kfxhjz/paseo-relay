@@ -27,12 +27,27 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # rust-toolchain.toml pins 1.99.1; install the same version here so the
-      # CI result matches local development.
+      # rust-toolchain.toml pins 1.100.0; install the same version here so
+      # the CI result matches local development and the Docker builder image.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: rustfmt
+      - name: Toolchain pins agree
+        # The Docker builder, rust-toolchain.toml, and the CI/release jobs must
+        # all compile with the same compiler; otherwise the released binary is
+        # produced by a toolchain that never ran the test suite.
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          test -n "${toolchain}"
+          docker_tag="$(sed -n 's/^FROM rust:\([^-@]*\).*/\1/p' Dockerfile)"
+          test "${toolchain}" = "${docker_tag}"
+          for workflow in ci.yml release.yml paseo-compat.yml; do
+            grep -Fq "toolchain: \"${toolchain}\"" ".github/workflows/${workflow}"
+          done
+          echo "Rust toolchain pins agree: ${toolchain}"
       - name: Documentation links and Chinese/English pairing
         run: python3 scripts/check-docs.py
       - run: cargo fmt --all --check
@@ -45,7 +60,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --all-targets -- -D warnings
@@ -58,7 +73,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked
 
@@ -70,7 +85,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo build --release --locked
 
@@ -128,6 +143,18 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-fuzz
+      - name: Restore fuzz corpus
+        # The corpus is gitignored local state; restoring it makes each PR run
+        # start from the coverage found by earlier runs instead of only the
+        # tracked seeds. `cp -n` in scripts/fuzz.sh keeps seeds from clobbering
+        # entries the fuzzer has already grown.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ hashFiles('fuzz/seeds/**') }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-${{ hashFiles('fuzz/seeds/**') }}-
+            fuzz-corpus-${{ runner.os }}-
       - name: Build and run every fuzz target
         # `rust-toolchain.toml` pins the stable toolchain for this checkout and
         # rustup prefers it over the installed default; select the pinned
@@ -146,10 +173,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-audit
       - run: cargo audit --deny warnings
       # The fuzz crate has its own lockfile (libfuzzer-sys and friends).
       - run: cargo audit --deny warnings --file fuzz/Cargo.lock
+      # Every crate shared by the fuzz crate and the relay must resolve to the
+      # same version, or the audit above covers a different dependency graph
+      # than the one that gets released.
+      - name: Fuzz lockfile matches the root lockfile
+        run: scripts/check-fuzz-lock.sh
+      # A lockfile that cannot satisfy fuzz/Cargo.toml (for example after a
+      # root dependency was added) would be silently rewritten by cargo-fuzz.
+      - name: Fuzz lockfile resolves with --locked
+        run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null

@@ -19,18 +19,85 @@ jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
+    outputs:
+      # Tag semantics and the "may this release move latest?" decision are
+      # computed once here, but the publish job re-checks `latest` right before
+      # promoting so a long environment approval cannot reintroduce a race.
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      promote_latest: ${{ steps.tag.outputs.promote_latest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Validate release tag semantics
+        id: tag
+        shell: bash
+        # A release tag is a promise: it must be a strict vX.Y.Z[-prerelease]
+        # string, must match the Cargo.toml version at that commit, and must
+        # have a CHANGELOG section. Without these checks a writable account
+        # could push `v9.9.9` (or a typo) on an old commit and publish old code
+        # with a valid signature and the floating `latest` tag.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "release tags must match ^v<major>.<minor>.<patch>(-<prerelease>)?: ${tag}" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          cargo_version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as handle:
+              print(tomllib.load(handle)["package"]["version"])
+          PY
+          )"
+          if [ "${cargo_version}" != "${version}" ]; then
+            echo "tag ${tag} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+          if ! grep -Fq "## [${version}]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [${version}]' section" >&2
+            exit 1
+          fi
+          # `latest` means "highest stable release tag on main", not "the tag
+          # that happened to publish last". Compare against every stable tag
+          # reachable from main (scripts/highest-stable-tag.sh ignores
+          # prereleases and tags outside main, so neither can move or freeze
+          # latest).
+          git fetch --no-tags origin main
+          git fetch --force --tags origin '+refs/tags/*:refs/tags/*'
+          highest="$(scripts/highest-stable-tag.sh)"
+          stable=true
+          if [[ "${version}" == *-* ]]; then
+            stable=false
+          fi
+          promote_latest=false
+          if [ "${stable}" = true ]; then
+            if [ -z "${highest}" ] \
+                || [ "$(printf '%s\n%s\n' "${highest}" "${version}" | sort -V | tail -n1)" = "${version}" ]; then
+              promote_latest=true
+            fi
+          fi
+          {
+            echo "version=${version}"
+            echo "prerelease=$([ "${stable}" = true ] && echo false || echo true)"
+            echo "promote_latest=${promote_latest}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "Release tag: \`${tag}\`"
+            echo "Highest stable tag on main: \`${highest:-none}\`"
+            echo "May move \`latest\`: \`${promote_latest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Ensure the tag commit is on main
         run: |
+          set -euo pipefail
           git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
@@ -44,6 +111,21 @@ jobs:
       - run: cargo audit --deny warnings
       - run: cargo audit --deny warnings --file fuzz/Cargo.lock
       - run: cargo build --release --locked
+      # Release must not ship fuzz targets that no longer build or crash on
+      # the committed seed corpus: run the same pinned nightly and the same
+      # command as the required `Fuzz targets (build + smoke run)` CI job.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned
+        with:
+          toolchain: nightly-2026-11-20
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz smoke test
+        env:
+          # rust-toolchain.toml pins stable; select the pinned nightly for
+          # cargo-fuzz's sanitizer flags, exactly as ci.yml does.
+          RUSTUP_TOOLCHAIN: nightly-2026-11-20
+        run: scripts/fuzz.sh 20
 
   image:
     name: Build ${{ matrix.platform }} image
@@ -108,11 +190,18 @@ jobs:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   publish:
     name: Publish multi-arch image and release
-    needs: image
+    needs: [verify, image]
+    # Human gate for publication. Repository admins must configure the
+    # `release` environment with required reviewers; a workflow cannot grant
+    # itself that protection. The approval is requested after the untagged
+    # per-platform digests are built and before anything becomes visible under
+    # a version or `latest` tag.
+    environment:
+      name: release
     # Assemble the GHCR manifest and push its signature and attestation
     # (`packages: write`), create the GitHub release (`contents: write`), and
     # sign keylessly as this workflow (`id-token: write`,
@@ -123,8 +212,14 @@ jobs:
       id-token: write
       attestations: write
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Needed to re-evaluate the highest stable tag at promotion time; the
+          # token must not be persisted, nothing here pushes to the repository.
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/digests
@@ -136,28 +231,28 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create multi-arch manifest
-        id: merge
+      # Publication is staged behind a temporary tag: the multi-arch index is
+      # assembled under `candidate-<sha>`, smoke-tested, signed, and attested
+      # *before* the version tag or `latest` exists. `candidate-*` is not a
+      # release tag, so a failure here leaves users on the previous release and
+      # never moves `latest`.
+      - name: Create candidate multi-arch manifest
+        id: candidate
+        env:
+          CANDIDATE_TAG: candidate-${{ github.sha }}
         run: |
           set -euo pipefail
           name="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tag="${GITHUB_REF_NAME}"
           sources=()
+          # Sorted so the index is built from the same source order every time;
+          # the promotion step rebuilds the index from these same sources and
+          # must produce the identical (signed) digest.
           while IFS= read -r -d '' file; do
             sources+=("${name}@sha256:$(basename "${file}")")
-          done < <(find /tmp/digests -type f -print0)
+          done < <(find /tmp/digests -type f -print0 | sort -z)
           if [ "${#sources[@]}" -ne 2 ]; then
             echo "expected 2 platform digests, found ${#sources[@]}" >&2
             exit 1
-          fi
-          # Move the floating `latest` tag only for stable releases. Prerelease
-          # tags such as `v1.0.0-rc1` or `v1.0.0-beta.1` contain a '-' and must
-          # not become `latest`, otherwise a pre-release would silently replace
-          # the current stable image. Every tag (including prereleases) still
-          # gets its own immutable version tag.
-          tag_args=(--tag "${name}:${tag}")
-          if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
-            tag_args+=(--tag "${name}:latest")
           fi
           # GitHub reads the package description, license, and linked repository
           # from annotations on the OCI image *index* for multi-arch images.
@@ -170,17 +265,57 @@ jobs:
           )
           docker buildx imagetools create \
             "${annotation_args[@]}" \
-            "${tag_args[@]}" \
+            --tag "${name}:${CANDIDATE_TAG}" \
             "${sources[@]}"
-          digest="$(docker buildx imagetools inspect "${name}:${tag}" | awk '/^Digest:/ {print $NF; exit}')"
+          digest="$(docker buildx imagetools inspect "${name}:${CANDIDATE_TAG}" | awk '/^Digest:/ {print $NF; exit}')"
           test -n "${digest}"
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "Platforms: linux/amd64, linux/arm64" >> "$GITHUB_STEP_SUMMARY"
-      - name: Smoke-test the published image
+          {
+            echo "name=${name}"
+            echo "digest=${digest}"
+            echo "candidate=${CANDIDATE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Created candidate ${name}:${CANDIDATE_TAG} (${digest})" >> "$GITHUB_STEP_SUMMARY"
+      # Rebuild the index from the same sorted platform digests and
+      # annotations before any version/latest tag moves. If buildx is not
+      # deterministic, this fails while only the scratch candidate tags exist;
+      # the release stays unpublished. This is the reproducibility check that
+      # previously required a manual dry-run in a test repository.
+      - name: Verify the candidate index is reproducible
+        env:
+          NAME: ${{ steps.candidate.outputs.name }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.candidate }}
         run: |
           set -euo pipefail
-          ref="${{ steps.merge.outputs.name }}@${{ steps.merge.outputs.digest }}"
+          sources=()
+          while IFS= read -r -d '' file; do
+            sources+=("${NAME}@sha256:$(basename "${file}")")
+          done < <(find /tmp/digests -type f -print0 | sort -z)
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "expected 2 platform digests, found ${#sources[@]}" >&2
+            exit 1
+          fi
+          annotation_args=(
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            --annotation "index:org.opencontainers.image.description=Self-hostable, wire-compatible relay for Paseo, written in Rust"
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0"
+          )
+          replay="${NAME}:${CANDIDATE_TAG}-replay"
+          docker buildx imagetools create \
+            "${annotation_args[@]}" \
+            --tag "${replay}" \
+            "${sources[@]}"
+          replay_digest="$(docker buildx imagetools inspect "${replay}" | awk '/^Digest:/ {print $NF; exit}')"
+          test -n "${replay_digest}"
+          if [ "${replay_digest}" != "${CANDIDATE_DIGEST}" ]; then
+            echo "index rebuild is not reproducible: ${replay_digest} != ${CANDIDATE_DIGEST}" >&2
+            exit 1
+          fi
+          echo "Candidate index is reproducible: \`${CANDIDATE_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke-test the candidate image
+        run: |
+          set -euo pipefail
+          ref="${{ steps.candidate.outputs.name }}@${{ steps.candidate.outputs.digest }}"
           container=paseo-relay-release-check
           trap 'docker rm --force "${container}" >/dev/null 2>&1 || true' EXIT
           docker run --detach --name "${container}" --read-only --cap-drop ALL \
@@ -200,11 +335,13 @@ jobs:
           cosign-release: "v2.4.1"
       # Sign the image itself, so `cosign verify <image>@<digest>` works. The
       # signature is stored in GHCR next to the image and is bound to this
-      # workflow's identity through Sigstore (keyless).
+      # workflow's identity through Sigstore (keyless). Signatures are attached
+      # to the digest, so they remain valid when the digest is later promoted
+      # to the version tag and `latest`.
       - name: Sign the multi-arch image
         env:
-          IMAGE: ${{ steps.merge.outputs.name }}
-          DIGEST: ${{ steps.merge.outputs.digest }}
+          IMAGE: ${{ steps.candidate.outputs.name }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           set -euo pipefail
           cosign sign --yes "${IMAGE}@${DIGEST}"
@@ -215,8 +352,8 @@ jobs:
       - name: Attest build provenance for the multi-arch image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ${{ steps.merge.outputs.name }}
-          subject-digest: ${{ steps.merge.outputs.digest }}
+          subject-name: ${{ steps.candidate.outputs.name }}
+          subject-digest: ${{ steps.candidate.outputs.digest }}
           push-to-registry: true
       # Convenience copy of the digest as a release asset, with a detached
       # signature. This signs a text file, not the image: use the commands in
@@ -224,17 +361,89 @@ jobs:
       - name: Sign the image digest file
         run: |
           set -euo pipefail
-          printf '%s\n' "${{ steps.merge.outputs.digest }}" > image-digest.txt
+          printf '%s\n' "${{ steps.candidate.outputs.digest }}" > image-digest.txt
           cosign sign-blob --yes \
             --output-signature image-digest.txt.sig \
             --output-certificate image-digest.txt.pem \
             image-digest.txt
+      # Promotion is the only step that creates a version or `latest` tag, and
+      # it runs after smoke, signature, and provenance succeeded. The
+      # provenance and signature cover the digest, so as long as promotion
+      # reproduces the same index digest users can verify what they pull.
+      #
+      # `latest` is re-decided here (not only in verify) against tags fetched
+      # at this moment: the environment approval may have waited while a newer
+      # stable tag was pushed, and an older pending release must never win.
+      - name: Promote candidate to release and latest tags
+        id: promote
+        env:
+          NAME: ${{ steps.candidate.outputs.name }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.candidate }}
+          VERSION_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION_TAG#v}"
+          git fetch --no-tags origin main
+          git fetch --force --tags origin '+refs/tags/*:refs/tags/*'
+          highest="$(scripts/highest-stable-tag.sh)"
+          stable=true
+          if [[ "${version}" == *-* ]]; then
+            stable=false
+          fi
+          promote_latest=false
+          if [ "${stable}" = true ]; then
+            if [ -z "${highest}" ] \
+                || [ "$(printf '%s\n%s\n' "${highest}" "${version}" | sort -V | tail -n1)" = "${version}" ]; then
+              promote_latest=true
+            fi
+          fi
+          echo "promote_latest=${promote_latest}" >> "$GITHUB_OUTPUT"
+          tags=("${VERSION_TAG}")
+          if [ "${promote_latest}" = true ]; then
+            tags+=(latest)
+            echo "Will move latest: ${version} is the highest stable tag on main" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Not moving latest: highest stable tag on main is ${highest:-none}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # The replay step above proved that rebuilding the index from the
+          # platform digests reproduces the signed/attested candidate. Verify
+          # that copying that digest preserves it before touching a release
+          # tag; then promote by copying the candidate digest rather than
+          # rebuilding a second index.
+          promote_check="${CANDIDATE_TAG}-promote"
+          docker buildx imagetools create \
+            --tag "${NAME}:${promote_check}" \
+            "${NAME}@${CANDIDATE_DIGEST}"
+          check_digest="$(docker buildx imagetools inspect "${NAME}:${promote_check}" | awk '/^Digest:/ {print $NF; exit}')"
+          if [ "${check_digest}" != "${CANDIDATE_DIGEST}" ]; then
+            echo "copying ${NAME}@${CANDIDATE_DIGEST} to ${promote_check} produced ${check_digest}" >&2
+            exit 1
+          fi
+          for tag in "${tags[@]}"; do
+            docker buildx imagetools create \
+              --tag "${NAME}:${tag}" \
+              "${NAME}@${CANDIDATE_DIGEST}"
+            digest="$(docker buildx imagetools inspect "${NAME}:${tag}" | awk '/^Digest:/ {print $NF; exit}')"
+            if [ "${digest}" != "${CANDIDATE_DIGEST}" ]; then
+              echo "${NAME}:${tag} resolved to ${digest}, expected the signed candidate ${CANDIDATE_DIGEST}" >&2
+              # Best effort: retry the copy once. The scratch preflight above
+              # is the real protection; if the retry still mismatches, fail
+              # without creating a GitHub release.
+              docker buildx imagetools create \
+                --tag "${NAME}:${tag}" \
+                "${NAME}@${CANDIDATE_DIGEST}" || true
+              exit 1
+            fi
+            echo "Promoted ${NAME}:${tag} -> ${digest}"
+            echo "Promoted \`${NAME}:${tag}\` -> \`${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Record immutable image reference
         run: |
           {
             echo "## Image"
             echo ""
-            echo "Published \`${{ steps.merge.outputs.name }}@${{ steps.merge.outputs.digest }}\`"
+            echo "Published \`${{ steps.candidate.outputs.name }}@${{ steps.candidate.outputs.digest }}\`"
             echo "The image is signed (cosign, keyless) and has a GitHub build provenance attestation."
             echo "Per-platform provenance and SBOM attestations were attached by buildx."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -250,20 +459,23 @@ jobs:
             image-digest.txt.sig
             image-digest.txt.pem
           # Do not let a prerelease tag become the repository's "Latest
-          # release"; only stable tags (no '-') are candidates.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # release"; only stable tags (no '-') are candidates. An out-of-order
+          # stable release (a higher tag already exists on main) also must not
+          # take over the latest marker.
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+          make_latest: ${{ steps.promote.outputs.promote_latest }}
           body: |
             Published container image:
-            `${{ steps.merge.outputs.name }}@${{ steps.merge.outputs.digest }}`
+            `${{ steps.candidate.outputs.name }}@${{ steps.candidate.outputs.digest }}`
 
             Verify the signature and the build provenance before deploying:
 
             ```sh
-            cosign verify ${{ steps.merge.outputs.name }}@${{ steps.merge.outputs.digest }} \
+            cosign verify ${{ steps.candidate.outputs.name }}@${{ steps.candidate.outputs.digest }} \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               --certificate-identity-regexp '^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/v'
 
-            gh attestation verify oci://${{ steps.merge.outputs.name }}@${{ steps.merge.outputs.digest }} \
+            gh attestation verify oci://${{ steps.candidate.outputs.name }}@${{ steps.candidate.outputs.digest }} \
               --repo ${{ github.repository }}
             ```
 
