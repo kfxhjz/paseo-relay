@@ -505,8 +505,12 @@ async fn ingress_budget_rejects_excess_sources() {
     // Must admit one maximum message including chunk bookkeeping; direct test
     // configs bypass the env parser's 128 MiB floor.
     config.ingress_budget_bytes = 205_000;
+    // These 1 KiB messages would otherwise all fit in the small reserve.
+    config.ingress_small_reserve_bytes = 0;
     config.ingress_wait_timeout = Duration::from_millis(50);
-    config.data_attach_timeout = Duration::from_millis(500);
+    // Longer than the collection window below, so a 1013 seen there is the
+    // budget, not "Data route unavailable".
+    config.data_attach_timeout = Duration::from_secs(5);
     let (server, addr) = start(config).await;
 
     // Each client waits for a data route that never appears, holding one
@@ -530,12 +534,17 @@ async fn ingress_budget_rejects_excess_sources() {
         if let Ok(Some(Ok(Message::Close(Some(frame))))) =
             tokio::time::timeout(Duration::from_millis(800), client.next()).await
         {
-            if u16::from(frame.code) == 1013 {
+            if u16::from(frame.code) == 1013 && frame.reason.as_str() == "Relay ingress capacity" {
                 rejected += 1;
             }
         }
     }
     assert!(rejected > 0, "expected at least one capacity close");
+    let (_, metrics) = http_get(addr, "/metrics").await;
+    assert!(
+        !metrics.contains("paseo_relay_ingress_rejections_total 0"),
+        "budget closes must be counted"
+    );
     server.shutdown().await;
 }
 
@@ -989,6 +998,1130 @@ async fn tcp_slot_is_held_for_upgraded_sockets() {
         status,
         Some(200),
         "TCP slot must be released when the socket ends"
+    );
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the 2026-11 review findings.
+// ---------------------------------------------------------------------------
+
+/// Masked frame header with an all-zero mask key, so payload bytes can be
+/// written as they are.
+fn frame_header(fin: bool, opcode: u8, length: usize) -> Vec<u8> {
+    let mut out = masked_frame_header(opcode, length, [0, 0, 0, 0]);
+    if !fin {
+        out[0] &= 0x7F;
+    }
+    out
+}
+
+async fn write_zeros(stream: &mut TcpStream, mut bytes: usize) {
+    let block = vec![0u8; 256 * 1024];
+    while bytes > 0 {
+        let step = bytes.min(block.len());
+        stream.write_all(&block[..step]).await.unwrap();
+        bytes -= step;
+    }
+    stream.flush().await.unwrap();
+}
+
+/// Send one non-final binary fragment of `bytes` and then go silent, keeping
+/// the socket open: an in-progress message that never finishes.
+async fn park_unfinished_fragment(addr: std::net::SocketAddr, id: &str, bytes: usize) -> TcpStream {
+    let mut stream = raw_ws(addr, &format!("serverId={id}&role=client")).await;
+    stream
+        .write_all(&frame_header(false, 0x2, bytes))
+        .await
+        .unwrap();
+    write_zeros(&mut stream, bytes).await;
+    stream
+}
+
+async fn metric(addr: std::net::SocketAddr, name: &str) -> u64 {
+    let (_, body) = http_get(addr, "/metrics").await;
+    body.lines()
+        .find(|line| line.split_whitespace().next() == Some(name))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("metric {name} missing"))
+}
+
+async fn wait_for_metric(addr: std::net::SocketAddr, name: &str, want: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let value = metric(addr, name).await;
+        if value == want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{name} stayed at {value}, expected {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Close code and reason the relay sent on a raw socket, if any.
+async fn raw_close(stream: &mut TcpStream, wait: Duration) -> Option<(u16, String)> {
+    let mut received = Vec::new();
+    let _ = tokio::time::timeout(wait, stream.read_to_end(&mut received)).await;
+    parse_close(&received)
+}
+
+/// First close frame in bytes received from the relay.
+fn parse_close(received: &[u8]) -> Option<(u16, String)> {
+    let at = received.iter().position(|byte| *byte == 0x88)?;
+    let length = usize::from(*received.get(at + 1)?);
+    let payload = received.get(at + 2..at + 2 + length)?;
+    let code = u16::from_be_bytes([*payload.first()?, *payload.get(1)?]);
+    Some((code, String::from_utf8_lossy(&payload[2..]).into_owned()))
+}
+
+async fn next_within(ws: &mut Client, wait: Duration) -> Option<Message> {
+    match tokio::time::timeout(wait, ws.next()).await {
+        Ok(Some(Ok(message))) => Some(message),
+        _ => None,
+    }
+}
+
+/// Wait for a binary message of `filler` bytes repeated `length` times.
+/// Panics with a short description instead of dumping the payload.
+async fn expect_binary(ws: &mut Client, wait: Duration, filler: u8, length: usize, what: &str) {
+    match next_within(ws, wait).await {
+        Some(Message::Binary(payload)) => {
+            assert_eq!(payload.len(), length, "{what}: wrong length");
+            assert!(
+                payload.iter().all(|byte| *byte == filler),
+                "{what}: payload corrupted"
+            );
+        }
+        Some(Message::Close(frame)) => panic!("{what}: closed instead ({frame:?})"),
+        Some(other) => panic!("{what}: unexpected {} frame", message_kind(&other)),
+        None => panic!("{what}: nothing arrived within {wait:?}"),
+    }
+}
+
+fn message_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Text(_) => "text",
+        Message::Binary(_) => "binary",
+        Message::Ping(_) => "ping",
+        Message::Pong(_) => "pong",
+        Message::Close(_) => "close",
+        Message::Frame(_) => "raw",
+    }
+}
+
+/// A small relay whose bulk budget is exactly one maximum (256 KiB) message.
+fn tight_budget_config() -> Config {
+    let mut config = test_config();
+    config.max_message_bytes = 256 * 1024;
+    config.ingress_budget_bytes = config.max_message_weighted_charge();
+    config.ingress_small_reserve_bytes = 0;
+    config.ingress_wait_timeout = Duration::from_secs(2);
+    config
+}
+
+/// Fill `tight_budget_config`'s bulk budget to the last byte with two
+/// unfinished fragments. Returns the large and the small holder.
+async fn pin_tight_budget(addr: std::net::SocketAddr, budget: u64) -> (TcpStream, TcpStream) {
+    // 1024 + 32 * 32,960 weighted.
+    let large = park_unfinished_fragment(addr, "pin-large", 256 * 1024).await;
+    // 1024 + 5 * 32,960 + (7,648 * 4 + 192) weighted: the remainder.
+    let small = park_unfinished_fragment(addr, "pin-small", 5 * 8192 + 7648).await;
+    wait_for_metric(addr, "paseo_relay_ingress_reserved_bytes", budget).await;
+    (large, small)
+}
+
+#[tokio::test]
+async fn small_frame_reclaims_a_much_larger_unfinished_message() {
+    let config = tight_budget_config();
+    let budget = config.ingress_budget_bytes;
+    let (server, addr) = start(config).await;
+    let (mut large, _small) = pin_tight_budget(addr, budget).await;
+
+    // The budget is full and its holders are fresh, so nothing counts as
+    // stalled for another two seconds. A small frame must still get through
+    // before that, by displacing the large message once it has waited half of
+    // its own 2 s reservation wait.
+    let mut daemon = connect(addr, "serverId=victim&role=server").await;
+    let mut client = connect(addr, "serverId=victim&role=client").await;
+    client.send(Message::Text("hi".into())).await.unwrap();
+    assert_eq!(
+        next_within(&mut daemon, Duration::from_millis(1800)).await,
+        Some(Message::Text("hi".into())),
+        "small frame must be delivered while large messages hold the budget"
+    );
+
+    assert_eq!(
+        raw_close(&mut large, Duration::from_secs(2)).await,
+        Some((1013, "Relay ingress reclaimed".to_owned()))
+    );
+    assert!(metric(addr, "paseo_relay_ingress_reclaims_total").await >= 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_message_is_reclaimed_for_a_large_transfer() {
+    let config = tight_budget_config();
+    let budget = config.ingress_budget_bytes;
+    let (server, addr) = start(config).await;
+    let (mut large, _small) = pin_tight_budget(addr, budget).await;
+
+    // Long enough for both holders to count as stalled.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+
+    let mut daemon = connect(addr, "serverId=victim&role=server").await;
+    let mut client = connect(addr, "serverId=victim&role=client").await;
+    client
+        .send(Message::Binary(vec![7u8; 100 * 1024].into()))
+        .await
+        .unwrap();
+    expect_binary(
+        &mut daemon,
+        Duration::from_secs(3),
+        7,
+        100 * 1024,
+        "a large transfer must displace stalled messages",
+    )
+    .await;
+    assert_eq!(
+        raw_close(&mut large, Duration::from_secs(2)).await,
+        Some((1013, "Relay ingress reclaimed".to_owned()))
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_trickled_to_keep_its_budget_yields_to_a_newer_transfer() {
+    // A sender can avoid ever looking stalled by trickling. Budget it has
+    // held for longer than INGRESS_RECLAIM_AFTER must still give way.
+    let mut config = test_config();
+    config.max_message_bytes = 1024 * 1024;
+    config.ingress_budget_bytes = config.max_message_weighted_charge();
+    config.ingress_small_reserve_bytes = 0;
+    // Only a message that receives nothing at all counts as slow here, so
+    // this test cannot pass through the stalled/slow rule.
+    config.ingress_reclaim_min_rate_bytes = 0;
+    config.ingress_reclaim_after = Duration::from_secs(5);
+    config.ingress_wait_timeout = Duration::from_secs(2);
+    let (server, addr) = start(config).await;
+
+    // 850 KiB up front, then a few bytes five times a second for as long as
+    // the relay lets it: always making progress, never finishing. The burst
+    // is charged 3,503,168 of the 4,416,512 weighted bytes, which leaves less
+    // than the 1,237,120 a 300 KiB message needs.
+    let holder = park_unfinished_fragment(addr, "trickle", 850 * 1024).await;
+    let (mut holder_read, mut holder_write) = holder.into_split();
+    let trickle = tokio::spawn(async move {
+        let mut frame = frame_header(false, 0x0, 16);
+        frame.extend_from_slice(&[0u8; 16]);
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if holder_write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let holder_close = tokio::spawn(async move {
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(12),
+            holder_read.read_to_end(&mut received),
+        )
+        .await;
+        parse_close(&received)
+    });
+
+    // Once the holder is past its allowance, a 300 KiB transfer arrives. Not
+    // enough budget is left for it, so it has to wait.
+    tokio::time::sleep(Duration::from_millis(5400)).await;
+    // Nothing has been reclaimed so far: without a waiter, a message may take
+    // as long as it likes.
+    assert_eq!(metric(addr, "paseo_relay_ingress_reclaims_total").await, 0);
+    let mut daemon = connect(addr, "serverId=victim&role=server").await;
+    let mut client = connect(addr, "serverId=victim&role=client").await;
+    client
+        .send(Message::Binary(vec![5u8; 300 * 1024].into()))
+        .await
+        .unwrap();
+    expect_binary(
+        &mut daemon,
+        Duration::from_secs(4),
+        5,
+        300 * 1024,
+        "the newer transfer must be served once the old message has had its time",
+    )
+    .await;
+
+    assert_eq!(
+        holder_close.await.unwrap(),
+        Some((1013, "Relay ingress reclaimed".to_owned()))
+    );
+    trickle.abort();
+    assert!(metric(addr, "paseo_relay_ingress_reclaims_total").await >= 1);
+    assert_eq!(
+        metric(addr, "paseo_relay_ingress_rejections_total").await,
+        0
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn small_reserve_serves_small_frames_while_the_bulk_budget_is_exhausted() {
+    let mut config = tight_budget_config();
+    config.ingress_small_reserve_bytes = Config::default().ingress_small_reserve_bytes;
+    config.ingress_wait_timeout = Duration::from_millis(300);
+    config.data_attach_timeout = Duration::from_secs(5);
+    let (server, addr) = start(config).await;
+
+    // A complete 256 KiB message waiting for a data route holds most of the
+    // bulk budget, and it is not reclaimable: it is no longer incomplete.
+    let mut waiting = connect(addr, "serverId=bulk&role=client&v=2&connectionId=a").await;
+    waiting
+        .send(Message::Binary(vec![0u8; 256 * 1024].into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut daemon = connect(addr, "serverId=victim&role=server").await;
+    let mut client = connect(addr, "serverId=victim&role=client").await;
+
+    // Another large message cannot be admitted: the bulk pool is exhausted.
+    let mut blocked = connect(addr, "serverId=victim2&role=client").await;
+    let _blocked_peer = connect(addr, "serverId=victim2&role=server").await;
+    blocked
+        .send(Message::Binary(vec![0u8; 200 * 1024].into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_close(&mut blocked).await,
+        (1013, "Relay ingress capacity".to_owned())
+    );
+
+    // Small frames are unaffected.
+    for round in 0..5 {
+        let text = format!("small-{round}");
+        client
+            .send(Message::Text(text.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(expect_text(&mut daemon).await, text);
+    }
+    assert!(metric(addr, "paseo_relay_ingress_small_budget_bytes").await > 0);
+    drop(waiting);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn unfinished_fragments_no_longer_starve_other_sessions() {
+    // The attack from the review, at production settings with the 129 MiB
+    // budget every Compose/Kubernetes example uses: one ~32 MiB unfinished
+    // fragment reserves the bulk budget (all but 261,176 weighted bytes, which
+    // is less than any message above 64 KiB needs), and a second unfinished
+    // fragment used to take the rest.
+    let config = Config {
+        host: "127.0.0.1".parse().unwrap(),
+        port: 0,
+        shutdown_grace: Duration::from_millis(50),
+        ingress_budget_bytes: 135_266_304,
+        ..Config::default()
+    };
+    let (server, addr) = start(config).await;
+
+    let mut large = park_unfinished_fragment(addr, "atk-large", 33_554_418).await;
+    wait_for_metric(addr, "paseo_relay_ingress_reserved_bytes", 135_005_128).await;
+    // Non-final fragments are always charged to the bulk pool so a peer cannot
+    // park a small opening fragment in the small reserve and follow it with
+    // multi-megabyte continuations. Even with bulk filled to the exact ceiling,
+    // the small reserve stays untouched and bulk reclamation clears the stalls.
+    let _small = park_unfinished_fragment(addr, "atk-small", 64_654).await;
+    wait_for_metric(addr, "paseo_relay_ingress_reserved_bytes", 135_266_304).await;
+    assert_eq!(
+        metric(addr, "paseo_relay_ingress_small_reserved_bytes").await,
+        0
+    );
+
+    let mut daemon = connect(addr, "serverId=victim&role=server").await;
+    let mut client = connect(addr, "serverId=victim&role=client").await;
+
+    // Small frames: served from the reserve at once, the attack is invisible.
+    client.send(Message::Text("hi".into())).await.unwrap();
+    assert_eq!(
+        next_within(&mut daemon, Duration::from_secs(1)).await,
+        Some(Message::Text("hi".into()))
+    );
+
+    // A large transfer needs the bulk pool: the stalled holders are evicted
+    // for it well inside the 5 s reservation wait.
+    client
+        .send(Message::Binary(vec![3u8; 1024 * 1024].into()))
+        .await
+        .unwrap();
+    expect_binary(
+        &mut daemon,
+        Duration::from_secs(8),
+        3,
+        1024 * 1024,
+        "large transfer must complete once the stalled messages are reclaimed",
+    )
+    .await;
+    assert_eq!(
+        raw_close(&mut large, Duration::from_secs(2)).await,
+        Some((1013, "Relay ingress reclaimed".to_owned()))
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_fragment_gap_is_closed_by_the_stall_timeout() {
+    let mut config = test_config();
+    config.read_stall_timeout = Duration::from_millis(300);
+    let (server, addr) = start(config).await;
+
+    // A non-final fragment, then silence: the next fragment never comes.
+    let mut gap = park_unfinished_fragment(addr, "gap", 16).await;
+    // A frame that stops in the middle of its payload.
+    let mut partial = raw_ws(addr, "serverId=partial&role=client").await;
+    partial
+        .write_all(&frame_header(true, 0x2, 64 * 1024))
+        .await
+        .unwrap();
+    write_zeros(&mut partial, 10 * 1024).await;
+
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        raw_close(&mut gap, Duration::from_secs(3)).await,
+        Some((1013, "Relay read timeout".to_owned()))
+    );
+    assert_eq!(
+        raw_close(&mut partial, Duration::from_secs(3)).await,
+        Some((1013, "Relay read timeout".to_owned()))
+    );
+    // Far sooner than the 300 s frame / 600 s message deadlines.
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(metric(addr, "paseo_relay_read_timeouts_total").await >= 2);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_slot_is_released_as_soon_as_its_last_socket_closes() {
+    let mut config = test_config();
+    config.max_sessions = 3;
+    config.per_ip_max_connections = 1;
+    // The idle sweep must play no part in this.
+    config.session_idle = Duration::from_secs(3600);
+    let (server, addr) = start(config).await;
+
+    // One client, limited to a single concurrent WebSocket, cycling through
+    // far more serverIds than there are session slots.
+    for index in 0..20 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let url = format!("ws://{addr}/ws?serverId=churn-{index}&role=client&v=2");
+            match connect_async(url).await {
+                Ok((mut ws, _)) => {
+                    let _ = ws.close(None).await;
+                    break;
+                }
+                Err(error) => {
+                    // 429 while the previous socket is still being torn down
+                    // is expected; a session-capacity 503 never is.
+                    if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
+                        assert_eq!(response.status().as_u16(), 429, "connection {index}");
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "{error:?}");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+    }
+
+    wait_for_metric(addr, "paseo_relay_active_websockets", 0).await;
+    wait_for_metric(addr, "paseo_relay_active_sessions", 0).await;
+    let (ready, _) = http_get(addr, "/ready").await;
+    assert_eq!(ready, 200);
+    let _daemon = connect(addr, "serverId=legit&role=server").await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn per_ip_cap_also_bounds_pre_upgrade_sockets() {
+    let mut config = test_config();
+    config.per_ip_max_connections = 1;
+    let (server, addr) = start(config).await;
+
+    // per_ip_max_connections = 1 allows 9 TCP sockets per client (the
+    // WebSocket cap plus headroom for sockets still in the HTTP phase).
+    let mut held = Vec::new();
+    for _ in 0..9 {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET /health HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut chunk = [0u8; 256];
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(String::from_utf8_lossy(&chunk[..read]).starts_with("HTTP/1.1 200"));
+        held.push(stream);
+    }
+
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), extra.read_to_end(&mut response)).await;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 429") && response.contains("Per-IP connection limit"),
+        "tenth socket from one client must be refused, got {response:?}"
+    );
+
+    // The node itself is nowhere near its TCP cap, and the slot comes back.
+    drop(held);
+    let mut status = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        status = lenient_http_status(addr, "/health").await;
+        if status == Some(200) {
+            break;
+        }
+    }
+    assert_eq!(status, Some(200));
+    assert!(metric(addr, "paseo_relay_tcp_rejections_total").await >= 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ops_listener_takes_operations_endpoints_off_the_public_port() {
+    let mut config = test_config();
+    config.ops_port = Some(0);
+    let (server, addr) = start(config).await;
+    let ops = server.ops_local_addr().expect("operations listener bound");
+    assert_ne!(ops, addr);
+
+    assert_eq!(http_get(addr, "/health").await.0, 200);
+    for path in ["/ready", "/metrics", "/version"] {
+        assert_eq!(http_get(addr, path).await.0, 404, "public {path}");
+        assert_eq!(http_get(ops, path).await.0, 200, "operations {path}");
+    }
+    assert_eq!(http_get(ops, "/health").await.0, 200);
+
+    // WebSockets are a public-listener feature only.
+    let _daemon = connect(addr, "serverId=ops&role=server").await;
+    let request = upgrade_request(
+        ops,
+        "/ws?serverId=ops&role=client",
+        Some("dGhlIHNhbXBsZSBub25jZQ=="),
+    )
+    .await;
+    assert_eq!(raw_http(ops, &request).await.0, 404);
+    let (_, metrics) = http_get(ops, "/metrics").await;
+    assert!(metrics.contains("paseo_relay_active_websockets 1"));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ops_listener_answers_while_the_public_listener_is_full() {
+    let mut config = test_config();
+    config.max_connections = 1;
+    config.max_tcp_connections = 1;
+    config.ops_port = Some(0);
+    let (server, addr) = start(config).await;
+    let ops = server.ops_local_addr().unwrap();
+
+    let _ws = connect(addr, "serverId=full&role=server").await;
+    assert_ne!(lenient_http_status(addr, "/health").await, Some(200));
+
+    // Liveness still answers, and readiness reports the truth.
+    assert_eq!(http_get(ops, "/health").await.0, 200);
+    assert_eq!(http_get(ops, "/ready").await.0, 503);
+
+    // The container healthcheck follows the operations listener, so a full
+    // public listener does not get the container restarted.
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_paseo-relay"))
+        .arg("healthcheck")
+        .env("PASEO_RELAY_PORT", addr.port().to_string())
+        .env("PASEO_RELAY_OPS_PORT", ops.port().to_string())
+        .output()
+        .await
+        .expect("run healthcheck");
+    assert!(
+        output.status.success(),
+        "healthcheck failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_timeout_closes_silent_sockets_but_not_ones_receiving_traffic() {
+    let mut config = test_config();
+    config.ws_idle_timeout = Duration::from_secs(1);
+    let (server, addr) = start(config).await;
+
+    let mut silent = connect(addr, "serverId=idle-a&role=client").await;
+    let mut daemon = connect(addr, "serverId=idle-b&role=server").await;
+    let mut listener = connect(addr, "serverId=idle-b&role=client").await;
+
+    // `listener` never sends anything, but the daemon keeps relaying to it.
+    let started = tokio::time::Instant::now();
+    let mut received = 0;
+    while started.elapsed() < Duration::from_millis(1800) {
+        daemon.send(Message::Text("tick".into())).await.unwrap();
+        assert_eq!(expect_text(&mut listener).await, "tick");
+        received += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(received >= 6);
+
+    // Meanwhile the socket with no traffic at all was closed.
+    assert_eq!(
+        expect_close(&mut silent).await,
+        (1013, "Idle timeout".to_owned())
+    );
+    assert_eq!(metric(addr, "paseo_relay_idle_timeouts_total").await, 1);
+
+    // And once the relayed traffic stops, the listener goes idle too.
+    drop(daemon);
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match listener.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    return (u16::from(frame.code), frame.reason.to_string())
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected idle close, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("listener must be closed once it is idle");
+    assert_eq!(closed, (1013, "Idle timeout".to_owned()));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_sockets_are_kept_when_no_idle_timeout_is_configured() {
+    // The documented default: the relay never closes a socket for being idle.
+    let (server, addr) = start(test_config()).await;
+    let mut client = connect(addr, "serverId=quiet&role=client").await;
+    assert!(
+        next_within(&mut client, Duration::from_millis(1500))
+            .await
+            .is_none(),
+        "socket must stay open"
+    );
+    assert_eq!(metric(addr, "paseo_relay_active_websockets").await, 1);
+    server.shutdown().await;
+}
+
+// --- native TLS -------------------------------------------------------------
+
+struct TlsFiles {
+    dir: std::path::PathBuf,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+}
+
+impl TlsFiles {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "paseo-relay-tls-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self {
+            cert: dir.join("cert.pem"),
+            key: dir.join("key.pem"),
+            dir,
+        }
+    }
+
+    /// Write a fresh self-signed certificate for `localhost` and return it.
+    fn issue(&self) -> rustls::pki_types::CertificateDer<'static> {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        std::fs::write(&self.cert, issued.cert.pem()).unwrap();
+        std::fs::write(&self.key, issued.signing_key.serialize_pem()).unwrap();
+        issued.cert.der().clone()
+    }
+}
+
+impl Drop for TlsFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+type TlsClient = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+/// Open a WebSocket over TLS, trusting only `trusted`.
+async fn connect_tls(
+    addr: std::net::SocketAddr,
+    trusted: &rustls::pki_types::CertificateDer<'static>,
+    query: &str,
+) -> Result<TlsClient, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(trusted.clone()).map_err(|e| e.to_string())?;
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let stream = connector
+        .connect(name, tcp)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (ws, response) =
+        tokio_tungstenite::client_async(format!("ws://localhost/ws?{query}"), stream)
+            .await
+            .map_err(|e| e.to_string())?;
+    assert_eq!(response.status(), 101);
+    Ok(ws)
+}
+
+#[tokio::test]
+async fn native_tls_serves_websockets_and_the_healthcheck() {
+    let files = TlsFiles::new("serve");
+    let cert = files.issue();
+    let mut config = test_config();
+    config.tls_cert = Some(files.cert.clone());
+    config.tls_key = Some(files.key.clone());
+    let (server, addr) = start(config).await;
+
+    let mut daemon = connect_tls(addr, &cert, "serverId=tls&role=server")
+        .await
+        .unwrap();
+    let mut client = connect_tls(addr, &cert, "serverId=tls&role=client")
+        .await
+        .unwrap();
+    client.send(Message::Text("over-tls".into())).await.unwrap();
+    assert_eq!(
+        daemon.next().await.unwrap().unwrap(),
+        Message::Text("over-tls".into())
+    );
+    daemon
+        .send(Message::Binary(vec![9u8; 70_000].into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.next().await.unwrap().unwrap(),
+        Message::Binary(vec![9u8; 70_000].into())
+    );
+
+    // Plaintext on a TLS listener is not served.
+    assert_ne!(lenient_http_status(addr, "/health").await, Some(200));
+
+    // The self-probe speaks TLS when the relay does.
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_paseo-relay"))
+        .arg("healthcheck")
+        .env("PASEO_RELAY_PORT", addr.port().to_string())
+        .env("PASEO_RELAY_TLS_CERT", &files.cert)
+        .env("PASEO_RELAY_TLS_KEY", &files.key)
+        .output()
+        .await
+        .expect("run healthcheck");
+    assert!(
+        output.status.success(),
+        "tls healthcheck failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn tls_certificate_reloads_without_dropping_sessions() {
+    let files = TlsFiles::new("reload");
+    let first = files.issue();
+    let mut config = test_config();
+    config.tls_cert = Some(files.cert.clone());
+    config.tls_key = Some(files.key.clone());
+    let (server, addr) = start(config).await;
+
+    let mut daemon = connect_tls(addr, &first, "serverId=keep&role=server")
+        .await
+        .unwrap();
+
+    // Rotate the certificate on disk and reload, as SIGHUP does.
+    let second = files.issue();
+    assert!(server.reload_tls().unwrap());
+
+    // New handshakes get the new certificate...
+    let mut client = connect_tls(addr, &second, "serverId=keep&role=client")
+        .await
+        .expect("new certificate must be served after reload");
+    assert!(
+        connect_tls(addr, &first, "serverId=other&role=client")
+            .await
+            .is_err(),
+        "the old certificate must no longer be served"
+    );
+
+    // ...and the session opened before the reload is still alive.
+    client
+        .send(Message::Text("still-here".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        daemon.next().await.unwrap().unwrap(),
+        Message::Text("still-here".into())
+    );
+
+    // A broken file is refused and the working certificate stays in use.
+    std::fs::write(&files.cert, "not a certificate").unwrap();
+    assert!(server.reload_tls().is_err());
+    assert!(connect_tls(addr, &second, "serverId=after&role=client")
+        .await
+        .is_ok());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn reload_tls_reports_when_tls_is_not_configured() {
+    let (server, _addr) = start(test_config()).await;
+    assert!(!server.reload_tls().unwrap());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn v2_session_caps_distinct_connections_and_deduplicates_watchdog() {
+    let mut config = test_config();
+    config.max_connections_per_session = 3;
+    config.control_nudge_after = Duration::from_millis(250);
+    config.control_unresponsive_after = Duration::from_millis(550);
+    let (server, addr) = start(config).await;
+
+    let mut control = connect(addr, "serverId=cap-s&role=server&v=2&mode=control").await;
+    let initial: Value = serde_json::from_str(&expect_text(&mut control).await).unwrap();
+    assert_eq!(initial["type"], "sync");
+    assert_eq!(initial["connectionIds"], serde_json::json!([]));
+
+    let mut clients = Vec::new();
+    for idx in 1..=3 {
+        let client = connect(
+            addr,
+            &format!("serverId=cap-s&role=client&v=2&connectionId=c{idx}"),
+        )
+        .await;
+        let event: Value = serde_json::from_str(&expect_text(&mut control).await).unwrap();
+        assert_eq!(event["type"], "connected");
+        clients.push(client);
+    }
+
+    // A 4th distinct connectionId exceeds max_connections_per_session.
+    let mut extra = connect(addr, "serverId=cap-s&role=client&v=2&connectionId=c4").await;
+    assert_eq!(
+        expect_close(&mut extra).await,
+        (1013, "Relay session connection capacity".to_owned())
+    );
+
+    // Without data sockets attaching, the single session-level watchdog must
+    // emit only one nudge `sync` (not one per waiting client), then close the
+    // unresponsive control socket with 1011.
+    let mut sync_nudges = 0usize;
+    let mut closed_reason = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), control.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                if value["type"] == "sync" {
+                    sync_nudges += 1;
+                    assert_eq!(
+                        value["connectionIds"],
+                        serde_json::json!(["c1", "c2", "c3"])
+                    );
+                }
+            }
+            Ok(Some(Ok(Message::Close(Some(frame))))) => {
+                closed_reason = Some((u16::from(frame.code), frame.reason.to_string()));
+                break;
+            }
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            _ => break,
+        }
+    }
+    assert_eq!(
+        sync_nudges, 1,
+        "watchdog must emit a single deduplicated sync nudge"
+    );
+    assert_eq!(
+        closed_reason,
+        Some((1011, "Control unresponsive".to_owned()))
+    );
+
+    drop(clients);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn replacing_v1_source_keeps_writer_budget_and_enforces_delivery_deadline() {
+    let mut config = test_config();
+    config.max_message_bytes = 2 * 1024 * 1024;
+    config.ingress_budget_bytes = 128 * 1024 * 1024;
+    config.delivery_timeout = Duration::from_millis(1200);
+    let (server, addr) = start(config).await;
+
+    // Connect a raw destination that never reads after upgrade, so frames back
+    // up inside its outbound writer queue.
+    let mut stalled_dest = raw_ws(addr, "serverId=crit2&role=server").await;
+    let source_a = connect(addr, "serverId=crit2&role=client").await;
+    let (mut source_a_write, mut source_a_read) = source_a.split();
+
+    // Push 512 KiB messages from a background task until loopback buffers fill
+    // and frames queue inside the destination's writer (well before the 1.2 s
+    // delivery deadline).
+    let sender = tokio::spawn(async move {
+        let chunk = vec![0xABu8; 512 * 1024];
+        for _ in 0..32 {
+            if source_a_write
+                .send(Message::Binary(chunk.clone().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let wait_until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < wait_until {
+        if metric(addr, "paseo_relay_ingress_reserved_bytes").await >= 2 * 1024 * 1024 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        metric(addr, "paseo_relay_ingress_reserved_bytes").await >= 2 * 1024 * 1024,
+        "frames must be queued in the stalled destination writer before replacement"
+    );
+
+    // Replace the v1 source while frames are still queued for `stalled_dest`.
+    let _source_b = connect(addr, "serverId=crit2&role=client").await;
+    let close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match source_a_read.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    return (u16::from(frame.code), frame.reason.to_string());
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected replacement close, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("old source must receive replacement close");
+    assert_eq!(close.0, 1008);
+    sender.abort();
+    drop(source_a_read);
+
+    // Give the replaced source task a moment to finish detaching, then confirm
+    // the queued frames in `stalled_dest`'s writer still hold ingress budget.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let reserved = metric(addr, "paseo_relay_ingress_reserved_bytes").await;
+    assert!(
+        reserved > 0,
+        "queued frames must retain their ingress budget after source replacement"
+    );
+
+    // Once the absolute delivery deadline expires, the stalled destination is
+    // shed independently and all queued budgets return to 0.
+    wait_for_metric(addr, "paseo_relay_ingress_reserved_bytes", 0).await;
+    assert!(metric(addr, "paseo_relay_slow_consumer_disconnects_total").await >= 1);
+
+    let _ = stalled_dest.shutdown().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn empty_and_one_byte_continuations_hit_stall_timeout_and_never_charge_small_reserve() {
+    let mut config = test_config();
+    config.read_stall_timeout = Duration::from_millis(400);
+    let (server, addr) = start(config).await;
+
+    // 1) 64 KiB opening fragment (fin=0) must use bulk, not small reserve, and
+    //    periodic 0-byte continuation frames must not defeat read_stall_timeout.
+    let zero_sock = park_unfinished_fragment(addr, "zero-cont", 64 * 1024).await;
+    assert_eq!(
+        metric(addr, "paseo_relay_ingress_small_reserved_bytes").await,
+        0,
+        "non-final fragment must not charge the small reserve"
+    );
+    let (mut zero_read, mut zero_write) = zero_sock.into_split();
+    let zero_sender = tokio::spawn(async move {
+        let empty_cont = frame_header(false, 0x0, 0);
+        loop {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if zero_write.write_all(&empty_cont).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut zero_buf = Vec::new();
+    let _ =
+        tokio::time::timeout(Duration::from_secs(3), zero_read.read_to_end(&mut zero_buf)).await;
+    zero_sender.abort();
+    assert_eq!(
+        parse_close(&zero_buf),
+        Some((1013, "Relay read timeout".to_owned()))
+    );
+
+    // 2) 1-byte continuation frames must also fail to defeat read_stall_timeout
+    //    because progress is measured in full INGRESS_CHUNK_BYTES (8 KiB) chunks.
+    let one_sock = park_unfinished_fragment(addr, "one-cont", 16).await;
+    let (mut one_read, mut one_write) = one_sock.into_split();
+    let one_sender = tokio::spawn(async move {
+        let mut one_cont = frame_header(false, 0x0, 1);
+        one_cont.push(0x42);
+        loop {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if one_write.write_all(&one_cont).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut one_buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), one_read.read_to_end(&mut one_buf)).await;
+    one_sender.abort();
+    assert_eq!(
+        parse_close(&one_buf),
+        Some((1013, "Relay read timeout".to_owned()))
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_http_response_times_out_and_releases_tcp_slot() {
+    let mut config = test_config();
+    config.http_header_timeout = Duration::from_millis(400);
+    config.max_tcp_connections = 1;
+    config.max_connections = 1;
+    config.per_ip_max_connections = 0;
+    let (server, addr) = start(config).await;
+
+    // Hold the single TCP slot by pipelining hundreds of /metrics requests
+    // without reading any response bytes.
+    let mut stalled = TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    let pipeline = req.repeat(600);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        stalled.write_all(pipeline.as_bytes()),
+    )
+    .await;
+
+    // While the socket is pinned, a second peer is turned away at the TCP cap.
+    assert_eq!(lenient_http_status(addr, "/health").await, Some(503));
+
+    // After http_header_timeout elapses, the stalled HTTP writer must time out
+    // and release its TCP slot so /health succeeds again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut recovered = false;
+    while tokio::time::Instant::now() < deadline {
+        if lenient_http_status(addr, "/health").await == Some(200) {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        recovered,
+        "stalled HTTP response writer must time out and release its TCP slot"
+    );
+
+    drop(stalled);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_port_drain_keeps_ops_reachable_and_rejects_ws() {
+    let mut config = test_config();
+    config.shutdown_grace = Duration::from_millis(600);
+    let (server, addr) = start(config).await;
+
+    let shutdown = tokio::spawn(async move { server.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let (health_status, _) = http_get(addr, "/health").await;
+    assert_eq!(health_status, 200);
+
+    let (ready_status, _) = http_get(addr, "/ready").await;
+    assert_eq!(ready_status, 503);
+
+    let (metrics_status, metrics_body) = http_get(addr, "/metrics").await;
+    assert_eq!(metrics_status, 200);
+    assert!(metrics_body.contains("paseo_relay_draining 1"));
+    assert!(metrics_body.contains("paseo_relay_ready 0"));
+
+    let req = upgrade_request(
+        addr,
+        "/ws?serverId=during-drain&role=client",
+        Some("dGhlIHNhbXBsZSBub25jZQ=="),
+    )
+    .await;
+    let (ws_status, _) = raw_http(addr, &req).await;
+    assert_eq!(ws_status, 503);
+
+    shutdown.await.unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_origin_and_http10_ws_upgrade_are_rejected() {
+    let mut config = test_config();
+    config.allowed_origins = vec!["https://app.example".to_owned()];
+    let (server, addr) = start(config).await;
+
+    let dup_origin = format!(
+        "GET /ws?serverId=orig&role=client HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Origin: https://app.example\r\n\
+         Origin: https://evil.example\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    let (status, _) = raw_http(addr, &dup_origin).await;
+    assert_eq!(status, 403);
+
+    let http10 = format!(
+        "GET /ws?serverId=v10&role=client HTTP/1.0\r\n\
+         Host: {addr}\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    let (status, _) = raw_http(addr, &http10).await;
+    assert_eq!(status, 400);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn healthcheck_ignores_empty_tls_vars_and_follows_bound_host() {
+    let (server, addr) = start(test_config()).await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_paseo-relay"))
+        .arg("healthcheck")
+        .env_remove("PASEO_RELAY_HEALTHCHECK_HOST")
+        .env_remove("PASEO_RELAY_OPS_PORT")
+        .env("PASEO_RELAY_HOST", addr.ip().to_string())
+        .env("PASEO_RELAY_PORT", addr.port().to_string())
+        .env("PASEO_RELAY_TLS_CERT", "")
+        .env("PASEO_RELAY_TLS_KEY", "")
+        .output()
+        .await
+        .expect("run healthcheck");
+    assert!(
+        output.status.success(),
+        "healthcheck with empty TLS vars failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     server.shutdown().await;
 }

@@ -25,6 +25,18 @@ use crate::ws::OpCode;
 /// near-JSON frame from being parsed at the full 32 MiB data-frame limit. This
 /// is protocol hygiene, not a security boundary: larger JSON-looking frames
 /// are forwarded without inspection.
+///
+/// # What this check does not guarantee
+///
+/// A client that wants a bad key to reach the daemon can get one there. The
+/// relay only stops well-formed handshakes; a frame is forwarded uninspected
+/// when it is larger than this cap, or when this parser rejects it while a
+/// more lenient parser (such as JavaScript's `JSON.parse`) accepts it: a lone
+/// surrogate escape, a number outside `f64` range, or nesting deeper than the
+/// parser's recursion limit. Closing those gaps would mean guessing how every
+/// endpoint parses JSON, and failing closed on anything unparseable would
+/// break opaque payloads that merely start with `{`. The daemon must validate
+/// the key it receives, exactly as it must with a relay it does not trust.
 pub const MAX_HANDSHAKE_JSON: usize = 64 * 1024;
 
 /// Handshake message kinds that receive validation.
@@ -363,6 +375,32 @@ mod tests {
         assert_eq!(
             check(OpCode::Text, b"{\"type\":\"hello\",\"key\":\xFF}"),
             HandshakeOutcome::NotHandshake
+        );
+    }
+
+    #[test]
+    fn frames_this_parser_rejects_are_forwarded_uninspected() {
+        // Pins the documented limitation: these are invalid JSON here but
+        // valid for more lenient parsers, so they are not treated as
+        // handshakes even though the key is bad. See MAX_HANDSHAKE_JSON.
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        let cases = [
+            r#"{"type":"hello","key":"AAAA","x":"\ud800"}"#.to_owned(),
+            r#"{"type":"hello","key":"AAAA","n":1e999}"#.to_owned(),
+            format!(r#"{{"type":"hello","key":"AAAA","d":{deep}}}"#),
+        ];
+        for case in cases {
+            assert_eq!(
+                check(OpCode::Text, case.as_bytes()),
+                HandshakeOutcome::NotHandshake,
+                "{}",
+                &case[..40]
+            );
+        }
+        // The same bad key in well-formed JSON is rejected.
+        assert_eq!(
+            check(OpCode::Text, br#"{"type":"hello","key":"AAAA"}"#),
+            HandshakeOutcome::Reject(HandshakeType::Hello)
         );
     }
 

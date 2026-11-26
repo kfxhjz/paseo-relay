@@ -1,10 +1,13 @@
+#![forbid(unsafe_code)]
+
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use paseo_relay::{serve, Config, BUILD_REVISION, VERSION};
+use paseo_relay::config::{open_file_limit, unknown_vars};
+use paseo_relay::{serve, Config, ServerHandle, BUILD_REVISION, VERSION};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConnection, DigitallySignedStruct, SignatureScheme};
@@ -24,6 +27,11 @@ async fn main() -> Result<()> {
         Some("--check-config") => {
             let config = Config::from_env()?;
             println!("configuration ok: {config}");
+            // Not errors: the relay starts either way. They are printed so a
+            // deployment check catches them before traffic does.
+            for warning in startup_warnings(&config) {
+                println!("warning: {warning}");
+            }
             return Ok(());
         }
         Some("--dump-config") => {
@@ -56,13 +64,30 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(config = %config, "starting paseo relay");
+    for warning in startup_warnings(&config) {
+        tracing::warn!("{warning}");
+    }
     let server = serve(config).await?;
     tracing::info!(addr = %server.local_addr(), "ready");
 
-    wait_for_shutdown_signal().await;
+    wait_for_shutdown_signal(&server).await;
     tracing::info!("shutdown signal received");
     server.shutdown().await;
     Ok(())
+}
+
+/// Deployment mistakes that do not stop the relay but will hurt it later.
+fn startup_warnings(config: &Config) -> Vec<String> {
+    let mut warnings: Vec<String> =
+        unknown_vars(std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()))
+            .into_iter()
+            .map(|name| {
+                format!("{name} is set but is not a relay setting (misspelled?); it is ignored")
+            })
+            .collect();
+    warnings.extend(config.open_file_limit_warning(open_file_limit()));
+    warnings.extend(config.per_ip_hint());
+    warnings
 }
 
 fn print_help() {
@@ -76,43 +101,96 @@ fn print_help() {
          Common settings:\n\
            PASEO_RELAY_HOST=127.0.0.1   listener IP\n\
            PASEO_RELAY_PORT=4000       listener port (HTTP, WebSocket, ops)\n\
+           PASEO_RELAY_OPS_PORT        optional private port for /ready /metrics /version\n\
            PASEO_RELAY_DRAIN=false     start unready and reject new sessions\n\
            PASEO_RELAY_TLS_CERT/KEY    optional PEM certificate/key for native TLS\n\
            PASEO_RELAY_LOG=info        tracing EnvFilter directive\n\
            PASEO_RELAY_LOG_FORMAT=text text or json structured logs\n\n\
          Endpoints: GET /ws  GET /health  GET /ready  GET /metrics  GET /version\n\
-         Send SIGTERM or SIGINT for a graceful drain."
+         Send SIGTERM or SIGINT for a graceful drain, SIGHUP to reload the TLS\n\
+         certificate and key."
     );
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_port(name: &str) -> Option<u16> {
+    env_non_empty(name)
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|&port| port > 0)
+}
+
+fn probe_host_for_bind(raw: Option<&str>) -> String {
+    match raw.and_then(|value| value.trim().parse::<IpAddr>().ok()) {
+        Some(ip) if !ip.is_unspecified() => ip.to_string(),
+        Some(IpAddr::V6(_)) => "::1".to_owned(),
+        _ => "127.0.0.1".to_owned(),
+    }
+}
+
+fn format_host_header(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Container-friendly self-probe for the scratch image: a raw HTTP GET /health.
 ///
-/// Uses `PASEO_RELAY_HEALTHCHECK_HOST` (default `127.0.0.1`) and
-/// `PASEO_RELAY_PORT` (default `4000`). Exit code 0 means the relay answered
-/// 200; anything else means unhealthy. When `PASEO_RELAY_TLS_CERT` and
-/// `PASEO_RELAY_TLS_KEY` are set, the probe speaks TLS with certificate
-/// signature verification (hostname/trust-chain checking is skipped because
-/// this only ever connects to the local relay).
+/// Uses `PASEO_RELAY_HEALTHCHECK_HOST` (defaulting to the bound listener
+/// address, or `127.0.0.1`/`::1` for wildcard binds) and `PASEO_RELAY_PORT`
+/// (default `4000`). Exit code 0 means the relay answered 200; anything else
+/// means unhealthy. When `PASEO_RELAY_TLS_CERT` and `PASEO_RELAY_TLS_KEY` are
+/// non-empty, the probe speaks TLS with certificate signature verification
+/// (hostname/trust-chain checking is skipped because this only ever connects
+/// to the local relay).
+///
+/// With `PASEO_RELAY_OPS_PORT` set the probe uses that listener instead (and
+/// follows `PASEO_RELAY_OPS_HOST` when `PASEO_RELAY_HEALTHCHECK_HOST` is unset).
+/// It is plaintext, and it has its own connection allowance, so the container
+/// is not reported unhealthy merely because the public listener is full.
 fn healthcheck() -> Result<()> {
-    let host =
-        std::env::var("PASEO_RELAY_HEALTHCHECK_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let port: u16 = std::env::var("PASEO_RELAY_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    let ops_port = env_port("PASEO_RELAY_OPS_PORT");
+    let port = ops_port
+        .or_else(|| env_port("PASEO_RELAY_PORT"))
         .unwrap_or(4000);
-    let address = format!("{host}:{port}");
-    let socket_addr = address
+    let host = match env_non_empty("PASEO_RELAY_HEALTHCHECK_HOST") {
+        Some(value) => value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(&value)
+            .to_owned(),
+        None => {
+            let bind_var = if ops_port.is_some() {
+                "PASEO_RELAY_OPS_HOST"
+            } else {
+                "PASEO_RELAY_HOST"
+            };
+            let bind = env_non_empty(bind_var);
+            probe_host_for_bind(bind.as_deref())
+        }
+    };
+    let host_header = format_host_header(&host, port);
+    let socket_addr = (host.as_str(), port)
         .to_socket_addrs()?
         .next()
-        .ok_or_else(|| anyhow!("cannot resolve {address}"))?;
+        .ok_or_else(|| anyhow!("cannot resolve {host_header}"))?;
     let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
-        .map_err(|error| anyhow!("healthcheck connect {address}: {error}"))?;
+        .map_err(|error| anyhow!("healthcheck connect {host_header}: {error}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
-    let tls = std::env::var("PASEO_RELAY_TLS_CERT").is_ok()
-        && std::env::var("PASEO_RELAY_TLS_KEY").is_ok();
-    let request = format!("GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    let tls = ops_port.is_none()
+        && env_non_empty("PASEO_RELAY_TLS_CERT").is_some()
+        && env_non_empty("PASEO_RELAY_TLS_KEY").is_some();
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
 
     if tls {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -215,24 +293,58 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-async fn wait_for_shutdown_signal() {
+/// Wait for SIGTERM/SIGINT. SIGHUP reloads the TLS certificate and keeps
+/// waiting.
+async fn wait_for_shutdown_signal(server: &ServerHandle) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
+        let (Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
         };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return,
+                _ = terminate.recv() => return,
+                _ = hangup.recv() => match server.reload_tls_async().await {
+                    Ok(true) => tracing::info!("SIGHUP: tls certificate reloaded"),
+                    Ok(false) => tracing::info!("SIGHUP: native TLS is not configured; nothing to reload"),
+                    Err(error) => tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "SIGHUP: tls reload failed; keeping the previous certificate"
+                    ),
+                },
+            }
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = server;
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_host_follows_non_wildcard_bind_and_loopback_for_wildcard() {
+        assert_eq!(probe_host_for_bind(None), "127.0.0.1");
+        assert_eq!(probe_host_for_bind(Some("0.0.0.0")), "127.0.0.1");
+        assert_eq!(probe_host_for_bind(Some("::")), "::1");
+        assert_eq!(probe_host_for_bind(Some("10.0.0.5")), "10.0.0.5");
+        assert_eq!(probe_host_for_bind(Some("fd00::1")), "fd00::1");
+    }
+
+    #[test]
+    fn host_header_brackets_ipv6_literals() {
+        assert_eq!(format_host_header("127.0.0.1", 4000), "127.0.0.1:4000");
+        assert_eq!(format_host_header("::1", 4001), "[::1]:4001");
+        assert_eq!(format_host_header("localhost", 4000), "localhost:4000");
     }
 }

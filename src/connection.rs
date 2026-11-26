@@ -6,8 +6,7 @@
 //! connection never closes another socket except for the protocol-mandated
 //! replacement/detach rules.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,16 +16,22 @@ use serde_json::{json, Value};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
-use crate::capacity::{BudgetError, BudgetGuard, IpGuard, TcpSlot, WsSlot};
+use crate::capacity::{
+    BudgetHold, Capacity, Class, ConnIngress, HoldHandle, IpGuard, Reservation, ScopedGuard,
+    TcpSlot, WsSlot,
+};
 use crate::config::{CONTROL_FRAME_BYTES, INGRESS_CHUNK_BYTES};
 use crate::handshake::{self, HandshakeOutcome};
-use crate::metrics::Metrics;
-use crate::protocol::{Connection, Role};
+use crate::metrics::{Metrics, ShedKind};
+use crate::protocol::{Connection, Role, Version};
 use crate::server::AppState;
-use crate::session::Session;
-use crate::writer::{spawn_writer, SendError, WriterHandle};
-use crate::ws::{self, FrameReader, OpCode, WsError, WsLimits, MAX_FRAGMENTS_PER_MESSAGE};
+use crate::session::{JoinError, Session, SocketHandle, WatchdogStep};
+use crate::writer::{spawn_writer, ActivityClock, SendError, WriterHandle};
+use crate::ws::{
+    self, FrameHeader, FrameReader, OpCode, WsError, WsLimits, MAX_FRAGMENTS_PER_MESSAGE,
+};
 
 /// Bounded read-ahead: at most two completed messages/events are handed to the
 /// main task; the reader task blocks on the channel once that is full.
@@ -37,36 +42,11 @@ const READ_CHANNEL_CAPACITY: usize = 2;
 /// cannot delay shutdown close frames.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Per-connection in-flight ingress budget.
-///
-/// Guards share this counter; the relay reserves at most
-/// [`Config::per_connection_ingress_bytes`] weighted bytes for one connection so
-/// a single peer cannot monopolise the node-wide budget through queued
-/// messages.
-struct ConnIngress {
-    used: AtomicU64,
-    limit: u64,
-}
-
-/// Ingress guard that also releases the connection-scoped counter.
-struct ScopedGuard {
-    guard: Option<BudgetGuard>,
-    scope: Arc<ConnIngress>,
-    weighted: u64,
-}
-
-impl Drop for ScopedGuard {
-    fn drop(&mut self) {
-        self.scope.used.fetch_sub(self.weighted, Ordering::Relaxed);
-        drop(self.guard.take());
-    }
-}
-
 enum Inbound {
     Message {
         opcode: OpCode,
         payload: Bytes,
-        guards: Vec<ScopedGuard>,
+        budget: Arc<BudgetHold>,
     },
     Ping(Bytes),
     Pong,
@@ -79,20 +59,65 @@ enum Inbound {
 
 enum Failure {
     Ws(WsError),
-    Budget(BudgetError),
+    /// An ingress reservation could not be made in time, or this connection
+    /// reached its own in-flight cap.
+    Budget,
+    /// A frame or message stalled or ran past its read deadline.
     ReadTimeout,
+    /// No frame in either direction for the configured idle timeout.
+    Idle,
+    /// The in-progress message was reclaimed to free budget for another
+    /// connection.
+    Reclaimed,
 }
 
 impl Failure {
     fn close(&self) -> (u16, String) {
         match self {
             Failure::Ws(error) => (error.close_code(), error.to_string()),
-            Failure::Budget(BudgetError::TooLarge) => (1013, "Relay ingress capacity".to_owned()),
-            Failure::Budget(BudgetError::Exhausted) => (1013, "Relay ingress capacity".to_owned()),
-            Failure::Budget(BudgetError::Closed) => (1013, "Relay ingress capacity".to_owned()),
+            Failure::Budget => (1013, "Relay ingress capacity".to_owned()),
             Failure::ReadTimeout => (1013, "Relay read timeout".to_owned()),
+            Failure::Idle => (1013, "Idle timeout".to_owned()),
+            Failure::Reclaimed => (1013, "Relay ingress reclaimed".to_owned()),
         }
     }
+
+    /// Count the failure and let the operator know the node is shedding.
+    fn note(&self, metrics: &Metrics) {
+        match self {
+            Failure::Budget => {
+                Metrics::inc(&metrics.ingress_rejections);
+                metrics.shed(ShedKind::IngressExhausted);
+            }
+            Failure::ReadTimeout => {
+                Metrics::inc(&metrics.read_timeouts);
+                metrics.shed(ShedKind::ReadTimeout);
+            }
+            Failure::Idle => {
+                Metrics::inc(&metrics.idle_timeouts);
+                metrics.shed(ShedKind::IdleTimeout);
+            }
+            // Reclaims are counted where the victim is chosen.
+            Failure::Reclaimed | Failure::Ws(_) => {}
+        }
+    }
+}
+
+/// Everything the read task needs besides the socket and its channel.
+struct ReadContext {
+    limits: WsLimits,
+    capacity: Arc<Capacity>,
+    metrics: Arc<Metrics>,
+    wait_timeout: Duration,
+    frame_read_timeout: Duration,
+    message_read_timeout: Duration,
+    read_stall_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    ingress_scope: Arc<ConnIngress>,
+    hold: HoldHandle,
+    /// Outbound activity of this socket; relayed traffic keeps it from being
+    /// considered idle.
+    activity: Arc<ActivityClock>,
 }
 
 pub async fn run_connection(
@@ -109,17 +134,14 @@ pub async fn run_connection(
     let io = TokioIo::new(upgraded);
     let (read_half, write_half) = tokio::io::split(io);
 
+    let frame_cap = if connection.is_v2_control() {
+        CONTROL_FRAME_BYTES
+    } else {
+        state.config.max_message_bytes
+    };
     let limits = WsLimits {
-        max_frame_payload: if connection.is_v2_control() {
-            CONTROL_FRAME_BYTES
-        } else {
-            state.config.max_message_bytes
-        },
-        max_message_payload: if connection.is_v2_control() {
-            CONTROL_FRAME_BYTES
-        } else {
-            state.config.max_message_bytes
-        },
+        max_frame_payload: frame_cap,
+        max_message_payload: frame_cap,
         max_fragments: MAX_FRAGMENTS_PER_MESSAGE,
     };
 
@@ -127,17 +149,12 @@ pub async fn run_connection(
     // The read-ahead pipeline can hold up to four messages per connection
     // (one being handled by the main task, two queued, one being read), so the
     // per-connection cap must not be lower than that or a legitimate pipelining
-    // source would be closed. It still prevents one connection from taking more
-    // than four maximum messages when the global budget is larger.
+    // source would be closed.
     let per_connection_limit = state
         .config
         .ingress_budget_bytes
         .min(one_max_message_weighted.saturating_mul(4))
         .max(one_max_message_weighted);
-    let ingress_scope = Arc::new(ConnIngress {
-        used: AtomicU64::new(0),
-        limit: per_connection_limit,
-    });
 
     let (writer, writer_task) = spawn_writer(
         write_half,
@@ -150,27 +167,44 @@ pub async fn run_connection(
     let (tx, mut rx) = mpsc::channel(READ_CHANNEL_CAPACITY);
     let reader_task = spawn_reader(
         read_half,
-        limits,
         tx,
-        Arc::clone(&state.capacity),
-        Arc::clone(&state.metrics),
-        state.config.ingress_wait_timeout,
-        state.config.frame_read_timeout,
-        state.config.message_read_timeout,
-        Arc::clone(&ingress_scope),
+        ReadContext {
+            limits,
+            capacity: Arc::clone(&state.capacity),
+            metrics: Arc::clone(&state.metrics),
+            wait_timeout: state.config.ingress_wait_timeout,
+            frame_read_timeout: state.config.frame_read_timeout,
+            message_read_timeout: state.config.message_read_timeout,
+            read_stall_timeout: state.config.read_stall_timeout,
+            idle_timeout: (!state.config.ws_idle_timeout.is_zero())
+                .then_some(state.config.ws_idle_timeout),
+            ingress_scope: Arc::new(ConnIngress::new(per_connection_limit)),
+            hold: state.capacity.ingress.register(),
+            activity: writer.activity(),
+        },
     );
 
     let (session, attach) = match state.sessions.join(&connection, writer.clone(), socket_id) {
         Ok(value) => value,
         Err(error) => {
             Metrics::inc(&state.metrics.session_rejections);
+            state.metrics.shed(ShedKind::SessionCapacity);
             let reason = match error {
-                crate::session::JoinError::SessionLimit => "Relay session capacity",
-                crate::session::JoinError::ClientLimit => "Relay client capacity",
+                JoinError::SessionLimit => "Relay session capacity",
+                JoinError::ClientLimit => "Relay client capacity",
+                JoinError::SessionConnectionLimit => "Relay session connection capacity",
             };
             writer.close(1013, reason);
             reader_task.abort();
-            let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
+            let _ = reader_task.await;
+            let mut writer_task = writer_task;
+            if tokio::time::timeout(Duration::from_secs(2), &mut writer_task)
+                .await
+                .is_err()
+            {
+                writer_task.abort();
+            }
+            state.sessions.release(&connection.server_id);
             drop(ws_slot);
             drop(ip_guard);
             return;
@@ -181,45 +215,35 @@ pub async fn run_connection(
         replaced.close(1008, "Replaced by new connection");
     }
     if let Some(ids) = attach.sync {
-        let sync = json!({"type": "sync", "connectionIds": ids});
-        let _ = tokio::time::timeout(
-            CONTROL_SEND_TIMEOUT,
-            writer.send_json(&sync, state.config.delivery_timeout),
-        )
-        .await;
+        if let Ok(payload) = serde_json::to_vec(&json!({"type": "sync", "connectionIds": ids})) {
+            let _ = writer
+                .send_text(Bytes::from(payload), CONTROL_SEND_TIMEOUT)
+                .await;
+        }
     }
     if let Some(control) = attach.control {
         let connected = json!({
             "type": "connected",
             "connectionId": connection.connection_id().unwrap_or_default(),
         });
-        let sent = tokio::time::timeout(
-            CONTROL_SEND_TIMEOUT,
-            control
-                .writer
-                .send_json(&connected, state.config.delivery_timeout),
-        )
-        .await;
-        if !matches!(sent, Ok(Ok(()))) {
-            Metrics::inc(&state.metrics.slow_consumer_disconnects);
-            control.writer.close(1013, "Slow consumer");
+        if control
+            .writer
+            .send_json(&connected, CONTROL_SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            shed_slow_consumer(&state, &control.writer);
         }
     }
 
-    let control_watchdog = if connection.is_v2_client() {
-        let connection_id = connection.connection_id().unwrap_or_default().to_owned();
-        if session.data_socket(&connection_id).is_none() {
-            Some(spawn_control_watchdog(
-                Arc::clone(&state),
-                Arc::clone(&session),
-                connection_id,
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    if attach.start_watchdog {
+        spawn_control_watchdog(
+            Arc::clone(&state),
+            Arc::downgrade(&session),
+            session.watchdog_wake(),
+            connection.server_id.clone(),
+        );
+    }
 
     tracing::debug!(
         role = %connection.role,
@@ -252,7 +276,7 @@ pub async fn run_connection(
                     break;
                 };
                 match event {
-                    Inbound::Message { opcode, payload, guards } => {
+                    Inbound::Message { opcode, payload, budget } => {
                         let outcome = tokio::select! {
                             biased;
                             _ = state.conn_shutdown.cancelled() => {
@@ -261,9 +285,17 @@ pub async fn run_connection(
                             _ = writer_cancel.cancelled() => {
                                 Err((1013, "Delivery unavailable"))
                             }
-                            result = handle_message(&state, &session, &connection, opcode, &payload) => result,
+                            result = handle_message(
+                                &state,
+                                &session,
+                                &connection,
+                                &writer,
+                                opcode,
+                                &payload,
+                                &budget,
+                            ) => result,
                         };
-                        drop(guards);
+                        drop(budget);
                         if let Err((code, reason)) = outcome {
                             close_code = code;
                             close_reason = reason.to_owned();
@@ -296,6 +328,7 @@ pub async fn run_connection(
                         break;
                     }
                     Inbound::Failed(failure) => {
+                        failure.note(&state.metrics);
                         let (code, reason) = failure.close();
                         close_code = code;
                         close_reason = reason;
@@ -304,10 +337,6 @@ pub async fn run_connection(
                 }
             }
         }
-    }
-
-    if let Some(watchdog) = control_watchdog {
-        watchdog.abort();
     }
 
     finish(
@@ -322,6 +351,11 @@ pub async fn run_connection(
         writer_task,
     )
     .await;
+
+    // Free the session slot now if this was its last socket, instead of
+    // leaving an empty session to the idle sweep.
+    drop(session);
+    state.sessions.release(&connection.server_id);
 
     drop(ws_slot);
     drop(ip_guard);
@@ -348,12 +382,9 @@ async fn finish(
             tokio::select! {
                 biased;
                 _ = state.conn_shutdown.cancelled() => {}
-                result = tokio::time::timeout(
-                    CONTROL_SEND_TIMEOUT,
-                    control
-                        .writer
-                        .send_json(&notification, state.config.delivery_timeout),
-                ) => {
+                result = control
+                    .writer
+                    .send_json(&notification, CONTROL_SEND_TIMEOUT) => {
                     let _ = result;
                 }
             }
@@ -361,7 +392,10 @@ async fn finish(
     }
 
     writer.close(close_code, close_reason);
+    // Abort and wait: the reader owns the budget guards of a partly received
+    // message and its registration in the hold registry.
     reader_task.abort();
+    let _ = reader_task.await;
     let mut writer_task = writer_task;
     if tokio::time::timeout(Duration::from_secs(2), &mut writer_task)
         .await
@@ -376,15 +410,17 @@ async fn handle_message(
     state: &Arc<AppState>,
     session: &Arc<Session>,
     connection: &Connection,
+    self_writer: &WriterHandle,
     opcode: OpCode,
     payload: &Bytes,
+    budget: &Arc<BudgetHold>,
 ) -> Result<(), (u16, &'static str)> {
     if session.is_empty() {
         return Ok(());
     }
 
     if connection.is_v2_control() {
-        handle_control_input(state, opcode, &session.control(), payload).await;
+        handle_control_input(state, opcode, self_writer, payload).await;
         return Ok(());
     }
 
@@ -402,15 +438,15 @@ async fn handle_message(
     }
 
     match connection.version {
-        crate::protocol::Version::V1 => {
+        Version::V1 => {
             let peer = session.v1_peer(connection.role);
             if let Some(peer) = peer {
-                deliver_one(state, &peer, opcode, payload)
+                deliver_one(state, &peer, opcode, payload, budget)
                     .await
                     .map_err(|reason| (1013, reason))?;
             }
         }
-        crate::protocol::Version::V2 => {
+        Version::V2 => {
             if connection.role == Role::Client {
                 let Some(connection_id) = connection.connection_id() else {
                     return Ok(());
@@ -426,7 +462,7 @@ async fn handle_message(
                 let Some(destination) = destination else {
                     return Err((1013, "Data route unavailable"));
                 };
-                deliver_one(state, &destination, opcode, payload)
+                deliver_one(state, &destination, opcode, payload, budget)
                     .await
                     .map_err(|reason| (1013, reason))?;
             } else {
@@ -443,7 +479,7 @@ async fn handle_message(
                 // per-destination ordering is preserved.
                 let deliveries = clients
                     .iter()
-                    .map(|client| deliver_one(state, client, opcode, payload));
+                    .map(|client| deliver_one(state, client, opcode, payload, budget));
                 let results = futures_util::future::join_all(deliveries).await;
                 let delivered = results.iter().filter(|result| result.is_ok()).count();
                 if delivered == 0 {
@@ -457,13 +493,19 @@ async fn handle_message(
 
 async fn deliver_one(
     state: &Arc<AppState>,
-    destination: &crate::session::SocketHandle,
+    destination: &SocketHandle,
     opcode: OpCode,
     payload: &Bytes,
+    budget: &Arc<BudgetHold>,
 ) -> Result<(), &'static str> {
     match destination
         .writer
-        .send_frame(opcode, payload.clone(), state.config.delivery_timeout)
+        .send_frame(
+            opcode,
+            payload.clone(),
+            state.config.delivery_timeout,
+            Some(Arc::clone(budget)),
+        )
         .await
     {
         Ok(()) => Ok(()),
@@ -472,6 +514,7 @@ async fn deliver_one(
                 SendError::SlowConsumer => {
                     Metrics::inc(&state.metrics.slow_consumer_disconnects);
                     Metrics::inc(&state.metrics.delivery_timeouts);
+                    state.metrics.shed(ShedKind::SlowConsumer);
                 }
                 SendError::Writer(_) => {
                     // The writer task's deadline or transport error; not counted
@@ -491,59 +534,111 @@ async fn deliver_one(
     }
 }
 
-/// Elixir-compatible control watchdog for a v2 client whose data socket has not
-/// attached yet. This runs independently of client frame delivery: after
-/// `CONTROL_NUDGE_MS` it re-sends `sync`, and after `CONTROL_UNRESPONSIVE_MS`
-/// it closes a still-unresponsive control socket with `1011`. It never
-/// shortens the client's own `DATA_ATTACH_TIMEOUT_MS` wait.
+/// Close a control socket that could not take a small notification in time.
+fn shed_slow_consumer(state: &Arc<AppState>, writer: &WriterHandle) {
+    Metrics::inc(&state.metrics.slow_consumer_disconnects);
+    state.metrics.shed(ShedKind::SlowConsumer);
+    writer.close(1013, "Slow consumer");
+}
+
+/// Single deduplicated control watchdog per session.
+///
+/// Holds only a [`Weak<Session>`] across awaits so an empty session can be
+/// released immediately when its last socket disconnects. Sends at most one
+/// `sync` per `CONTROL_NUDGE_MS` window (bounded by `CONTROL_SEND_TIMEOUT`,
+/// with the JSON Value dropped before awaiting), and closes an unresponsive
+/// control socket with `1011` after `CONTROL_UNRESPONSIVE_MS`.
 fn spawn_control_watchdog(
     state: Arc<AppState>,
-    session: Arc<Session>,
-    connection_id: String,
-) -> JoinHandle<()> {
+    session: Weak<Session>,
+    wake: Arc<tokio::sync::Notify>,
+    server_id: String,
+) {
     tokio::spawn(async move {
-        tokio::time::sleep(state.config.control_nudge_after).await;
-        if !session.waiting_for_data(&connection_id) {
-            return;
-        }
-        if let Some(control) = session.control() {
-            let sync = json!({"type": "sync", "connectionIds": session.connection_ids()});
-            if control
-                .writer
-                .send_json(&sync, state.config.delivery_timeout)
-                .await
-                .is_err()
-            {
-                Metrics::inc(&state.metrics.slow_consumer_disconnects);
-                control.writer.close(1013, "Slow consumer");
-                return;
+        let nudge_after = state.config.control_nudge_after;
+        let unresponsive_after = state.config.control_unresponsive_after;
+
+        loop {
+            let woken = wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+
+            let step = {
+                let Some(strong) = session.upgrade() else {
+                    return;
+                };
+                let step = strong.watchdog_step(nudge_after, unresponsive_after);
+                drop(strong);
+                step
+            };
+
+            match step {
+                WatchdogStep::Exit => {
+                    state.sessions.release(&server_id);
+                    return;
+                }
+                WatchdogStep::WaitForChange => {
+                    tokio::select! {
+                        biased;
+                        _ = state.conn_shutdown.cancelled() => {
+                            if let Some(strong) = session.upgrade() {
+                                strong.mark_watchdog_stopped();
+                            }
+                            return;
+                        }
+                        _ = woken => {}
+                    }
+                }
+                WatchdogStep::Sleep(delay) => {
+                    tokio::select! {
+                        biased;
+                        _ = state.conn_shutdown.cancelled() => {
+                            if let Some(strong) = session.upgrade() {
+                                strong.mark_watchdog_stopped();
+                            }
+                            return;
+                        }
+                        _ = woken => {}
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                WatchdogStep::SendNudge { control, ids } => {
+                    let payload =
+                        serde_json::to_vec(&json!({"type": "sync", "connectionIds": ids}))
+                            .map(Bytes::from);
+                    if let Ok(payload) = payload {
+                        let sent = tokio::select! {
+                            biased;
+                            _ = state.conn_shutdown.cancelled() => {
+                                if let Some(strong) = session.upgrade() {
+                                    strong.mark_watchdog_stopped();
+                                }
+                                return;
+                            }
+                            result = control.writer.send_text(payload, CONTROL_SEND_TIMEOUT) => result,
+                        };
+                        if sent.is_err() {
+                            shed_slow_consumer(&state, &control.writer);
+                        }
+                    }
+                }
+                WatchdogStep::CloseUnresponsive { control } => {
+                    control.writer.close(1011, "Control unresponsive");
+                }
             }
         }
-        let remaining = state
-            .config
-            .control_unresponsive_after
-            .saturating_sub(state.config.control_nudge_after);
-        tokio::time::sleep(remaining).await;
-        if session.waiting_for_data(&connection_id) {
-            if let Some(control) = session.control() {
-                control.writer.close(1011, "Control unresponsive");
-            }
-        }
-    })
+    });
 }
 
 async fn handle_control_input(
     state: &Arc<AppState>,
     opcode: OpCode,
-    control: &Option<crate::session::SocketHandle>,
+    writer: &WriterHandle,
     payload: &Bytes,
 ) {
     if opcode != OpCode::Text {
         return;
     }
-    let Some(control) = control else {
-        return;
-    };
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(payload) else {
         return;
     };
@@ -555,14 +650,12 @@ async fn handle_control_input(
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let pong = json!({"type": "pong", "ts": timestamp});
-    if control
-        .writer
+    if writer
         .send_json(&pong, state.config.delivery_timeout)
         .await
         .is_err()
     {
-        Metrics::inc(&state.metrics.slow_consumer_disconnects);
-        control.writer.close(1013, "Slow consumer");
+        shed_slow_consumer(state, writer);
     }
 }
 
@@ -574,54 +667,42 @@ fn echo_close_code(code: u16) -> u16 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_reader<R>(
-    read: R,
-    limits: WsLimits,
-    tx: mpsc::Sender<Inbound>,
-    capacity: Arc<crate::capacity::Capacity>,
-    metrics: Arc<Metrics>,
-    wait_timeout: Duration,
-    frame_read_timeout: Duration,
-    message_read_timeout: Duration,
-    ingress_scope: Arc<ConnIngress>,
-) -> JoinHandle<()>
+fn spawn_reader<R>(read: R, tx: mpsc::Sender<Inbound>, ctx: ReadContext) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        read_loop(
-            read,
-            limits,
-            tx,
-            capacity,
-            metrics,
-            wait_timeout,
-            frame_read_timeout,
-            message_read_timeout,
-            ingress_scope,
-        )
-        .await;
+        let evicted = ctx.hold.evicted();
+        let reclaimed = {
+            let reading = read_loop(read, &tx, &ctx);
+            tokio::pin!(reading);
+            tokio::select! {
+                biased;
+                _ = evicted.cancelled() => true,
+                _ = &mut reading => false,
+            }
+            // `reading` is dropped here, and with it the partly received
+            // message and the budget guards it held.
+        };
+        if reclaimed {
+            let _ = tx.send(Inbound::Failed(Failure::Reclaimed)).await;
+        }
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn read_loop<R>(
-    read: R,
-    limits: WsLimits,
-    tx: mpsc::Sender<Inbound>,
-    capacity: Arc<crate::capacity::Capacity>,
-    metrics: Arc<Metrics>,
-    wait_timeout: Duration,
-    frame_read_timeout: Duration,
-    message_read_timeout: Duration,
-    ingress_scope: Arc<ConnIngress>,
-) where
+async fn read_loop<R>(read: R, tx: &mpsc::Sender<Inbound>, ctx: &ReadContext)
+where
     R: AsyncRead + Unpin,
 {
-    let mut reader = FrameReader::new(read, limits);
+    let mut reader = FrameReader::new(read, ctx.limits);
     let mut assembling: Option<Assembling> = None;
-    let mut message_started: Option<tokio::time::Instant> = None;
+    let mut message_started: Option<Instant> = None;
+    // Last payload progress of the fragmented message being assembled.
+    // Control frames and tiny sub-chunk trickles do not advance it.
+    let mut last_progress = Instant::now();
+    let mut progress_bytes: usize = 0;
+    // Last inbound frame of any kind, for the idle timeout.
+    let mut last_inbound = Instant::now();
 
     macro_rules! fail {
         ($failure:expr) => {{
@@ -631,15 +712,33 @@ async fn read_loop<R>(
     }
 
     loop {
-        let header_timeout =
-            message_started.map(|started| message_read_timeout.saturating_sub(started.elapsed()));
-        if header_timeout == Some(Duration::ZERO) {
-            fail!(Failure::ReadTimeout);
-        }
-        let header = match read_header_bounded(&mut reader, header_timeout).await {
-            Ok(header) => header,
-            Err(failure) => fail!(failure),
+        let header = match message_started {
+            Some(started) => {
+                // Between fragments the next header must arrive before both
+                // the whole-message deadline and the stall deadline.
+                let left = ctx
+                    .message_read_timeout
+                    .saturating_sub(started.elapsed())
+                    .min(
+                        ctx.read_stall_timeout
+                            .saturating_sub(last_progress.elapsed()),
+                    );
+                if left.is_zero() {
+                    fail!(Failure::ReadTimeout);
+                }
+                match tokio::time::timeout(left, reader.read_header()).await {
+                    Ok(Ok(header)) => header,
+                    Ok(Err(error)) => fail!(Failure::Ws(error)),
+                    Err(_) => fail!(Failure::ReadTimeout),
+                }
+            }
+            None => match read_idle_header(&mut reader, ctx, last_inbound).await {
+                Ok(header) => header,
+                Err(failure) => fail!(failure),
+            },
         };
+        last_inbound = Instant::now();
+
         // Start the fragmented-message clock as soon as the first fragment
         // header arrives, so MESSAGE_READ_TIMEOUT_MS bounds the whole wire
         // time rather than only the time after the first payload was read.
@@ -647,17 +746,20 @@ async fn read_loop<R>(
             && !header.fin
             && message_started.is_none()
         {
-            message_started = Some(tokio::time::Instant::now());
+            message_started = Some(Instant::now());
+            last_progress = Instant::now();
+            progress_bytes = 0;
         }
         let payload_timeout = message_started
             .map(|started| {
-                frame_read_timeout.min(message_read_timeout.saturating_sub(started.elapsed()))
+                ctx.frame_read_timeout
+                    .min(ctx.message_read_timeout.saturating_sub(started.elapsed()))
             })
-            .unwrap_or(frame_read_timeout);
-        if payload_timeout == Duration::ZERO {
+            .unwrap_or(ctx.frame_read_timeout);
+        if payload_timeout.is_zero() {
             fail!(Failure::ReadTimeout);
         }
-        let payload_deadline = tokio::time::Instant::now() + payload_timeout;
+        let payload_deadline = Instant::now() + payload_timeout;
 
         match header.opcode {
             OpCode::Close => {
@@ -702,93 +804,97 @@ async fn read_loop<R>(
                         "new data frame during fragmented message",
                     )));
                 }
+                // Only complete single-frame small messages draw from the
+                // small reserve; fragmented messages always use the bulk pool
+                // so a multi-megabyte transfer cannot lock small-reserve bytes
+                // via a <=64 KiB opening fragment.
+                let class = if header.fin {
+                    Class::for_message_bytes(header.payload_len)
+                } else {
+                    Class::Bulk
+                };
                 // Charge the fixed per-message overhead once per message. It is
                 // charged before the payload is read, but it is small (~1 KiB
                 // weighted at the default weight).
-                let overhead = match bounded_budget_wait(payload_deadline, wait_timeout) {
-                    Ok(wait) => match reserve_weighted(
-                        &capacity,
-                        &ingress_scope,
-                        capacity.ingress.overhead_weight(),
-                        wait,
-                    )
-                    .await
-                    {
-                        Ok(guard) => guard,
-                        Err(failure) => fail!(failure),
-                    },
+                let overhead = match bounded_budget_wait(payload_deadline, ctx.wait_timeout) {
+                    Ok(wait) => {
+                        let request = Reservation {
+                            weighted: ctx.capacity.ingress.overhead_weight(),
+                            class,
+                            frame_need: ctx.capacity.ingress.frame_weight(header.payload_len),
+                        };
+                        match reserve(ctx, request, 0, wait).await {
+                            Ok(guard) => guard,
+                            Err(failure) => fail!(failure),
+                        }
+                    }
                     Err(failure) => fail!(failure),
                 };
-                let (payload, mut guards) = match read_data_payload(
+                let mut message = Assembling {
+                    opcode: header.opcode,
+                    payload: Vec::new(),
+                    guards: vec![overhead],
+                };
+                if let Err(failure) = read_data_payload(
                     &mut reader,
                     &header,
-                    &capacity,
-                    &ingress_scope,
-                    wait_timeout,
+                    ctx,
+                    class,
                     payload_deadline,
+                    &mut message,
+                    &mut progress_bytes,
+                    &mut last_progress,
                 )
                 .await
                 {
-                    Ok(value) => value,
-                    Err(failure) => fail!(failure),
-                };
-                guards.insert(0, overhead);
-                metrics.observe_frame_size(header.payload_len);
+                    fail!(failure);
+                }
+                ctx.metrics.observe_frame_size(header.payload_len);
                 if header.fin {
-                    if header.opcode == OpCode::Text && std::str::from_utf8(&payload).is_err() {
-                        fail!(Failure::Ws(WsError::InvalidUtf8));
-                    }
-                    if tx
-                        .send(Inbound::Message {
-                            opcode: header.opcode,
-                            payload: Bytes::from(payload),
-                            guards,
-                        })
-                        .await
-                        .is_err()
-                    {
+                    if let Err(failure) = finish_message(tx, message, ctx).await {
+                        let _ = tx.send(failure).await;
                         return;
                     }
                 } else {
-                    assembling = Some(Assembling {
-                        opcode: header.opcode,
-                        payload,
-                        guards,
-                    });
+                    assembling = Some(message);
                 }
             }
             OpCode::Continuation => {
                 if let Some(started) = message_started {
-                    if started.elapsed() > message_read_timeout {
+                    if started.elapsed() > ctx.message_read_timeout {
                         fail!(Failure::ReadTimeout);
                     }
                 }
                 let Some(mut message) = assembling.take() else {
                     fail!(Failure::Ws(WsError::Protocol("unexpected continuation")));
                 };
-                let (payload, guards) = match read_data_payload(
+                // The frame reader already enforces the message cap when it
+                // parses the header; this keeps the append below safe even if
+                // that ever changes.
+                let total = message.payload.len().saturating_add(header.payload_len);
+                if total > ctx.limits.max_message_payload {
+                    fail!(Failure::Ws(WsError::MessageTooLarge));
+                }
+                let class = Class::Bulk;
+                if let Err(failure) = read_data_payload(
                     &mut reader,
                     &header,
-                    &capacity,
-                    &ingress_scope,
-                    wait_timeout,
+                    ctx,
+                    class,
                     payload_deadline,
+                    &mut message,
+                    &mut progress_bytes,
+                    &mut last_progress,
                 )
                 .await
                 {
-                    Ok(value) => value,
-                    Err(failure) => fail!(failure),
-                };
-                if message.payload.len().saturating_add(payload.len()) > limits.max_message_payload
-                {
-                    fail!(Failure::Ws(WsError::MessageTooLarge));
+                    fail!(failure);
                 }
-                metrics.observe_frame_size(header.payload_len);
-                message.payload.extend_from_slice(&payload);
-                message.guards.extend(guards);
+                ctx.metrics.observe_frame_size(header.payload_len);
                 if header.fin {
                     message_started = None;
-                    if let Err(failure) = finish_message(&tx, message, &limits).await {
+                    progress_bytes = 0;
+                    if let Err(failure) = finish_message(tx, message, ctx).await {
                         let _ = tx.send(failure).await;
                         return;
                     }
@@ -800,33 +906,72 @@ async fn read_loop<R>(
     }
 }
 
+/// Read the next frame header while no message is in progress.
+///
+/// Without an idle timeout this waits indefinitely, which is the documented
+/// default. With one, the socket is closed once nothing has been received
+/// from it and nothing has been relayed to it for the whole timeout.
+async fn read_idle_header<R>(
+    reader: &mut FrameReader<R>,
+    ctx: &ReadContext,
+    last_inbound: Instant,
+) -> Result<FrameHeader, Failure>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(idle) = ctx.idle_timeout else {
+        return reader.read_header().await.map_err(Failure::Ws);
+    };
+    // One future for the whole wait: the timer below may fire many times
+    // while a header is still arriving, and there is no reason to restart the
+    // read each time (`read_header` could be restarted safely, though).
+    let header = reader.read_header();
+    tokio::pin!(header);
+    loop {
+        let quiet = last_inbound.elapsed().min(ctx.activity.idle_for());
+        let left = idle.saturating_sub(quiet);
+        if left.is_zero() {
+            return Err(Failure::Idle);
+        }
+        if let Ok(result) = tokio::time::timeout(left, &mut header).await {
+            return result.map_err(Failure::Ws);
+        }
+    }
+}
+
 /// Read one data-frame payload in [`INGRESS_CHUNK_BYTES`] chunks, charging the
-/// ingress budget as bytes actually arrive.
+/// ingress budget as bytes actually arrive and appending them to `message`.
 ///
 /// At most one chunk per connection is transiently allocated before it is
 /// charged. A peer that declares a large frame but never sends it therefore
-/// holds only the per-message overhead, not the whole declared payload.
+/// holds only the per-message overhead, not the whole declared payload. Each
+/// chunk must also arrive within the stall timeout, so a peer that sends part
+/// of a frame and then goes silent does not keep its reservation for the
+/// whole frame deadline.
+#[allow(clippy::too_many_arguments)]
 async fn read_data_payload<R>(
     reader: &mut FrameReader<R>,
-    header: &crate::ws::FrameHeader,
-    capacity: &Arc<crate::capacity::Capacity>,
-    ingress_scope: &Arc<ConnIngress>,
-    wait_timeout: Duration,
-    deadline: tokio::time::Instant,
-) -> Result<(Vec<u8>, Vec<ScopedGuard>), Failure>
+    header: &FrameHeader,
+    ctx: &ReadContext,
+    class: Class,
+    deadline: Instant,
+    message: &mut Assembling,
+    progress_bytes: &mut usize,
+    last_progress: &mut Instant,
+) -> Result<(), Failure>
 where
     R: AsyncRead + Unpin,
 {
     let mut remaining = reader.begin_payload(header).map_err(Failure::Ws)?;
-    // Grow the assembled payload only after each chunk has been charged, so the
-    // only uncharged memory per in-flight read is the 8 KiB chunk buffer below.
-    let mut payload = Vec::new();
-    let mut guards = Vec::new();
+    // The message grows only after each chunk has been charged, so the only
+    // uncharged memory per in-flight read is this one scratch chunk.
+    let mut scratch = vec![0u8; remaining.min(INGRESS_CHUNK_BYTES)];
     while remaining > 0 {
         let chunk_len = remaining.min(INGRESS_CHUNK_BYTES);
-        let mut chunk = vec![0u8; chunk_len];
+        let chunk = &mut scratch[..chunk_len];
+        let read_deadline = deadline.min(Instant::now() + ctx.read_stall_timeout);
         let read =
-            match tokio::time::timeout_at(deadline, reader.read_payload_chunk(&mut chunk)).await {
+            match tokio::time::timeout_at(read_deadline, reader.read_payload_chunk(chunk)).await {
                 Ok(Ok(read)) => read,
                 Ok(Err(error)) => return Err(Failure::Ws(error)),
                 Err(_) => return Err(Failure::ReadTimeout),
@@ -837,28 +982,29 @@ where
                 "short WebSocket payload chunk",
             ))));
         }
-        let wait = bounded_budget_wait(deadline, wait_timeout)?;
-        let guard = reserve_weighted(
-            capacity,
-            ingress_scope,
-            capacity.ingress.chunk_weight(chunk_len),
-            wait,
-        )
-        .await?;
-        payload.extend_from_slice(&chunk);
-        guards.push(guard);
+        let wait = bounded_budget_wait(deadline, ctx.wait_timeout)?;
+        let request = Reservation {
+            weighted: ctx.capacity.ingress.chunk_weight(chunk_len),
+            class,
+            frame_need: ctx.capacity.ingress.frame_weight(remaining),
+        };
+        let guard = reserve(ctx, request, chunk_len, wait).await?;
+        message.payload.extend_from_slice(chunk);
+        message.guards.push(guard);
+        *progress_bytes = progress_bytes.saturating_add(chunk_len);
+        if *progress_bytes >= INGRESS_CHUNK_BYTES {
+            *progress_bytes %= INGRESS_CHUNK_BYTES;
+            *last_progress = Instant::now();
+        }
         remaining -= chunk_len;
     }
-    Ok((payload, guards))
+    Ok(())
 }
 
 /// Remaining budget wait, bounded by the frame/message read deadline so a
 /// source cannot extend its read deadline by waiting for ingress capacity.
-fn bounded_budget_wait(
-    deadline: tokio::time::Instant,
-    wait_timeout: Duration,
-) -> Result<Duration, Failure> {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+fn bounded_budget_wait(deadline: Instant, wait_timeout: Duration) -> Result<Duration, Failure> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         Err(Failure::ReadTimeout)
     } else {
@@ -866,27 +1012,31 @@ fn bounded_budget_wait(
     }
 }
 
-async fn reserve_weighted(
-    capacity: &Arc<crate::capacity::Capacity>,
-    ingress_scope: &Arc<ConnIngress>,
-    weighted: u64,
+/// Reserve node-wide budget for `payload_bytes` newly read bytes and account
+/// it to this connection's cap and to its in-progress message.
+async fn reserve(
+    ctx: &ReadContext,
+    request: Reservation,
+    payload_bytes: usize,
     wait_timeout: Duration,
 ) -> Result<ScopedGuard, Failure> {
-    let guard = capacity
+    let weighted = request.weighted;
+    let guard = ctx
+        .capacity
         .ingress
-        .reserve_weighted(weighted, wait_timeout)
+        .reserve(&ctx.hold, request, wait_timeout)
         .await
-        .map_err(Failure::Budget)?;
-    let previous = ingress_scope.used.fetch_add(weighted, Ordering::Relaxed);
-    if previous.saturating_add(weighted) > ingress_scope.limit {
-        ingress_scope.used.fetch_sub(weighted, Ordering::Relaxed);
-        return Err(Failure::Budget(BudgetError::Exhausted));
-    }
-    Ok(ScopedGuard {
-        guard: Some(guard),
-        scope: Arc::clone(ingress_scope),
-        weighted,
-    })
+        .map_err(|error| {
+            tracing::debug!(error = %error, "ingress reservation failed");
+            Failure::Budget
+        })?;
+    let pool = guard.pool();
+    let scoped = ctx
+        .ingress_scope
+        .try_scope(guard)
+        .map_err(|_| Failure::Budget)?;
+    ctx.hold.charged(pool, weighted, payload_bytes);
+    Ok(scoped)
 }
 
 struct Assembling {
@@ -895,27 +1045,10 @@ struct Assembling {
     guards: Vec<ScopedGuard>,
 }
 
-async fn read_header_bounded<R>(
-    reader: &mut FrameReader<R>,
-    timeout: Option<Duration>,
-) -> Result<crate::ws::FrameHeader, Failure>
-where
-    R: AsyncRead + Unpin,
-{
-    match timeout {
-        Some(remaining) => match tokio::time::timeout(remaining, reader.read_header()).await {
-            Ok(Ok(header)) => Ok(header),
-            Ok(Err(error)) => Err(Failure::Ws(error)),
-            Err(_) => Err(Failure::ReadTimeout),
-        },
-        None => reader.read_header().await.map_err(Failure::Ws),
-    }
-}
-
 /// Read a small control payload (close/ping/pong, at most 125 bytes).
 async fn read_small_payload<R>(
     reader: &mut FrameReader<R>,
-    header: &crate::ws::FrameHeader,
+    header: &FrameHeader,
     timeout: Duration,
 ) -> Result<Bytes, Failure>
 where
@@ -928,21 +1061,27 @@ where
     }
 }
 
+/// Validate a complete message and hand it to the main task.
+///
+/// The message stops being an *incomplete* hold here: from now on its budget
+/// is released by delivery, which the relay bounds itself, so it is no longer
+/// a candidate for reclaim.
 async fn finish_message(
     tx: &mpsc::Sender<Inbound>,
     message: Assembling,
-    limits: &WsLimits,
+    ctx: &ReadContext,
 ) -> Result<(), Inbound> {
-    if message.payload.len() > limits.max_message_payload {
+    if message.payload.len() > ctx.limits.max_message_payload {
         return Err(Inbound::Failed(Failure::Ws(WsError::MessageTooLarge)));
     }
     if message.opcode == OpCode::Text && std::str::from_utf8(&message.payload).is_err() {
         return Err(Inbound::Failed(Failure::Ws(WsError::InvalidUtf8)));
     }
+    ctx.hold.message_done();
     tx.send(Inbound::Message {
         opcode: message.opcode,
         payload: Bytes::from(message.payload),
-        guards: message.guards,
+        budget: BudgetHold::new(message.guards),
     })
     .await
     .map_err(|_| Inbound::Close {

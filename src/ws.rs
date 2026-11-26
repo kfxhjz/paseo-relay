@@ -37,13 +37,26 @@ pub const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 ///
 /// This is the historical 32 MiB wire ceiling minus the 14-byte maximum masked
 /// frame header (2-byte fixed header + 8-byte extended length + 4-byte mask).
-pub const MAX_CLIENT_FRAME_PAYLOAD: usize = 32 * 1024 * 1024 - 14;
+pub use crate::config::MAX_CLIENT_FRAME_PAYLOAD;
 
 /// Per-connection frame cap for the v2 control socket.
 ///
 /// This is a relay policy limit, not an RFC 6455 limit; RFC control frames are
 /// still bounded to 125 payload bytes by [`FrameReader::read_header`].
-pub const MAX_CONTROL_PAYLOAD: usize = 64 * 1024;
+pub use crate::config::CONTROL_FRAME_BYTES as MAX_CONTROL_PAYLOAD;
+
+/// Largest masked client frame header: 2 fixed bytes, 8 bytes of extended
+/// length, 4 bytes of masking key.
+const MAX_HEADER_BYTES: usize = 14;
+
+/// Size of the reader's inline read-ahead buffer.
+///
+/// Parsing a header field by field costs three socket reads per frame. The
+/// reader instead takes whatever is available, up to this many bytes, so a
+/// header and a small payload usually arrive in one read. The buffer is part
+/// of the reader itself (no allocation) and is the only place payload bytes
+/// can sit before the caller has asked for them.
+const READ_AHEAD: usize = 256;
 
 /// Maximum number of fragments accepted for one data message.
 ///
@@ -182,6 +195,11 @@ pub struct FrameReader<R> {
     fragmented_len: Option<usize>,
     /// Number of frames seen for the in-progress fragmented message.
     fragments: usize,
+    /// Bytes read from the stream but not consumed yet:
+    /// `ahead[ahead_start..ahead_end]`.
+    ahead: [u8; READ_AHEAD],
+    ahead_start: usize,
+    ahead_end: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -194,6 +212,63 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             payload: None,
             fragmented_len: None,
             fragments: 0,
+            ahead: [0; READ_AHEAD],
+            ahead_start: 0,
+            ahead_end: 0,
+        }
+    }
+
+    fn buffered(&self) -> usize {
+        self.ahead_end - self.ahead_start
+    }
+
+    /// Byte `offset` of the frame header being parsed.
+    fn header_byte(&self, offset: usize) -> u8 {
+        self.ahead[self.ahead_start + offset]
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.ahead_start += count;
+        if self.ahead_start == self.ahead_end {
+            self.ahead_start = 0;
+            self.ahead_end = 0;
+        }
+    }
+
+    /// Read until at least `needed` bytes are buffered. `Ok(false)` means the
+    /// stream ended first.
+    ///
+    /// Each `read` asks for all the free space, so one call normally returns
+    /// more than `needed`; the loop only repeats when the peer delivers a
+    /// header in pieces. Buffer state changes only after a `read` completes,
+    /// so dropping this future loses no bytes.
+    async fn fill(&mut self, needed: usize) -> io::Result<bool> {
+        debug_assert!(needed <= MAX_HEADER_BYTES);
+        if self.buffered() >= needed {
+            return Ok(true);
+        }
+        if self.ahead_start > 0 {
+            self.ahead.copy_within(self.ahead_start..self.ahead_end, 0);
+            self.ahead_end -= self.ahead_start;
+            self.ahead_start = 0;
+        }
+        while self.ahead_end < needed {
+            let read = self.reader.read(&mut self.ahead[self.ahead_end..]).await?;
+            if read == 0 {
+                return Ok(false);
+            }
+            self.ahead_end += read;
+        }
+        Ok(true)
+    }
+
+    /// Like [`Self::fill`], for the part of a header after its first two
+    /// bytes: the stream ending there is always an error.
+    async fn fill_header(&mut self, needed: usize) -> Result<(), WsError> {
+        if self.fill(needed).await? {
+            Ok(())
+        } else {
+            Err(truncated_header())
         }
     }
 
@@ -220,11 +295,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             ));
         }
 
-        let mut head = [0u8; 2];
-        self.read_fixed_header(&mut head).await?;
-
-        let b0 = head[0];
-        let b1 = head[1];
+        // A clean EOF between frames is a normal close; EOF inside a header
+        // is a truncated frame.
+        if !self.fill(2).await? {
+            return Err(if self.buffered() == 0 {
+                WsError::Closed
+            } else {
+                truncated_header()
+            });
+        }
+        let b0 = self.header_byte(0);
+        let b1 = self.header_byte(1);
 
         let fin = b0 & 0x80 != 0;
         if b0 & 0x70 != 0 {
@@ -238,14 +319,15 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
         let len7 = usize::from(b1 & 0x7F);
 
-        let payload_len = if is_control(opcode) {
+        // `length_bytes` is the size of the extended length field.
+        let (payload_len, length_bytes) = if is_control(opcode) {
             if !fin {
                 return Err(WsError::Protocol("control frames must not be fragmented"));
             }
             if len7 > 125 {
                 return Err(WsError::Protocol("control frame payload exceeds 125 bytes"));
             }
-            len7
+            (len7, 0)
         } else {
             self.read_extended_length(len7).await?
         };
@@ -255,8 +337,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
 
         // Track fragmented-message assembly limits without buffering the
-        // message here; the caller still owns payload forwarding.
-        match opcode {
+        // message here; the caller still owns payload forwarding. The new
+        // state is only computed here and committed below, after the last
+        // await: dropping this future part-way and calling `read_header`
+        // again then parses the same bytes from the same state.
+        let (fragmented_len, fragments) = match opcode {
             OpCode::Text | OpCode::Binary => {
                 if self.fragmented_len.is_some() {
                     return Err(WsError::Protocol(
@@ -266,14 +351,13 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if payload_len > self.limits.max_message_payload {
                     return Err(WsError::MessageTooLarge);
                 }
-                if !fin {
-                    self.fragmented_len = Some(payload_len);
-                    self.fragments = 1;
-                    if self.fragments > self.limits.max_fragments {
+                if fin {
+                    (None, 0)
+                } else {
+                    if self.limits.max_fragments == 0 {
                         return Err(WsError::Protocol("too many message fragments"));
                     }
-                } else {
-                    self.fragments = 0;
+                    (Some(payload_len), 1)
                 }
             }
             OpCode::Continuation => {
@@ -286,20 +370,28 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if total > self.limits.max_message_payload {
                     return Err(WsError::MessageTooLarge);
                 }
-                self.fragments = self.fragments.saturating_add(1);
-                if self.fragments > self.limits.max_fragments {
+                let fragments = self.fragments.saturating_add(1);
+                if fragments > self.limits.max_fragments {
                     return Err(WsError::Protocol("too many message fragments"));
                 }
-                self.fragmented_len = if fin { None } else { Some(total) };
                 if fin {
-                    self.fragments = 0;
+                    (None, 0)
+                } else {
+                    (Some(total), fragments)
                 }
             }
-            OpCode::Close | OpCode::Ping | OpCode::Pong => {}
-        }
+            // Control frames may be interleaved with a fragmented message.
+            OpCode::Close | OpCode::Ping | OpCode::Pong => (self.fragmented_len, self.fragments),
+        };
 
-        let mut mask_key = [0u8; 4];
-        self.reader.read_exact(&mut mask_key).await?;
+        let mask_at = 2 + length_bytes;
+        self.fill_header(mask_at + 4).await?;
+        let mask_key = [
+            self.header_byte(mask_at),
+            self.header_byte(mask_at + 1),
+            self.header_byte(mask_at + 2),
+            self.header_byte(mask_at + 3),
+        ];
 
         let header = FrameHeader {
             fin,
@@ -307,6 +399,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             payload_len,
             mask_key,
         };
+        self.consume(mask_at + 4);
+        self.fragmented_len = fragmented_len;
+        self.fragments = fragments;
         self.pending = Some(header);
         Ok(header)
     }
@@ -363,10 +458,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         let offset = state.offset;
         let mask = state.mask;
 
-        self.reader.read_exact(&mut buf[..length]).await?;
-        for (index, byte) in buf[..length].iter_mut().enumerate() {
-            *byte ^= mask[(offset + index) & 3];
+        // Payload bytes that arrived together with the header come first; the
+        // rest is read straight into the caller's buffer.
+        let ahead = self.buffered().min(length);
+        if ahead > 0 {
+            buf[..ahead].copy_from_slice(&self.ahead[self.ahead_start..self.ahead_start + ahead]);
+            self.consume(ahead);
         }
+        if ahead < length {
+            self.reader.read_exact(&mut buf[ahead..length]).await?;
+        }
+        unmask(&mut buf[..length], mask, offset);
 
         if let Some(state) = self.payload.as_mut() {
             state.remaining -= length;
@@ -407,44 +509,29 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Ok(Bytes::from(payload))
     }
 
-    /// Read the 2-byte fixed header, mapping a clean EOF between frames to
-    /// [`WsError::Closed`].
-    async fn read_fixed_header(&mut self, head: &mut [u8; 2]) -> Result<(), WsError> {
-        let mut filled = 0usize;
-        while filled < head.len() {
-            let read = self.reader.read(&mut head[filled..]).await?;
-            if read == 0 {
-                return if filled == 0 {
-                    Err(WsError::Closed)
-                } else {
-                    Err(WsError::Io(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "unexpected end of stream in a WebSocket frame header",
-                    )))
-                };
-            }
-            filled += read;
-        }
-        Ok(())
-    }
-
-    /// Read and decode an extended payload length (RFC 6455 section 5.2).
-    async fn read_extended_length(&mut self, len7: usize) -> Result<usize, WsError> {
+    /// Decode the payload length (RFC 6455 section 5.2), returning it with the
+    /// size of the extended length field that follows the two fixed bytes.
+    async fn read_extended_length(&mut self, len7: usize) -> Result<(usize, usize), WsError> {
         match len7 {
             126 => {
-                let mut bytes = [0u8; 2];
-                self.reader.read_exact(&mut bytes).await?;
-                let length = usize::from(u16::from_be_bytes(bytes));
+                self.fill_header(2 + 2).await?;
+                let length = usize::from(u16::from_be_bytes([
+                    self.header_byte(2),
+                    self.header_byte(3),
+                ]));
                 if length < 126 {
                     return Err(WsError::Protocol(
                         "non-minimal 16-bit frame length encoding",
                     ));
                 }
-                Ok(length)
+                Ok((length, 2))
             }
             127 => {
+                self.fill_header(2 + 8).await?;
                 let mut bytes = [0u8; 8];
-                self.reader.read_exact(&mut bytes).await?;
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = self.header_byte(2 + index);
+                }
                 let length = u64::from_be_bytes(bytes);
                 if length & (1 << 63) != 0 {
                     return Err(WsError::Protocol(
@@ -459,10 +546,41 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if length > self.limits.max_frame_payload as u64 {
                     return Err(WsError::FrameTooLarge);
                 }
-                usize::try_from(length).map_err(|_| WsError::FrameTooLarge)
+                let length = usize::try_from(length).map_err(|_| WsError::FrameTooLarge)?;
+                Ok((length, 8))
             }
-            length => Ok(length),
+            length => Ok((length, 0)),
         }
+    }
+}
+
+fn truncated_header() -> WsError {
+    WsError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "unexpected end of stream in a WebSocket frame header",
+    ))
+}
+
+/// XOR `buf` with the client masking key. `offset` is the position of
+/// `buf[0]` within the frame payload, so a payload can be unmasked in pieces.
+fn unmask(buf: &mut [u8], mask: [u8; 4], offset: usize) {
+    // Rotate the key once so the loop body has no per-byte index arithmetic;
+    // fixed four-byte steps let the compiler vectorise the XOR.
+    let key = [
+        mask[offset & 3],
+        mask[(offset + 1) & 3],
+        mask[(offset + 2) & 3],
+        mask[(offset + 3) & 3],
+    ];
+    let (words, tail) = buf.as_chunks_mut::<4>();
+    for word in words {
+        word[0] ^= key[0];
+        word[1] ^= key[1];
+        word[2] ^= key[2];
+        word[3] ^= key[3];
+    }
+    for (byte, key) in tail.iter_mut().zip(key) {
+        *byte ^= key;
     }
 }
 
@@ -522,9 +640,30 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             10
         };
 
-        self.writer.write_all(&header[..header_len]).await?;
-        if !payload.is_empty() {
+        let header = &header[..header_len];
+        if payload.is_empty() {
+            self.writer.write_all(header).await?;
+            return Ok(());
+        }
+        // Hand the header and the payload to the transport together. Sockets
+        // run with TCP_NODELAY, so two separate writes would put a two-byte
+        // header in its own segment (or TLS record) ahead of every payload.
+        // A transport without vectored writes takes only the header here and
+        // the code below sends the rest, exactly as two writes would.
+        let written = self
+            .writer
+            .write_vectored(&[io::IoSlice::new(header), io::IoSlice::new(payload)])
+            .await?;
+        if written == 0 {
+            return Err(WsError::Io(io::ErrorKind::WriteZero.into()));
+        }
+        if written < header_len {
+            self.writer.write_all(&header[written..]).await?;
             self.writer.write_all(payload).await?;
+        } else {
+            self.writer
+                .write_all(&payload[written - header_len..])
+                .await?;
         }
         Ok(())
     }
@@ -1386,6 +1525,347 @@ mod tests {
         let error = reader.read_header().await.unwrap_err();
         assert!(matches!(error, WsError::Protocol(_)));
         assert_eq!(error.close_code(), 1002);
+    }
+
+    /// Deterministic pseudo-random numbers for the randomised codec tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Reader that hands out its bytes in arbitrary small pieces, the way a
+    /// socket delivers a stream.
+    struct Dribble {
+        data: Vec<u8>,
+        at: usize,
+        rng: Lcg,
+    }
+
+    impl AsyncRead for Dribble {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let left = self.data.len() - self.at;
+            let step = (1 + self.rng.below(37)).min(left).min(buf.remaining());
+            let at = self.at;
+            buf.put_slice(&self.data[at..at + step]);
+            self.at += step;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_roundtrips_random_frames_delivered_in_random_pieces() {
+        // The read-ahead buffer must never lose, duplicate or reorder a byte,
+        // whatever the frame sizes and however the stream is cut up.
+        for seed in 0..40u64 {
+            let mut rng = Lcg(seed * 7919 + 1);
+            let mut wire = Vec::new();
+            let mut expected: Vec<(OpCode, Vec<u8>)> = Vec::new();
+            for _ in 0..30 {
+                let (opcode, length) = match rng.below(10) {
+                    0 => (OpCode::Ping, rng.below(126)),
+                    1 => (OpCode::Pong, rng.below(126)),
+                    // Around the read-ahead and length-encoding boundaries.
+                    2 => (OpCode::Binary, READ_AHEAD - 16 + rng.below(32)),
+                    3 => (OpCode::Binary, 120 + rng.below(12)),
+                    4 => (OpCode::Text, 65_530 + rng.below(12)),
+                    5 => (OpCode::Binary, 0),
+                    _ => (OpCode::Binary, rng.below(3000)),
+                };
+                let payload: Vec<u8> = (0..length).map(|_| b'a' + rng.below(26) as u8).collect();
+                let mask = [
+                    rng.below(256) as u8,
+                    rng.below(256) as u8,
+                    rng.below(256) as u8,
+                    rng.below(256) as u8,
+                ];
+                wire.extend(encode_frame(true, opcode, &payload, Some(mask)));
+                expected.push((opcode, payload));
+            }
+
+            let dribble = Dribble {
+                data: wire,
+                at: 0,
+                rng: Lcg(seed + 99),
+            };
+            let mut reader = FrameReader::new(dribble, WsLimits::default());
+            for (index, (opcode, payload)) in expected.iter().enumerate() {
+                let header = reader.read_header().await.unwrap();
+                assert_eq!(header.opcode, *opcode, "seed {seed} frame {index}");
+                assert_eq!(
+                    header.payload_len,
+                    payload.len(),
+                    "seed {seed} frame {index}"
+                );
+                // Consume in uneven chunks, as the connection reader does.
+                let mut remaining = reader.begin_payload(&header).unwrap();
+                let mut got = Vec::with_capacity(remaining);
+                while remaining > 0 {
+                    let mut chunk = vec![0u8; remaining.min(1 + rng.below(700))];
+                    let read = reader.read_payload_chunk(&mut chunk).await.unwrap();
+                    assert_eq!(read, chunk.len());
+                    got.extend_from_slice(&chunk);
+                    remaining -= read;
+                }
+                assert_eq!(&got, payload, "seed {seed} frame {index}");
+            }
+            assert!(matches!(reader.read_header().await, Err(WsError::Closed)));
+        }
+    }
+
+    /// Reader that yields `Pending` once before each of its first `stalls`
+    /// reads, so a `read_header` future can be dropped part-way.
+    struct Stalling {
+        data: Vec<u8>,
+        at: usize,
+        step: usize,
+        stalls: usize,
+        armed: bool,
+    }
+
+    impl AsyncRead for Stalling {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.stalls > 0 && !self.armed {
+                self.armed = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                self.armed = false;
+            }
+            let step = self
+                .step
+                .min(self.data.len() - self.at)
+                .min(buf.remaining());
+            let at = self.at;
+            buf.put_slice(&self.data[at..at + step]);
+            self.at += step;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_header_can_be_dropped_and_called_again() {
+        // A continuation header, delivered one byte per read so the future can
+        // be dropped after every byte. Fragment bookkeeping must be applied
+        // exactly once however often the call is restarted.
+        let mut wire = encode_frame(false, OpCode::Binary, &[1u8; 200], Some(MASK));
+        wire.extend(encode_frame(
+            false,
+            OpCode::Continuation,
+            &[2u8; 300],
+            Some(MASK),
+        ));
+        wire.extend(encode_frame(
+            true,
+            OpCode::Continuation,
+            &[3u8; 10],
+            Some(MASK),
+        ));
+        let limits = WsLimits {
+            max_frame_payload: 1024,
+            max_message_payload: 510,
+            max_fragments: 3,
+        };
+        let stalling = Stalling {
+            data: wire,
+            at: 0,
+            step: 1,
+            stalls: usize::MAX,
+            armed: false,
+        };
+        let mut reader = FrameReader::new(stalling, limits);
+
+        let mut sizes = Vec::new();
+        for _ in 0..3 {
+            let header = loop {
+                // Poll once, then drop the future whether or not it finished.
+                let attempt = {
+                    let fut = reader.read_header();
+                    tokio::pin!(fut);
+                    futures_util::poll!(fut.as_mut())
+                };
+                if let std::task::Poll::Ready(result) = attempt {
+                    break result.expect("header parses");
+                }
+            };
+            sizes.push(header.payload_len);
+            let payload = reader.read_payload(&header).await.unwrap();
+            assert_eq!(payload.len(), header.payload_len);
+        }
+        // 200 + 300 + 10 = 510 is exactly the message cap and three fragments
+        // is exactly the fragment cap: counting any header twice would fail.
+        assert_eq!(sizes, vec![200, 300, 10]);
+    }
+
+    #[tokio::test]
+    async fn reader_reports_a_header_cut_short_at_every_position() {
+        // A 64-bit length frame has the longest header: 2 + 8 + 4 bytes.
+        let frame = encode_frame(true, OpCode::Binary, &vec![1u8; 70_000], Some(MASK));
+        for cut in 1..MAX_HEADER_BYTES {
+            let mut reader = frame_reader(&frame[..cut]);
+            match reader.read_header().await {
+                Err(WsError::Io(error)) => {
+                    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "cut {cut}")
+                }
+                other => panic!("cut {cut}: expected truncated header, got {other:?}"),
+            }
+        }
+        // The complete header parses without any payload byte being present.
+        let mut reader = frame_reader(&frame[..MAX_HEADER_BYTES]);
+        assert_eq!(reader.read_header().await.unwrap().payload_len, 70_000);
+    }
+
+    #[test]
+    fn unmask_matches_the_bytewise_definition_at_every_offset() {
+        let mask = [0x12, 0xab, 0x00, 0xff];
+        for offset in 0..9 {
+            for length in 0..41 {
+                let original: Vec<u8> = (0..length as u8)
+                    .map(|byte| byte.wrapping_mul(31))
+                    .collect();
+                let mut fast = original.clone();
+                unmask(&mut fast, mask, offset);
+                let slow: Vec<u8> = original
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ mask[(offset + index) & 3])
+                    .collect();
+                assert_eq!(fast, slow, "offset {offset} length {length}");
+            }
+        }
+    }
+
+    /// Writer that records how it was called and can refuse to take more than
+    /// `step` bytes per call, with or without vectored-write support.
+    struct RecordingWriter {
+        data: Vec<u8>,
+        calls: usize,
+        vectored: bool,
+        step: usize,
+    }
+
+    impl RecordingWriter {
+        fn new(vectored: bool, step: usize) -> Self {
+            Self {
+                data: Vec::new(),
+                calls: 0,
+                vectored,
+                step,
+            }
+        }
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.calls += 1;
+            let take = buf.len().min(self.step);
+            self.data.extend_from_slice(&buf[..take]);
+            std::task::Poll::Ready(Ok(take))
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if !self.vectored {
+                // What a transport without vectored writes does: only the
+                // first non-empty buffer.
+                let first = bufs
+                    .iter()
+                    .find(|buf| !buf.is_empty())
+                    .map_or(&[][..], |b| &**b);
+                return self.poll_write(cx, first);
+            }
+            self.calls += 1;
+            let mut budget = self.step;
+            let mut written = 0;
+            for buf in bufs {
+                let take = buf.len().min(budget);
+                self.data.extend_from_slice(&buf[..take]);
+                written += take;
+                budget -= take;
+            }
+            std::task::Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_sends_header_and_payload_in_one_write() {
+        let mut writer = FrameWriter::new(RecordingWriter::new(true, usize::MAX));
+        writer
+            .write_frame(true, OpCode::Text, b"hello")
+            .await
+            .unwrap();
+        let inner = writer.into_inner();
+        assert_eq!(inner.calls, 1, "header and payload must share one write");
+        assert_eq!(
+            decode_server_frame(&inner.data),
+            (true, OpCode::Text, b"hello".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_output_is_identical_however_the_transport_takes_it() {
+        let payload: Vec<u8> = (0..70_000u32).map(|index| index as u8).collect();
+        let reference = write_one(true, OpCode::Binary, &payload).await;
+        // Vectored or not; whole frame, mid-payload, mid-header, byte by byte.
+        for vectored in [true, false] {
+            for step in [usize::MAX, 4096, 7, 3, 1] {
+                let mut writer = FrameWriter::new(RecordingWriter::new(vectored, step));
+                writer
+                    .write_frame(true, OpCode::Binary, &payload)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    writer.into_inner().data,
+                    reference,
+                    "vectored={vectored} step={step}"
+                );
+            }
+        }
     }
 
     fn upgrade_headers() -> HeaderMap {
