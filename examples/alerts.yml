@@ -36,3 +36,26 @@ groups:
           severity: warning
         annotations:
           summary: "Relay {{ $labels.instance }} ingress budget is >80% reserved"
+      # The two rules below use counters added after v0.1.2; on older relays
+      # the series do not exist and the rules simply never fire.
+      #
+      # Reclaims mean the budget was full and the relay closed stalled or
+      # oversized in-progress messages to keep other sessions moving. A few
+      # are normal under load; a steady stream is someone parking unfinished
+      # messages, or a budget that is too small for the traffic.
+      - alert: PaseoRelayIngressReclaims
+        expr: increase(paseo_relay_ingress_reclaims_total[5m]) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay {{ $labels.instance }} keeps reclaiming in-progress messages to free ingress budget"
+      # Rejections mean a source waited the whole reservation timeout and was
+      # closed 1013: reclaiming did not free enough. Users are being dropped.
+      - alert: PaseoRelayIngressRejections
+        expr: increase(paseo_relay_ingress_rejections_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Relay {{ $labels.instance }} is closing sources that cannot reserve ingress budget"

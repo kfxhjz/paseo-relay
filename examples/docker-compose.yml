@@ -32,6 +32,12 @@ services:
       PASEO_RELAY_PORT: "4000"
       PASEO_RELAY_LOG: "info"
       PASEO_RELAY_LOG_FORMAT: "json"
+      # Releases after v0.1.2: serve /ready, /metrics and /version on a
+      # separate operations listener instead of port 4000. The default
+      # PASEO_RELAY_OPS_HOST is 127.0.0.1, i.e. reachable only inside this
+      # container (the healthcheck below follows it automatically); set it to
+      # "0.0.0.0" to scrape from another container on the Compose network.
+      # PASEO_RELAY_OPS_PORT: "4001"
       # Sized for a 512 MB container; raise together with PASEO_RELAY_MEM_LIMIT.
       # An idle accepted socket costs ~23 KiB, so keep MAX_TCP_CONNECTIONS well
       # below RAM/30 KiB. The built-in defaults (20k/25k) need ~700-800 MiB idle.

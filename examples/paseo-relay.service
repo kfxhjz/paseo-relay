@@ -7,6 +7,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/paseo-relay
+# Releases after v0.1.2 reload PASEO_RELAY_TLS_CERT/KEY on SIGHUP without
+# dropping sessions (`systemctl reload paseo-relay` after a renewal). v0.1.2
+# and earlier exit on SIGHUP: leave this line out for those.
+ExecReload=/bin/kill -HUP $MAINPID
 EnvironmentFile=/etc/paseo-relay.env
 User=paseo-relay
 Group=paseo-relay
@@ -14,6 +18,10 @@ Restart=always
 RestartSec=2
 # Must exceed PASEO_RELAY_SHUTDOWN_GRACE_MS.
 TimeoutStopSec=30
+# Every connection is one file descriptor, and systemd's default soft limit is
+# 1024: without this, accept() starts failing far below
+# PASEO_RELAY_MAX_TCP_CONNECTIONS (25,000 by default). Keep it above that cap.
+LimitNOFILE=65536
 # Optional hardening when running on a dedicated host:
 NoNewPrivileges=true
 PrivateTmp=true

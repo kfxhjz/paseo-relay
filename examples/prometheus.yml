@@ -1,5 +1,8 @@
 # Example Prometheus scrape configuration. Keep /metrics on an internal
 # network; the relay's ops endpoints have no authentication.
+#
+# If the relays run with PASEO_RELAY_OPS_PORT (releases after v0.1.2), scrape
+# that port instead of 4000: /metrics is no longer served on the public port.
 scrape_configs:
   - job_name: paseo-relay
     metrics_path: /metrics

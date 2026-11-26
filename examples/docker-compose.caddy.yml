@@ -35,6 +35,12 @@ services:
       PASEO_RELAY_PORT: "4000"
       PASEO_RELAY_LOG: "info"
       PASEO_RELAY_LOG_FORMAT: "json"
+      # Releases after v0.1.2: serve /ready, /metrics and /version on a
+      # separate operations listener instead of port 4000. The default
+      # PASEO_RELAY_OPS_HOST is 127.0.0.1, i.e. reachable only inside this
+      # container (the healthcheck below follows it automatically); set it to
+      # "0.0.0.0" to scrape from another container on the Compose network.
+      # PASEO_RELAY_OPS_PORT: "4001"
       # 129 MiB weighted ingress for a small VPS. The validator requires room
       # for one maximum message including the 256-byte per-message overhead and
       # 192-per-chunk bookkeeping (135,201,736 bytes at the defaults), and the
@@ -65,6 +71,11 @@ services:
     # Pinned multi-arch manifest for caddy:2.10-alpine.
     image: "caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d"
     restart: unless-stopped
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: "256m"
     depends_on:
       relay:
         condition: service_healthy

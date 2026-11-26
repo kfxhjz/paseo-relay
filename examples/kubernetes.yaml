@@ -20,6 +20,11 @@ spec:
       terminationGracePeriodSeconds: 30
       # The relay never calls the Kubernetes API.
       automountServiceAccountToken: false
+      # The Service below is named `paseo-relay`, so Kubernetes would inject
+      # `PASEO_RELAY_PORT=tcp://<ip>:4000`, `PASEO_RELAY_SERVICE_HOST`, ... into
+      # the pod. Those collide with the relay's own `PASEO_RELAY_*` settings
+      # (an unset PASEO_RELAY_PORT would become a URL and abort startup).
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -37,6 +42,9 @@ spec:
           ports:
             - name: http
               containerPort: 4000
+            # With the operations listener enabled (see env below):
+            # - name: ops
+            #   containerPort: 4001
           env:
             - name: PASEO_RELAY_HOST
               value: "0.0.0.0"
@@ -62,6 +70,18 @@ spec:
             # Behind a proxy, keep the per-IP cap at 0 and limit at the edge:
             - name: PASEO_RELAY_PER_IP_MAX_CONNECTIONS
               value: "0"
+            # Releases after v0.1.2: move /ready, /metrics and /version to a
+            # separate operations listener. Port 4000 then serves only /ws and
+            # /health, and the NetworkPolicy below can admit the ingress
+            # controller to 4000 and monitoring to 4001 separately. Kubelet
+            # probes reach the pod IP, so bind 0.0.0.0. When you enable this,
+            # also add the `ops` containerPort and point the readiness,
+            # liveness and startup probes at `port: ops`: probes then keep
+            # working when the public listener is at its connection cap.
+            # - name: PASEO_RELAY_OPS_HOST
+            #   value: "0.0.0.0"
+            # - name: PASEO_RELAY_OPS_PORT
+            #   value: "4001"
           readinessProbe:
             httpGet:
               path: /ready
@@ -132,6 +152,16 @@ spec:
 # port, so keep the Service internal (do not expose it publicly) and filter the
 # operations endpoints at the ingress, or scrape them from a monitoring
 # namespace as shown in the commented rule below.
+#
+# With the operations listener enabled (PASEO_RELAY_OPS_PORT=4001, releases
+# after v0.1.2) the split becomes a port split, which NetworkPolicy can
+# enforce: keep the ingress rule on 4000 and change the monitoring rule to
+# port 4001.
+#
+# The ingress controller also writes access logs. `serverId` is a bearer
+# routing secret in the query string: with ingress-nginx, set
+# `log-format-upstream` in its ConfigMap to a format without `$request` /
+# `$request_uri` (use `$request_method $uri`), as examples/nginx.conf does.
 #
 # Note: some CNIs also apply NetworkPolicy to kubelet probe traffic. If probes
 # fail after applying this policy, additionally allow your node CIDR(s) to port
