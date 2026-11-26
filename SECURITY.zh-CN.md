@@ -58,16 +58,23 @@ query string，并把配对链接和二维码当作秘密。relay 按设计没�
   不 attach，这些消息的预算会一直占到 `DELIVERY_TIMEOUT_MS`（30 秒）或
   `DATA_ATTACH_TIMEOUT_MS`（15 秒）到期——即使源连接已断开或被替换，队列中的每条待写帧
   仍持有其 ingress 预算 guard 与绝对投递 deadline，不会脱账也不会在慢消费端无限滞留。
-  单个连接最多能持有它的 in-flight 上限，在默认配置下就是整个预算。要持续维持，大约每
-  15–30 秒需要发送一整个预算量的 payload：默认约 35–70 Mbit/s，129 MiB 时约
-  9–18 Mbit/s。调低这两个超时可以缩短这个窗口。
+  单个连接最多能持有它的 in-flight 上限：默认是
+  `min(全局预算, 4 × 一条最大消息的计费)`（默认配置下就是整个预算），也可以用
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 显式设置。要持续维持，大约每 15–30 秒需要
+  发送一整个预算量的 payload：默认约 35–70 Mbit/s，129 MiB 时约 9–18 Mbit/s。调低这两个
+  超时可以缩短这个窗口。把每连接上限设到预算以下只能减少单个 source 的份额，多条协作
+  连接仍可占满预算，而 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` 默认关闭；当派生上限等于
+  预算且没有 per-IP 上限时，relay 会在启动时告警。主要缓解手段仍然是边缘带宽/速率限制。
 - *它能拒绝什么。* 主预算被占满期间，其他 source 大于 64 KiB 的消息（以及分片消息）
   需要等待，并可能以 `1013`（可重试）关闭。不超过 64 KiB 的完整单帧消息（所有握手和大
   多数普通流量）由独立的小消息预留池服务；如果预留池也满了，它们会挤掉最大的那条未完成
   消息。要把它们也拒绝掉，必须用"永远不被投递的消息"同时占满两个池。控制通道的 `sync`
-  通知也不能绕过这套预算：每个 session 限制不同 v2 `connectionId` 数量
-  （`PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`，默认 `512`），且每个 session 只运行
-  单个去重的 control watchdog。
+  通知也不能绕过这套预算：每个 session 限制不同 v2 `connectionId` 的 **并集**（client
+  id 与 daemon data 路由共用 `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`，默认 `512`），
+  只运行单个去重的 control watchdog，并把每条生成的 `sync` 限制在 64 KiB 内。会让下一
+  条 `sync` 超限的 client 会在接入前以 `1013` "Relay session sync capacity" 拒绝，所以
+  relay 不会发出超大的控制帧；初始或 watchdog `sync` 发送失败会关闭 control socket，
+  而不是留下过期路由表。
 
 这些都受文档化的预算和 deadline 约束，但不会消失。请用边缘带宽/速率限制缓解，并对
 `paseo_relay_ingress_rejections_total`（确实有 source 被丢弃）以及
@@ -104,6 +111,18 @@ query string，并把配对链接和二维码当作秘密。relay 按设计没�
 `× ~35 KiB`（原生 TLS）规划；内置 25,000 socket 默认值约需 700–800 MiB（明文）或
 约 850–900 MiB（原生 TLS），小节点必须调低上限。
 
+`v0.1.3` 之后的版本中，内置 `paseo-relay healthcheck` 不再接受任意证书。原生 TLS 下
+它会读取 `PASEO_RELAY_TLS_CERT` 的 leaf 证书，固定其 DER SHA-256 并只接受探测目标提供
+的这一张证书，因此其他本地服务或路径 MITM 无法在 relay 不健康时返回 `200`。如果配置了
+原生 TLS 但证书文件不可读，探针只信任 loopback 目标，对任何非 loopback 的
+`PASEO_RELAY_HEALTHCHECK_HOST` fail-closed。明文监听没有可固定证书：仍允许非 loopback
+探测，但无法认证，请只在可信网络使用。
+
+`v0.1.3` 之后的版本可以用 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 调低自动派生的每连接
+ingress 上限（`min(budget, 4 × 一条最大消息的计费)`）。这能减少单个慢 source 能占的共享
+预算，但不是上条残余可用性风险的完整修复：多条连接仍可占满预算，且 per-IP 上限默认关闭。
+主要控制手段仍然是边缘的 per-source 带宽/速率限制。
+
 ## 验证发布产物
 
 v0.1.2 之后的 release 在构建时即完成签名和证明。运行镜像之前，请针对本仓库的 release
@@ -121,6 +140,29 @@ gh attestation verify "oci://$IMAGE" --repo kfxhjz/paseo-relay
 
 第一条命令校验多架构镜像上的 Sigstore keyless 签名；第二条校验 GitHub 的构建来源证明
 （build provenance attestation），其中记录了产出该 digest 的 commit 和 workflow。
+
+发布顺序保证 tag 不会指向未验证的内容。release workflow 先校验 tag 必须是严格的
+`vX.Y.Z[-prerelease]`、与 `Cargo.toml` 一致、CHANGELOG 有对应段落、且 commit 在
+`main` 上；然后构建两个平台，在临时 `candidate-<sha>` tag 下组装多架构 index，按
+digest 做 smoke test，再用 cosign keyless 签名并生成 GitHub build provenance
+attestation。只有这些全部成功，才把版本 tag 提升到同一个 digest——`latest` 还要求
+release 稳定且不低于 `main` 上最高 stable tag。因此构建、smoke 或签名任一步失败都会
+保留原来的 `latest`，乱序排队中的旧 release 也无法接管 `latest`。
+
+### 仓库设置（维护者）
+
+部分发布控制属于 GitHub 仓库设置而不是 workflow 代码，被攻破的 workflow 也无法对自己
+强制执行。维护者应：
+
+- 保护 `v*` tag（tag ruleset），防止删除或强制移动，并限制创建（为发布者留 bypass）；
+- 在 `main` 上要求完整 CI check 集：`Format`、`Clippy`、`Test`、`Release build`、
+  `Dependency audit`，再加上 **`Fuzz targets (build + smoke run)`** 和
+  **`Container image`**（CodeQL 用 code-scanning ruleset），这样坏掉的 fuzz target
+  或镜像无法合并；
+- 给 publish job 使用的 `release` environment 配置 required reviewers，让发布在
+  candidate digest 已存在、但版本 tag/`latest` 尚未提升时等待人工批准。
+
+release verify job 也会跑 fuzz smoke，所以即使分支保护设置遗漏，发布也无法跳过它。
 
 v0.1.2 及更早的版本无法用这种方式验证。v0.1.2 的 release 有一个带分离签名的
 `image-digest.txt` 资产，但它签的是一个写着 digest 的文本文件，而不是镜像本身。它的

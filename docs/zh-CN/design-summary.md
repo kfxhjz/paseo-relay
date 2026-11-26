@@ -46,8 +46,11 @@ daemon ───────┘                                                 
   给对端 role。
 - v2：control socket（server + 空 connectionId）+ 每 client connection 一个 data socket；
   支持 `sync`/`connected`/`disconnected`、替换、data 断开 `1012`、最后 client 断开
-  `1001`、control ping/pong 和 10 s nudge/15 s `1011` watchdog。
-- 空 session 在 `SESSION_IDLE_MS` 后被清理；`MAX_SESSIONS` 限制总数。
+  `1001`、control ping/pong 和 10 s nudge/15 s `1011` watchdog。每条 `sync` 限制在
+  64 KiB 内（超限的 client 以 `1013` "Relay session sync capacity" 拒绝）；每 session
+  的 `connectionId` 上限按 client id 与 data 路由的并集计数。
+- 空 session 在最后一个 socket 关闭时立即移除；`SESSION_IDLE_MS` 只是兜底清理。
+  `MAX_SESSIONS` 限制总数。
 
 ## 关键不变量
 
@@ -83,6 +86,7 @@ daemon ───────┘                                                 
 | ingress 预算等待超时 | `1013` |
 | delivery deadline/慢 destination | `1013` |
 | v2 client 等不到 data socket | `1013` |
+| v2 client 会让 control `sync` 超 64 KiB | `1013` "Relay session sync capacity" |
 | 优雅 drain/重启 | `1012` |
 | v2 server data socket 断开 | clients `1012` |
 | 最后一个 v2 client detach | data socket `1001` |
@@ -103,8 +107,8 @@ daemon ───────┘                                                 
 
 - upgrade/query 全校验后才创建状态；失败不占容量。
 - 每条消息固定 256 字节开销只计一次；payload 按 8 KiB chunk 到达时计入 ingress
-  预算；每连接 in-flight 上限为 `min(预算, 4 × 一条最大消息的计费)`；每条消息最多
-  1024 个分片。
+  预算；每连接 in-flight 上限默认是 `min(预算, 4 × 一条最大消息的计费)`，可用
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 调低；每条消息最多 1024 个分片。
 - source/destination 隔离；慢 consumer 在自己的 deadline 淘汰。
 - 单节点 + 边缘 `serverId` 哈希；无 ownership/reroute。
 - 无 Erlang distribution；可选原生 TLS；结构化日志不含 ID/payload。

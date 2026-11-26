@@ -37,6 +37,10 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
   `MAX_CONNECTIONS` 留出余量（至少 64–128 个空槽，探针突发时更多）：TCP slot 在
   整个 socket 生命周期内持有，如果两者相等，满 WebSocket 负载会在 accept 阶段拒绝
   `/health`、`/ready`、`/metrics`、镜像 HEALTHCHECK 和 k8s 探针。
+- relay 直接暴露时，考虑调低 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`。默认派生的
+  每连接上限等于整个 ingress 预算，单个 source 可以在 delivery 窗口内占满它；没有边缘
+  per-source 限制时，多条连接仍可占满预算。派生上限和 per-IP 上限都在默认/关闭值时，
+  启动日志会告警。
 - 客户端应只发送一个未编码的 `serverId`。重复 query key 在 relay 侧是 last-wins，
   而边缘一致性哈希通常使用原始 query 值，因此重复或 percent-encoded 的值可能把
   同一 session 的两端路由到不同 relay 节点。
@@ -44,6 +48,8 @@ attach 到该 session 并破坏可用性。Paseo payload 端到端加密且对 r
   `PASEO_RELAY_OPS_PORT` 把 `/ready`、`/metrics`、`/version` 完全移出公网端口。
 - 对 `paseo_relay_ingress_rejections_total`（因 ingress 预算不足被丢弃的 source）以及
   `paseo_relay_ingress_reclaims_total` 的持续上升设置告警；它们是有人在占用预算的特征。
+  也要对 `paseo_relay_ops_rejections_total` 告警：运维监听打满时，恰好在最需要的时候
+  无法访问 `/ready` 和 `/metrics`。
 - 使用提供的 scratch 镜像：read-only、非 root、drop capabilities；保持工具链/
   镜像更新。
 - 不要添加 Erlang distribution；本 relay 没有。

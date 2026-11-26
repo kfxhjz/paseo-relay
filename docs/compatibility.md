@@ -34,7 +34,7 @@ Payloads are opaque and end-to-end encrypted; the relay never decrypts them.
 | Fragments per message | At most 1024 (relay policy; exceeding `1002`) |
 | Frame length encoding | Non-minimal 126/127 encodings rejected (`1002`) |
 | Close codes | Invalid/reserved codes rejected (`1002`); valid range `1000..=1003`, `1007..=1014`, `3000..=4999` |
-| v2 control frame cap | 64 KiB |
+| v2 control frame cap | 64 KiB in both directions; inbound frames and every relay-generated `sync` are bounded to it (`1013` "Relay session sync capacity" if a client would overflow `sync`) |
 | WebSocket ping/pong | Supported (relay answers pings) |
 | WebSocket compression | Not negotiated (Paseo does not require it) |
 

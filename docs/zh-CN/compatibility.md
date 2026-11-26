@@ -32,7 +32,7 @@
 | 每条消息的分片数 | 最多 1024（relay 策略；超过 `1002`） |
 | 帧长度编码 | 非最小 126/127 长度编码被拒绝（`1002`） |
 | Close code | 非法/保留 code 被拒绝（`1002`）；合法范围 `1000..=1003`、`1007..=1014`、`3000..=4999` |
-| v2 control 帧上限 | 64 KiB |
+| v2 control 帧上限 | 双向 64 KiB；入站帧和 relay 生成的每条 `sync` 都受限（client 会让 `sync` 超限时 `1013` "Relay session sync capacity"） |
 | WebSocket ping/pong | 支持（relay 回 pong） |
 | WebSocket 压缩 | 不协商（Paseo 不要求） |
 

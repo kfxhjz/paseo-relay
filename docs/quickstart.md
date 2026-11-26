@@ -35,7 +35,10 @@ docker compose -f examples/docker-compose.caddy.yml up -d
 
 The Compose file pulls the current release,
 `ghcr.io/kfxhjz/paseo-relay:v0.1.3`; `latest` follows the newest stable release
-(prerelease tags do not move it). Set `PASEO_RELAY_IMAGE` to override the
+(prerelease tags do not move it). The release workflow smoke-tests and
+signs/attests the image by digest before promoting the version tag or `latest`,
+so following `latest` does not pick up an unverified build. Set
+`PASEO_RELAY_IMAGE` to override the
 version, and see [deployment.md](deployment.md) if you need an immutable digest
 pin. The example also caps `PASEO_RELAY_MAX_CONNECTIONS` (4,000),
 `PASEO_RELAY_MAX_SESSIONS` (4,000), and `PASEO_RELAY_MAX_TCP_CONNECTIONS`
@@ -116,6 +119,7 @@ and the relay drains existing sessions within its grace window.
 | `/health` works but pairing fails | Use `wss`/443; the mobile client must reach the same public endpoint |
 | 502/504 from Caddy | Relay container healthy? `docker compose logs relay` |
 | All connections rejected | Check `PASEO_RELAY_MAX_CONNECTIONS`, `/ready`, and relay logs |
+| `healthcheck` fails with "not loopback" | Native TLS configured but `PASEO_RELAY_TLS_CERT` unreadable: the probe only trusts loopback. Fix the certificate or use a loopback target. Plaintext non-loopback probes are allowed but unauthenticated |
 | Metrics missing | `/metrics` and `/ready` are blocked at Caddy; scrape the relay over the internal network |
 | Need to take the node down | Remove from any edge, send SIGTERM, wait for the grace window |
 | OOM or build fails | Use the prebuilt image; raise `PASEO_RELAY_MEM_LIMIT` and the connection caps together (idle sockets cost ~23 KiB each), or give the build at least ~1 GB RAM |

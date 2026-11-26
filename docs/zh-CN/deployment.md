@@ -47,7 +47,10 @@ flowchart TD
 30 秒内自行重新加载，不会断开已有会话（`v0.1.2` 之后的版本；见
 [operations.md](operations.md) 的"轮换 TLS 证书"）。此时客户端直接连到 relay，所以还
 应设置 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS`，并用 `PASEO_RELAY_OPS_PORT` 把运维端点
-移出公网端口（见下文）。
+移出公网端口（见下文）。内置 `paseo-relay healthcheck` 会固定
+`PASEO_RELAY_TLS_CERT` 的 leaf 证书（DER SHA-256），只接受这一张证书，因此非 loopback
+的探测目标无法由其他本地服务冒充；配置了原生 TLS 但证书不可读时，它会拒绝非 loopback
+目标，只探测 loopback。
 
 Paseo payload 虽然 E2EE，但 `serverId`、连接元数据和可用性仍会暴露给明文网络上的
 被动/主动攻击者，所以公网不能只跑 `ws://`。
@@ -70,7 +73,8 @@ LB 必须：
   访问日志不记录 query string，并把 `error_log` 设为 `crit`（nginx 的 error log 总是
   带完整请求行）。
 - HAProxy：[examples/haproxy.cfg](https://github.com/kfxhjz/paseo-relay/blob/main/examples/haproxy.cfg) —— 一致性哈希、
-  `/ready` 检查、拒绝运维端点、per-source 连接/速率限制，日志格式不记录 query string。
+  `/ready` 检查、拒绝运维端点、在 TLS/HTTP 之前统计的 per-source TCP 连接限制，
+  以及 HTTP 请求速率限制，日志格式不记录 query string。
 - Kubernetes + ingress-nginx：Ingress annotation 设为
   `nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_serverId"`，liveness 用
   `/health`，readiness 用 `/ready`。示例还包含只允许 ingress-nginx namespace 访问
@@ -124,7 +128,12 @@ TLS，请挂载 PEM 证书、设置 `PASEO_RELAY_TLS_CERT` / `PASEO_RELAY_TLS_KE
 TLS 端口（例如 `-p 0.0.0.0:443:4000`）。
 
 `v0.1.3` 是当前 release tag，`latest` 跟随最新 **stable** release。预发布 tag
-（任何包含 `-` 的 tag，例如 `v0.2.0-rc1`）不会移动 `latest`。如果需要不可变引用，
+（任何包含 `-` 的 tag，例如 `v0.2.0-rc1`）不会移动 `latest`。发布是分阶段进行的，
+用户不会拉到未验证的镜像：先以临时 candidate tag 组装多架构 index，按 digest 做 smoke
+test、cosign 签名并生成 GitHub build provenance attestation，全部成功后才把版本 tag
+（以及符合条件时的 `latest`）提升到同一个 digest。因此构建、smoke 或签名任一步失败，
+之前的 `latest` 都会保留。`latest` 也只会移动到不低于 `main` 上最高 stable tag 的稳定
+版本，乱序发布的旧版本无法接管它。如果需要不可变引用，
 请改用 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.3) 中
 `v0.1.3` 对应的多架构 index digest，而不是 tag：
 
@@ -198,6 +207,10 @@ docker compose -f examples/docker-compose.yml \
 - `GET /health` — liveness；draining 期间仍 200。
 - `GET /ready` — 仅在愿意接受新工作时 200；draining、shutting down、WebSocket/session
   满或 capacity 异常时 503。
+- `paseo-relay healthcheck` — 原生 TLS 下固定 `PASEO_RELAY_TLS_CERT` 的 leaf
+  证书；拿不到可读 TLS 材料时只探测 loopback，对非 loopback 目标 fail-closed。
+  明文监听无法认证：允许非 loopback 探测，但请只在可信网络使用，并优先保持
+  ops host 为 loopback/通配。
 - `SIGTERM`/`SIGINT` — 停止 accept，`/ready` 变 503；现有 session 继续运行
   `PASEO_RELAY_SHUTDOWN_GRACE_MS`，然后以 `1012` 关闭并退出。
 - `PASEO_RELAY_DRAIN=true` — 启动即 unready；适合维护启动或先摘流再停止。
@@ -229,8 +242,11 @@ sequenceDiagram
 默认情况下 `/ready`、`/metrics`、`/version` 与公网端口共用，它们能否保持私有取决于边缘
 规则或网络策略是否配对。设置 `PASEO_RELAY_OPS_PORT`（例如 `4001`）后，它们改由一个
 独立的明文监听提供；公网端口只回答 `/ws` 和 `/health`。`PASEO_RELAY_OPS_HOST` 默认是
-`127.0.0.1`，这对容器 healthcheck 已经足够；要让探针和 Prometheus 访问，请设为内网
-地址，或在不对外发布该端口的 pod/容器里设为 `0.0.0.0`。然后：
+`127.0.0.1`，这对容器 healthcheck 已经足够；要让探针和 Prometheus 访问，请设为
+`0.0.0.0`（不对外发布该端口的 pod/容器内）或内网地址。绑定到具体非 loopback 地址的
+明文监听仍然可以被内置 `paseo-relay healthcheck` 探测，但该探测无法认证：任何服务只要
+回答 `/health` 都会被当成健康。请把运维监听放在内网，或优先使用通配绑定以便探针走
+loopback。然后：
 
 - 把 Kubernetes 探针、负载均衡健康检查和 Prometheus 指向运维端口（示例里有可以取消
   注释的配置行）；
@@ -263,6 +279,11 @@ sequenceDiagram
   记账），单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)`。校验器要求预算
   能容纳一条最大消息及这些记账；具体下限用 `--check-config` 查看（129 MiB 的
   Compose 预算仍然通过）。
+- `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`（未设置/`0` = 自动）可以调低每连接上限。
+  默认派生值在出厂配置下就是整个预算，单个 source 可以在 delivery 窗口内占满它；
+  设低一些可以限制每个 source，派生值等于预算且
+  `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` 关闭时启动会告警。多条连接仍可占满预算，
+  所以主要缓解手段仍是边缘的 per-source 带宽限制。
 - `PASEO_RELAY_MAX_TCP_CONNECTIONS` 是 OS socket 总上限，包含 upgrade 后的
   WebSocket（slot 在整个 socket 生命周期内持有），因此必须满足
   `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS`。同时要在 `MAX_CONNECTIONS` 之上留出

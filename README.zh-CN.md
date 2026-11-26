@@ -7,7 +7,7 @@
 [![CI](https://github.com/kfxhjz/paseo-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/kfxhjz/paseo-relay/actions/workflows/ci.yml)
 [![Paseo compatibility](https://github.com/kfxhjz/paseo-relay/actions/workflows/paseo-compat.yml/badge.svg)](https://github.com/kfxhjz/paseo-relay/actions/workflows/paseo-compat.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-blue.svg)](rust-toolchain.toml)
+[![Toolchain 1.100.0](https://img.shields.io/badge/toolchain-1.100.0-blue.svg)](rust-toolchain.toml)
 [![Image](https://img.shields.io/badge/ghcr.io-paseo--relay-blue)](https://github.com/kfxhjz/paseo-relay/pkgs/container/paseo-relay)
 [![Release](https://img.shields.io/github/v/release/kfxhjz/paseo-relay?sort=semver)](https://github.com/kfxhjz/paseo-relay/releases)
 [![GitHub stars](https://img.shields.io/github/stars/kfxhjz/paseo-relay?style=social)](https://github.com/kfxhjz/paseo-relay/stargazers)
@@ -152,8 +152,8 @@ relay，选这个。如果你不想维护带 `serverId` 亲和性的边缘代理
 - **无账号、无遥测、无外呼**：relay 只监听，不注册、不统计、不 phone-home
   （Paseo 配对是端到端的）。
 - **部署**：固定 digest 的 builder、多架构发布工作流（每个平台独立的
-  provenance 和 SBOM attestation）、带签名的镜像和构建来源证明（`v0.1.2` 之后的
-  版本）、scratch 非 root 运行时、read-only 友好。
+  provenance 和 SBOM attestation），以及带签名和构建来源证明的多架构 index
+  （`v0.1.2` 之后的版本）、scratch 非 root 运行时、read-only 友好。
 
 ## 一图看懂架构
 
@@ -189,9 +189,10 @@ probe 脚本和输出未提交，因此只作为补充材料，不是可复现�
 
 ## 部署
 
-发布 `v0.1.3` 会把多架构（`linux/amd64`、`linux/arm64`）镜像发布到 GHCR，
-附带 **每个平台独立** 的 provenance 和 SBOM attestation（多架构 index 本身没有
-index 级 attestation）。直接用短版本 tag 即可；tag 带前导 `v`（不带 `v` 的
+发布 `v0.1.3` 会把多架构（`linux/amd64`、`linux/arm64`）镜像发布到 GHCR。
+每个平台镜像带有 buildx 生成的 provenance 和 SBOM attestation；多架构 index 上
+另有 GitHub build provenance attestation 与 keyless cosign 签名（`v0.1.2` 之后的
+版本）。**没有 index 级 SBOM。** 直接用短版本 tag 即可；tag 带前导 `v`（不带 `v` 的
 `0.1.3` 没有发布）：
 
 - **镜像 tag：** `ghcr.io/kfxhjz/paseo-relay:v0.1.3`（同时打 `latest`；只有
@@ -208,8 +209,9 @@ docker buildx imagetools inspect ghcr.io/kfxhjz/paseo-relay:v0.1.3
 
 `v0.1.2` 之后的 release 带签名（cosign keyless），并且在多架构 index 上附有 GitHub
 构建来源证明，所以部署前可以针对本仓库的 release workflow 验证镜像；命令见
-[SECURITY.zh-CN.md](SECURITY.zh-CN.md) 的"验证发布产物"。`v0.1.2` 及更早版本无法用
-这种方式验证。
+[SECURITY.zh-CN.md](SECURITY.zh-CN.md) 的"验证发布产物"。同一 release 还会给每个
+平台镜像附加 buildx 生成的 provenance 和 SBOM attestation；**没有 index 级 SBOM**。
+`v0.1.2` 及更早版本无法用这种方式验证。
 
 两种拓扑使用同一个镜像；区别在于前置的边缘如何做路由亲和：
 
@@ -250,9 +252,11 @@ SHA-pinned CI actions），不宣称跨主机 bit-for-bit 完全一致。
 ## 运维与指标
 
 `/metrics` 是只含聚合值的 Prometheus 文本（没有 `serverId` label）：readiness/
-draining、活跃 WebSocket/session、两个池的 ingress 已预留/预算字节、转发帧/字节、slow
-consumer、delivery timeout、各类拒绝数（WebSocket、session、per-IP、TCP、ingress）、
-ingress 回收数、读超时和 idle 超时、handshake 结果、最大帧、uptime、build info。见
+draining、活跃 WebSocket/session、两个池的 ingress 已预留/预算字节、中继的用户帧/字节
+（relay 自产控制帧不计入）、slow consumer、delivery timeout、control 发送失败、各类
+拒绝数（WebSocket、session、session-connection、per-client、per-IP、TCP、operations、
+ingress）、ingress 回收数、读超时和 idle 超时、handshake 结果、最大帧、uptime、
+build info。见
 [docs/zh-CN/operations.md](docs/zh-CN/operations.md)、
 [examples/prometheus.yml](examples/prometheus.yml)、
 [examples/alerts.yml](examples/alerts.yml)。
@@ -274,10 +278,11 @@ socket 仍约占 23 KiB，原生 TLS（rustls 缓冲）时约 33 KiB。idle 规�
 payload 记账是增量的：data frame payload 按 8 KiB chunk 在字节到达时按
 `chunk_bytes × weight + 192` 加权单位计费（192 为每 chunk 记账），每消息固定
 256 字节开销只计一次，单个连接最多持有
-`min(budget, 4 × 一条最大消息的计费)` 的加权 ingress 预算，一条消息最多 1024 个
-分片。因此停滞 header 无法为它从未发送的 payload 预留预算，分片上限也限制了空分片
-洪泛。让 `PASEO_RELAY_MAX_TCP_CONNECTIONS` 高于 `MAX_CONNECTIONS`（至少 64–128 个
-空槽），保证满 WebSocket 负载下健康/readiness 探针仍能拿到 slot。完整限制见
+`min(budget, 4 × 一条最大消息的计费)` 的加权 ingress 预算（或显式的
+`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`），一条消息最多 1024 个分片。因此停滞
+header 无法为它从未发送的 payload 预留预算，分片上限也限制了空分片洪泛。让
+`PASEO_RELAY_MAX_TCP_CONNECTIONS` 高于 `MAX_CONNECTIONS`（至少 64–128 个空槽），
+保证满 WebSocket 负载下健康/readiness 探针仍能拿到 slot。完整限制见
 [docs/zh-CN/configuration.md](docs/zh-CN/configuration.md) 和
 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)。
 
@@ -312,9 +317,10 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 - **per-IP 限制较粗**：默认 `0`，因为文档推荐拓扑使用边缘代理；直连部署时再启用
   并按用户规模设置。
 - **大消息占用预算**：少数最大消息可能吃掉配置的 ingress 预算（单连接上限为
-  `min(budget, 4 × 一条最大消息的计费)`）。未完成的消息在有压力时会被回收，小消息也
-  有自己的预留池，但如果有 peer 持续发送没人读取的大消息，仍然可以拖慢其他大传输；
-  可以提高预算或在边缘限制带宽。
+  `min(budget, 4 × 一条最大消息的计费)`，或 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`）。
+  未完成的消息在有压力时会被回收，小消息也有自己的预留池，但如果有 peer 持续发送没人
+  读取的大消息，仍然可以拖慢其他大传输；默认每连接上限就是整个预算，且 per-IP 上限默认
+  关闭。可以提高预算、调低 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`，或在边缘限制带宽。
 - **没有 per-user 配额/relay 认证**：公共运营者必须在边缘做限制并提供隐私/滥用
   政策；见 [operator-policy.md](docs/zh-CN/operator-policy.md)。
 - **没有第三方安全审计**：这里的证据是代码评审、真实 socket 测试、在 CI 中运行的
@@ -343,8 +349,8 @@ cargo build --release --locked
 scripts/ci.sh                 # 本地 CI，包含容器 smoke test
 ```
 
-工具链固定在 `rust-toolchain.toml`（Rust `1.99.1`）。测试套件有 85 个单元测试 +
-30 个真实 listener/真实 WebSocket 集成测试，没有 mock。欢迎贡献，见
+工具链固定在 `rust-toolchain.toml`（Rust `1.100.0`；MSRV 为 `1.99.1`）。测试套件包含
+单元测试和真实 listener/真实 WebSocket 集成测试，没有 mock。欢迎贡献，见
 [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md) 和
 [CODE_OF_CONDUCT.zh-CN.md](CODE_OF_CONDUCT.zh-CN.md)。安全问题请走
 [SECURITY.zh-CN.md](SECURITY.zh-CN.md)，不要开公开 issue。

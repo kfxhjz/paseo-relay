@@ -32,8 +32,10 @@ docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
 Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.3`；`latest` 跟随
-最新 **stable** release（预发布 tag 不会移动它）。可用 `PASEO_RELAY_IMAGE`
-覆盖版本；如果需要固定不可变的 digest，见[部署指南](deployment.md)。示例还把
+最新 **stable** release（预发布 tag 不会移动它）。release workflow 会先按 digest
+对镜像做 smoke test、签名/证明，再提升版本 tag 或 `latest`，所以跟随 `latest` 不会
+拿到未验证的构建。可用 `PASEO_RELAY_IMAGE` 覆盖版本；如果需要固定不可变的 digest，
+见[部署指南](deployment.md)。示例还把
 `PASEO_RELAY_MAX_CONNECTIONS`（4,000）、`PASEO_RELAY_MAX_SESSIONS`（4,000）、
 `PASEO_RELAY_MAX_TCP_CONNECTIONS`（5,000）限制到适合 512 MB 内存上限的值；调高
 `PASEO_RELAY_MEM_LIMIT` 时请一起调高这些上限。
@@ -107,6 +109,7 @@ relay 状态是临时的：Paseo 客户端会重连，E2EE 配对是端到端的
 | `/health` 正常但配对失败 | 使用 `wss`/443；手机是否能访问同一公网 endpoint |
 | Caddy 返回 502/504 | relay 容器是否 healthy；`docker compose logs relay` |
 | 所有连接被拒 | 检查 `PASEO_RELAY_MAX_CONNECTIONS`、`/ready` 和 relay 日志 |
+| `healthcheck` 报 "not loopback" | 配置了原生 TLS 但 `PASEO_RELAY_TLS_CERT` 不可读：探针只信任 loopback。修复证书或改用 loopback 目标。明文非 loopback 探测允许但无法认证 |
 | 看不到 metrics | `/metrics` 和 `/ready` 被 Caddy 屏蔽；从内网抓 relay |
 | 要下线节点 | 先从边缘摘除，再发 SIGTERM，等待 grace window |
 | OOM 或构建失败 | 使用预构建镜像；同时调高 `PASEO_RELAY_MEM_LIMIT` 和连接上限（每个 idle socket 约 23 KiB），或给构建至少 ~1 GB 内存 |

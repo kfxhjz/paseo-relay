@@ -43,6 +43,12 @@ That has consequences:
   more for probe bursts): the TCP slot is held for the whole socket lifetime, so
   a full WebSocket load at equal caps would reject `/health`, `/ready`,
   `/metrics`, the image HEALTHCHECK, and k8s probes at accept.
+- If the relay is directly exposed, consider lowering
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`. The automatic per-connection cap
+  equals the whole ingress budget at the shipped defaults, so one source can
+  hold all of it for a delivery window; several connections can still fill the
+  budget without edge per-source limits. The startup log warns when both the
+  derived cap and the per-IP limit are at their default/off values.
 - Clients should send exactly one unencoded `serverId`. Duplicate query keys are
   last-wins at the relay, while edge consistent hashing normally uses the raw
   query value, so duplicate or percent-encoded values can route the two sides of
@@ -53,7 +59,9 @@ That has consequences:
 - Alert on `paseo_relay_ingress_rejections_total` (sources dropped for lack of
   ingress budget) and on a sustained rise of
   `paseo_relay_ingress_reclaims_total`; they are the signature of someone
-  occupying the budget.
+  occupying the budget. Also alert on `paseo_relay_ops_rejections_total`: a
+  saturated operations listener makes `/ready` and `/metrics` unreachable
+  exactly when you need them.
 - Run the provided scratch image read-only, non-root, drop capabilities; keep
   the toolchain/image updated.
 - Do not add Erlang distribution; there is none in this relay.

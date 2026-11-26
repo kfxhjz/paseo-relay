@@ -16,11 +16,14 @@
 |---|---|---|
 | `serverId` | 是 | 路由 key；1..=256 字节，合法 UTF-8，不能包含控制字符或空白 |
 | `role` | 是 | `server`（daemon）或 `client` |
-| `v` | 否 | `1`（默认）或 `2` |
-| `connectionId` | 仅 v2 | daemon data socket 的路由 id。client 通常省略，relay 生成 `conn_<16 hex>`；v2 daemon control socket 传空值 |
+| `v` | 否 | `1`（默认）或 `2`，按 **原值精确匹配**。缺省或空值表示 `1`；带空白或其它形式（例如 `v=+2` 解码为 `" 2"`）返回 `400` |
+| `connectionId` | 仅 v2 | daemon data socket 的路由 id。v2 client 省略或传空值时，relay 生成 `conn_<16 hex>`；显式值按原样使用（不做 trim），必须通过 ID 校验。v2 daemon 省略或传空值表示 control socket |
 
 Paseo client/daemon 把 `serverId` 当作 bearer secret：知道它的人可以 attach 到该
 session。relay 按设计不增加认证；安全模型见 README 与 `SECURITY.md`。
+
+`v` 和 `connectionId` 都不做 trim：`connectionId=%20` 是纯空白值，会被 `400` 拒绝，
+不会当作空值/control 值处理。
 
 请只发送一个未编码的 `serverId`。同一 query 参数出现多次时，relay 使用 **最后
 一个** 值（last-wins，与 Elixir 实现的 `Map.new/1` 一致）。边缘一致性哈希通常对
@@ -65,6 +68,8 @@ daemon 会打开：
 
 - control attach 时，relay 发送
   `{"type":"sync","connectionIds":[...]}`，并替换之前的 control socket（`1008`）。
+  relay 发出的每条 `sync` 序列化后都限制在 64 KiB 内。如果当前 client 列表放不下，
+  control attach 会以 `1013` "Relay session sync capacity" 拒绝，而不是发送超大控制帧。
 - client attach 时，relay 向 control 发送
   `{"type":"connected","connectionId":"..."}`。
 - 某 `connectionId` 的最后一个 client detach 时，relay 向 control 发送
@@ -74,14 +79,31 @@ daemon 会打开：
   关闭。
 - client 帧最多等待 data socket `DATA_ATTACH_TIMEOUT_MS`（默认 15 s）；超时仍不存在
   则 client 以 `1013` "Data route unavailable" 关闭。
-- 每个 session 的不同 v2 `connectionId` 数量受
-  `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`（默认 `512`）限制；超限以 `1013`
-  "Relay session connection capacity" 关闭。
+- `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`（默认 `512`）限制 session 内不同 v2
+  `connectionId` 的 **并集**：client id 与 daemon data 路由共用同一额度，同一个 id
+  无论只有 client、只有 data 还是两者都有，都只占一个名额。超限以 `1013`
+  "Relay session connection capacity" 关闭。新 client 的 id 还会在接入前检查 64 KiB
+  `sync` 预算；会让下一条 `sync` 超限的 client 以 `1013` "Relay session sync capacity"
+  拒绝，而不是先接进一个 daemon 无法接收的状态（也避免等到 data 路由 attach 时才失败）。
 - 有一个或多个 client 等待 data 期间，每个 session 运行单个去重的 control watchdog，
-  在 `CONTROL_NUDGE_MS` 后重发一次 `sync`，在 `CONTROL_UNRESPONSIVE_MS` 后若仍无响应
+  在 `CONTROL_NUDGE_MS` 后重发 `sync`，在 `CONTROL_UNRESPONSIVE_MS` 后若仍无响应
   则以 `1011` 关闭 control socket。
+- watchdog 按 client 记录 nudge 覆盖：在上一次 `sync` 之后才 attach 的 client 会收到
+  自己的补充 `sync`，但这些后到者不会推迟最老等待者的 `1011` deadline。最老 deadline
+  到达后即关闭 control，即使有后到者尚未收到 `sync`，因此攻击者无法靠不断加入新
+  client 无限推迟 `1011`。
 - control 输入除文本 `{"type":"ping"}` 外忽略；ping 回复
   `{"type":"pong","ts":<unix ms>}`。control 上的二进制帧忽略。
+
+如果初始或 watchdog 的 `sync` 在 1 s control 发送超时内无法入队/写出，relay 将其视为
+control 面失败：计入 `paseo_relay_control_send_failures_total` 并关闭 control socket，
+而不是让 daemon 保留过期的路由表。
+
+**顺序说明。** 初始 `sync` 在 control socket attach 之后发送，并发 attach 的 client 的
+`connected`（或 detach 的 `disconnected`）通知可能先进入同一个 writer 队列。relay 不
+保证 `sync` 先于 `connected`；daemon 应把 `sync` 当作基线快照，并幂等地应用
+`connected`/`disconnected`。这个顺序竞态是已知且接受的（Paseo v0.15.3 实测可容忍
+connected-before-sync），不属于数据面或安全边界。
 
 v2 的 control/data 流程与 close 传播：
 
@@ -119,7 +141,7 @@ sequenceDiagram
 | client 数据帧 / 重组消息 | `32 MiB - 14` 字节；超限 close `1009` |
 | 每条消息的分片数 | 最多 1024；超过 close `1002` |
 | 长度编码 | 126/127 长度形式必须是最小编码；非最小编码 close `1002` |
-| v2 control 帧 | 每帧/消息 64 KiB |
+| v2 control 帧 | 每帧/消息 64 KiB，双向都算：入站 control 帧上限 64 KiB，relay 生成的每条 `sync` 也限制在 64 KiB（会让它超限的 client 直接 `1013` 拒绝） |
 | WebSocket control 帧 | 遵循 RFC 6455（≤125 字节，不能分片） |
 | Close payload | 空，或至少 2 字节且状态码合法；非法 code close `1002` |
 | 压缩 | 不协商 |
@@ -133,7 +155,7 @@ sequenceDiagram
 | Ingress 预算等待 | 限制为 `min(INGRESS_WAIT_TIMEOUT_MS, 剩余 frame/message 读取 deadline)`。等待期间会回收其他连接上未完成的消息（见下一行）；到点仍腾不出预算的等待方以 `1013` "Relay ingress capacity" 关闭 |
 | 预算回收 | 仅在有别的 source 等预算时发生：停滞或慢于每秒 `INGRESS_RECLAIM_MIN_RATE_BYTES` 的未完成消息、传输超过 `INGRESS_RECLAIM_AFTER_MS` 的未完成消息，或（等待方是不超过 64 KiB 的消息时）比它大至少 8 倍的未完成消息，以 `1013` "Relay ingress reclaimed" 关闭。已完整接收的消息永远不会被回收 |
 | 小消息预留 | 不超过 64 KiB 的完整单帧消息优先从 `INGRESS_SMALL_RESERVE_BYTES` 计费，预留池满了才计入主预算；分片消息一律走主预算 |
-| 每连接 in-flight 上限 | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × 一条最大消息的计费)` |
+| 每连接 in-flight 上限 | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × 一条最大消息的计费)`，或配置的 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` |
 | 慢 destination | 有界 writer 队列 + deadline；destination 被 `1013` shed |
 
 Ingress 记账有两个对滥用上限很重要的细节：
@@ -175,7 +197,7 @@ daemon 的 client。以下帧会不经检查直接转发：
 | `1009` | 帧/消息过大 |
 | `1011` | control socket 无响应 |
 | `1012` | relay 正在 shutdown，或 v2 server data socket 断开 |
-| `1013` | 可重试：ingress 预算耗尽（"Relay ingress capacity"）、预算紧张时未完成的消息被回收（"Relay ingress reclaimed"）、单 session v2 连接数达到上限（"Relay session connection capacity"）、frame/message 读超时或停滞超时（"Relay read timeout"）、可选的 idle 超时（"Idle timeout"）、data route 不可用，或 delivery 不可用 |
+| `1013` | 可重试：ingress 预算耗尽（"Relay ingress capacity"）、预算紧张时未完成的消息被回收（"Relay ingress reclaimed"）、单 session v2 连接数达到上限（"Relay session connection capacity"）、control `sync` 会超过 64 KiB（"Relay session sync capacity"）、frame/message 读超时或停滞超时（"Relay read timeout"）、可选的 idle 超时（"Idle timeout"）、data route 不可用，或 delivery 不可用 |
 
 合法的 close code 是 `1000..=1003`、`1007..=1014` 和 `3000..=4999`。空 close
 payload 允许；单字节 payload 不允许。`1005`/`1006`/`1015` 保留给本地使用，不会出现

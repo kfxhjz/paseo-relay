@@ -8,7 +8,9 @@ matter more than feature count.
 
 ## Development setup
 
-- Rust `1.99.1` (pinned in `rust-toolchain.toml`; `rustup` installs it).
+- Rust `1.100.0` (pinned in `rust-toolchain.toml`; `rustup` installs it). The
+  crate's `rust-version`/MSRV is `1.99.1`; do not raise it without a separate
+  MSRV decision.
 - `cargo fmt`, `clippy`, and the test toolchain from the pin.
 - Docker only for the optional container checks.
 
@@ -19,13 +21,15 @@ cargo test --locked
 cargo build --release --locked
 python3 scripts/check-docs.py   # local links + Chinese/English pairing
 scripts/ci.sh          # includes the same checks plus a container smoke test
-RUSTUP_TOOLCHAIN=nightly scripts/fuzz.sh 60   # optional: all fuzz targets; needs nightly + cargo-fuzz
+RUSTUP_TOOLCHAIN=nightly-2026-11-20 scripts/fuzz.sh 60   # optional: all fuzz targets; needs cargo-fuzz
 ```
 
 Changes to the frame codec, the handshake classifier, the query parser or
 upgrade validation should be fuzzed before review (`fuzz/README.md`); CI builds
-and briefly runs every fuzz target as well. The repository pins stable Rust, so
-the script needs `RUSTUP_TOOLCHAIN=nightly`.
+and briefly runs every fuzz target as well. The repository pins stable Rust for
+the relay and a dated nightly for `cargo-fuzz`; `scripts/fuzz.sh` uses the
+tracked seed corpus and expects `RUSTUP_TOOLCHAIN=nightly-2026-11-20` (or the
+nightly set in `ci.yml`).
 
 The test suite uses real listeners and real WebSocket clients
 (`tokio-tungstenite`), not mocks. Please keep that property: new protocol

@@ -18,14 +18,15 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 | `PASEO_RELAY_HOST` | `127.0.0.1` | 监听 IP。容器镜像设为 `0.0.0.0`。 |
 | `PASEO_RELAY_PORT` | `4000` | `/ws` 和 `/health` 的监听端口；运维端点也在这里，除非用 `PASEO_RELAY_OPS_PORT` 把它们移走。 |
 | `PASEO_RELAY_OPS_HOST` | `127.0.0.1` | 运维监听的 IP；只有设置了 `PASEO_RELAY_OPS_PORT` 才生效。默认值只能从同一主机/容器内访问。要让探针和 Prometheus 访问，请设为内网地址（或在不对外发布该端口的 pod/容器内设为 `0.0.0.0`）。 |
-| `PASEO_RELAY_OPS_PORT` | 未设置 | 设置后，`/ready`、`/metrics`、`/version` **只**在这个明文监听上提供（同时提供 `/health`），`PASEO_RELAY_PORT` 只保留 `/ws` 和 `/health`。该监听有自己独立的 64 个连接额度，所以公网监听打满 TCP 上限时探针和抓取仍然可用；`paseo-relay healthcheck` 会自动改用它。不设置 = 全部在 `PASEO_RELAY_PORT` 上。 |
+| `PASEO_RELAY_OPS_PORT` | 未设置 | 设置后，`/ready`、`/metrics`、`/version` **只**在这个明文监听上提供（同时提供 `/health`），`PASEO_RELAY_PORT` 只保留 `/ws` 和 `/health`。该监听有自己独立的 64 个连接额度，所以公网监听打满 TCP 上限时探针和抓取仍然可用；`paseo-relay healthcheck` 会自动改用它。不设置 = 全部在 `PASEO_RELAY_PORT` 上。Kubernetes service-link 值（例如名为 `paseo-relay-ops` 的 Service 注入的 `tcp://10.96.0.5:4001`）会被拒绝，并给出说明原因的错误，而不是裸的解析失败。 |
 | `PASEO_RELAY_DRAIN` | `false` | 启动即 draining：`/ready` 返回 503，新 `/ws` upgrade 被拒绝。SIGTERM/SIGINT 总会触发 drain。 |
 | `PASEO_RELAY_MAX_CONNECTIONS` | `20000` | 最大 WebSocket 数。必须 `<= PASEO_RELAY_MAX_TCP_CONNECTIONS`，并让后者高于它（见下一行）。 |
 | `PASEO_RELAY_MAX_TCP_CONNECTIONS` | `25000` | 最大 OS socket 数，包含 upgrade 前的 HTTP 和 upgrade 后的 WebSocket。slot 在整个 socket 生命周期内持有，因此要比 `PASEO_RELAY_MAX_CONNECTIONS` 留出余量（至少 64–128 个空槽，探针突发时更多），否则满 WebSocket 负载会在 accept 阶段拒绝 `/health`、`/ready`、`/metrics` 和探针。 |
 | `PASEO_RELAY_MAX_SESSIONS` | `20000` | 最大存活 `serverId` session 数。 |
-| `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` | `512` | 每个 `serverId` session 允许的不同 v2 `connectionId` 上限；超限以 `1013` "Relay session connection capacity" 关闭。 |
-| `PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION` | `32` | 每个 `connectionId` 的最大 v2 client socket 数。 |
-| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | 节点级加权 in-flight payload 预算。必须能容纳一条最大消息，包括 256 字节每消息开销和每 chunk 记账（每个 8 KiB chunk 192 加权单位，包含 1024 分片最坏情况）；具体下限用 `--check-config` 查看。129 MiB 的 Compose 预算（135,266,304）仍可通过，余量约 64.6 KB。单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)`。 |
+| `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` | `512` | 每个 `serverId` session 允许的不同 v2 `connectionId` 上限，按 client 连接 id 与 daemon data 路由的 **并集** 计数（同一个 id 无论只有 client、只有 data 还是两者都有，都只占一个名额）。超限以 `1013` "Relay session connection capacity" 关闭。如果接受新 client 会让 control `sync` 消息超过 64 KiB，则新 client 以 `1013` "Relay session sync capacity" 拒绝，而不是让 daemon 收到它无法接收的状态。 |
+| `PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION` | `32` | 每个 `connectionId` 的最大 v2 client socket 数；超限 client 以 `1013` "Relay client capacity" 关闭。 |
+| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | 节点级加权 in-flight payload 预算。必须能容纳一条最大消息，包括 256 字节每消息开销和每 chunk 记账（每个 8 KiB chunk 192 加权单位，包含 1024 分片最坏情况）；具体下限用 `--check-config` 查看。129 MiB 的 Compose 预算（135,266,304）仍可通过，余量约 64.6 KB。单个连接最多持有 `min(budget, 4 × 一条最大消息的计费)`，或 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 的显式值。 |
+| `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` | `0`（自动） | 单个连接的加权 in-flight 上限。`0` 时派生为 `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × 一条最大消息的计费)`；默认配置下就等于整个预算，也就是已文档化的单 source 残余成本。非 0 值会被 **clamp** 到 `[一条最大消息的计费, PASEO_RELAY_INGRESS_BUDGET_BYTES]`（超出范围的调优值只会被收窄，不会导致启动失败），`--dump-config` 显示为 `per_connection_limit=...`；可用它限制单个慢 source 能占多少预算。低于 `4 ×` 一条最大消息计费的值会缩小预读流水线，在大帧流水线场景可能表现为可重试的 `1013`。当派生上限等于预算且 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0` 时，启动会打印警告（见下文"启动警告"）。 |
 | `PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES` | `16777216` | 在 `PASEO_RELAY_INGRESS_BUDGET_BYTES` 之外额外提供的加权预算，只有不超过 64 KiB 的消息可以使用，这样大传输占满主预算时握手和普通小帧仍能通过。`0` 关闭；否则必须能容纳一条 64 KiB 消息（默认权重下为 461,312）。 |
 | `PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES` | `65536` | 当别的 source 在等预算时，最近一到两秒内每秒收到的 payload 不超过该值的未完成消息会被优先关闭以释放其预留。`0` 表示只针对完全没有收到数据的消息。 |
 | `PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS` | `60000` | 当别的 source 在等预算时，已经传输超过该时长的未完成消息要让位给更新的消息。`0` 关闭该规则；否则至少 `5000`。 |
@@ -38,7 +39,7 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 | `PASEO_RELAY_WS_IDLE_TIMEOUT_MS` | `0` | 一个 WebSocket 在这么长时间内既没有发来任何帧、也没有任何数据帧转发给它时，以 `1013` "Idle timeout" 关闭。`0`（默认）表示从不关闭空闲 socket；否则至少 `1000`。任何帧（包括 ping）都算活动。上游 Paseo（按 v0.15.3 核对）每 10 秒 ping 一次 v2 control socket，client 每 10 秒发一次心跳，所以设成几分钟（例如 `300000`）只会清掉已死或被遗弃的 socket；在整个周期内双向都静默的 socket 会被关闭，并应当自行重连。 |
 | `PASEO_RELAY_DATA_ATTACH_TIMEOUT_MS` | `15000` | v2 client 帧等待 daemon data socket 的最长时间。 |
 | `PASEO_RELAY_DELIVERY_TIMEOUT_MS` | `30000` | 等待 destination writer 权限/写入的最长时间；慢 destination 被 `1013` shed。 |
-| `PASEO_RELAY_CONTROL_QUEUE_BYTES` | `1048576` | 每 destination writer 队列下限；有效队列至少为 `MAX_MESSAGE_BYTES + 64 KiB`。 |
+| `PASEO_RELAY_CONTROL_QUEUE_BYTES` | `1048576` | **每个** destination writer 队列的字节下限（`CONTROL_` 这个名字是历史原因，用户数据 destination 同样适用）。有效队列为 `max(本值, PASEO_RELAY_MAX_MESSAGE_BYTES + 64 KiB)`，默认约 32 MiB（`33,619,954` 字节），因此一条最大消息总能放下，淘汰由 delivery deadline 触发而不是队列 slot 无法预留。 |
 | `PASEO_RELAY_CONTROL_NUDGE_MS` | `10000` | v2 client 等 data 时，向 control 重发 `sync` 的延迟。 |
 | `PASEO_RELAY_CONTROL_UNRESPONSIVE_MS` | `15000` | control 仍无响应则 `1011` 关闭的延迟；必须大于 nudge。 |
 | `PASEO_RELAY_SESSION_IDLE_MS` | `30000` | 周期性兜底清理移除空 session 的年龄阈值。session 通常在最后一个 socket 关闭时立即移除，所以这个值很少起作用。 |
@@ -51,7 +52,7 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 | `PASEO_RELAY_ALLOWED_ORIGINS` | 未设置 | 逗号分隔的精确 `Origin` allowlist，用于 `/ws`；空 = 允许任意。没有 Origin 的 native client 始终允许；重复或无法解析的 `Origin` header 返回 `403`。 |
 | `PASEO_RELAY_LOG` | `info` | `tracing` `EnvFilter`，如 `info`、`paseo_relay=debug`。启动时校验；非法指令会中止启动。 |
 | `PASEO_RELAY_LOG_FORMAT` | `text` | `text` 或 `json` 结构化日志。 |
-| `PASEO_RELAY_HEALTHCHECK_HOST` | 监听地址 / `127.0.0.1` | `paseo-relay healthcheck` 自检使用的 host 覆盖项。未设置时，若监听绑定到具体 IP 则跟随 `PASEO_RELAY_OPS_HOST`（启用 `PASEO_RELAY_OPS_PORT` 时）或 `PASEO_RELAY_HOST`；绑定通配地址时回退到 `127.0.0.1`（`::` 回退到 `::1`）。 |
+| `PASEO_RELAY_HEALTHCHECK_HOST` | 监听地址 / `127.0.0.1` | `paseo-relay healthcheck` 自检使用的 host 覆盖项。未设置时，若监听绑定到具体 IP 则跟随 `PASEO_RELAY_OPS_HOST`（启用 `PASEO_RELAY_OPS_PORT` 时）或 `PASEO_RELAY_HOST`；绑定通配地址时回退到 `127.0.0.1`（`::` 回退到 `::1`）。原生 TLS 下探针会固定 `PASEO_RELAY_TLS_CERT` 的 leaf 证书（DER SHA-256），只接受该证书，因此非 loopback 目标安全；证书不可读时拒绝非 loopback 目标（fail-closed）。明文监听没有可固定证书：允许非 loopback 探测，但无法认证，请只在可信网络使用，优先保持 loopback。 |
 | `PASEO_RELAY_BUILD_REVISION` | 构建时推导 | 嵌入 `/version` 和指标的 revision；覆盖 git 推导值。 |
 
 **`v0.1.3` 新增：** `PASEO_RELAY_OPS_HOST`、`PASEO_RELAY_OPS_PORT`、
@@ -62,6 +63,12 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 `PASEO_RELAY_WS_IDLE_TIMEOUT_MS`。`v0.1.2` 镜像会忽略它们，并且收到 `SIGHUP` 时会直接
 退出而不是重新加载 TLS。详见
 [changelog（英文）](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md)。
+`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 比 `v0.1.3` 更新；更早的镜像会忽略它，继续
+使用旧的派生上限。
+
+监听冲突会在启动时拒绝：两个 listener 配置在同一个非 0 端口时，只要任一侧绑定通配地址
+（`0.0.0.0` 或 `::`）就拒绝，跨地址族也一样，因为双栈 `::` 绑定也可能占住 IPv4 端口。
+同一端口上的不同具体地址允许共存，端口 `0`（由 OS 分配，测试用）例外。
 
 ## Ingress 预算与有界队列
 
@@ -80,9 +87,10 @@ flowchart TD
 data frame 的 payload 按 8 KiB chunk 读取，每个 chunk 到达后才计费，因此每个连接
 最多只有一个 8 KiB chunk 在计费前被分配。每消息固定 256 字节开销 **每条消息只计
 一次**，不再按分片重复计费。每连接 in-flight 上限为
-`min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × 一条最大消息的计费)`，限制单个连接最多
-能持有的加权预算（4× 覆盖 reader 最多流水化 4 条消息）。一条消息最多 1024 个分片
-（固定策略，不可配置）；超过时以 `1002` 关闭 source。
+`min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × 一条最大消息的计费)`，或配置的
+`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`，限制单个连接最多能持有的加权预算（4× 覆盖
+reader 最多流水化 4 条消息）。一条消息最多 1024 个分片（固定策略，不可配置）；超过时
+以 `1002` 关闭 source。
 
 destination 的 writer 队列或写入超过 `PASEO_RELAY_DELIVERY_TIMEOUT_MS` 时以 `1013`
 shed。frame/message 读超时，或消息在 `PASEO_RELAY_READ_STALL_TIMEOUT_MS` 内没有任何
@@ -160,8 +168,14 @@ paseo-relay --help               # 用法
 paseo-relay --version            # 版本 + build revision
 paseo-relay --check-config       # 校验环境与 TLS 文件（常规且可读），打印警告，退出 0/1
 paseo-relay --dump-config        # 打印生效配置
-paseo-relay healthcheck          # 容器自检（支持 TLS）
+paseo-relay healthcheck          # 容器自检（支持 TLS，固定证书）
 ```
+
+原生 TLS 下，`paseo-relay healthcheck` 会读取 `PASEO_RELAY_TLS_CERT` 的 leaf 证书，
+固定其 DER SHA-256 指纹，只接受探测目标提供的这一张证书；其他证书（即使本身有效）会
+导致探测失败。如果配置了原生 TLS 但证书文件不可读，探针只连接 loopback，对任何非
+loopback 的 `PASEO_RELAY_HEALTHCHECK_HOST` 都 fail-closed。明文监听没有可固定证书：
+允许非 loopback 探测，但无法认证。
 
 服务本身没有命令行配置；请使用环境变量，这样 Docker、Kubernetes、systemd 和
 release 镜像共享同一套契约。
@@ -178,10 +192,18 @@ release 镜像共享同一套契约。
   `accept` 会在达到 relay 自己的上限之前就开始失败。
 - **原生 TLS 但没有 per-IP 上限。** 设置了 `PASEO_RELAY_TLS_CERT` 时客户端多半是直连，
   而 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0` 允许单个客户端占满所有 WebSocket 槽位。
+- **自动的每连接上限等于整个预算。** `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 未设置时，
+  派生上限为 `min(budget, 4 × 一条最大消息的计费)`；默认配置下就是整个预算，且
+  `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0` 时单个连接（或单个 peer 的多条连接）可以在
+  delivery 窗口内占满全部预算。请调低 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 和/或
+  设置 per-IP 上限，或在边缘保留 per-source 限流。见
+  [残余可用性风险](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.zh-CN.md#威胁模型)。
 
 有一种 Kubernetes 情况是错误而不是警告：名为 `paseo-relay` 的 Service 会让 kubelet 向
-pod 注入 `PASEO_RELAY_PORT=tcp://<ip>:<port>`。relay 会拒绝这个值并在报错里说明原因。
-请显式设置 `PASEO_RELAY_PORT`，或使用 `enableServiceLinks: false`。
+pod 注入 `PASEO_RELAY_PORT=tcp://<ip>:<port>`；名为 `paseo-relay-ops` 的 Service 也可能
+在你没有显式设置 `PASEO_RELAY_OPS_PORT` 时注入同形式的 service link。relay 会拒绝这两种
+值，并在报错里点名冲突的 Service。请显式设置端口，或使用 `enableServiceLinks: false`；
+显式定义的变量不会被 service link 覆盖。
 
 ## 信号
 
@@ -190,8 +212,10 @@ pod 注入 `PASEO_RELAY_PORT=tcp://<ip>:<port>`。relay 会拒绝这个值并在
 - `SIGHUP`：重新读取 `PASEO_RELAY_TLS_CERT` 和 `PASEO_RELAY_TLS_KEY`。新连接使用新
   证书；已建立的会话不受影响。如果新的证书/私钥无法加载，继续使用旧证书并记录一条警告。
   relay 还会每 30 秒检查一次这两个文件，修改时间或大小变化时自动重新加载，所以原地续期
-  的证书（或轮换后的 Kubernetes Secret 挂载）不发信号也会生效。没有启用原生 TLS 时
-  `SIGHUP` 不做任何事。`v0.1.2` 及更早版本不处理 `SIGHUP`，收到会直接退出。
+  的证书（或轮换后的 Kubernetes Secret 挂载）不发信号也会生效。路径不再是常规文件
+  （FIFO、socket 或目录）时会记录警告并忽略，而不是打开它，因此坏挂载不会阻塞 reload；
+  关闭时最多等待卡住的 watcher 2 秒。没有启用原生 TLS 时 `SIGHUP` 不做任何事。
+  `v0.1.2` 及更早版本不处理 `SIGHUP`，收到会直接退出。
 
 ## 最小示例
 

@@ -7,7 +7,8 @@
 
 ## 开发环境
 
-- Rust `1.99.1`（`rust-toolchain.toml` 固定，rustup 会自动安装）
+- Rust `1.100.0`（`rust-toolchain.toml` 固定，rustup 会自动安装）。crate 的
+  `rust-version`/MSRV 是 `1.99.1`；没有单独的 MSRV 决定不要提高它。
 - cargo fmt、clippy 和测试工具链
 - Docker 仅用于可选的容器检查
 
@@ -18,12 +19,14 @@ cargo test --locked
 cargo build --release --locked
 python3 scripts/check-docs.py   # 本地链接 + 中英文配对检查
 scripts/ci.sh          # 与 CI 相同，包含容器 smoke test
-RUSTUP_TOOLCHAIN=nightly scripts/fuzz.sh 60   # 可选：运行全部 fuzz target；需要 nightly 和 cargo-fuzz
+RUSTUP_TOOLCHAIN=nightly-2026-11-20 scripts/fuzz.sh 60   # 可选：运行全部 fuzz target；需要 cargo-fuzz
 ```
 
 改动 frame codec、handshake 分类器、query 解析器或 upgrade 校验时，请在评审前先跑
-fuzz（见 `fuzz/README.md`，英文）；CI 也会构建并短时间运行每个 fuzz target。仓库通过
-`rust-toolchain.toml` 固定了 stable，因此脚本需要 `RUSTUP_TOOLCHAIN=nightly`。
+fuzz（见 `fuzz/README.md`，英文）；CI 也会构建并短时间运行每个 fuzz target。仓库为
+relay 固定 stable，并为 `cargo-fuzz` 固定一个有日期的 nightly；`scripts/fuzz.sh` 使用
+仓库内的 seed corpus，需要 `RUSTUP_TOOLCHAIN=nightly-2026-11-20`（或 `ci.yml` 中的
+nightly）。
 
 测试使用真实 listener 和真实 WebSocket client（`tokio-tungstenite`），不是 mock。
 新增协议行为请加集成测试到 `tests/relay_integration.rs`，纯逻辑加模块内单元测试。

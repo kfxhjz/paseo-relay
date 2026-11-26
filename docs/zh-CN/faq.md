@@ -56,15 +56,17 @@ Paseo 自带 relay 传输 E2E
 32 MiB−14、v2 control 帧 64 KiB、delivery timeout 30 s，以及每条消息最多 1024 个
 分片。payload 字节按 8 KiB chunk 在到达时按 `chunk_bytes × weight + 192` 加权单位
 计费（192 为每 chunk 记账）；每消息固定 256 字节开销只计一次；单个连接最多持有
-`min(budget, 4 × 一条最大消息的计费)` 的 ingress 预算。不超过 64 KiB 的消息另有
+`min(budget, 4 × 一条最大消息的计费)` 的 ingress 预算（可用
+`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 调低）。不超过 64 KiB 的消息另有
 16 MiB（加权）的独立预留池。预算占满时，relay 会先关闭其他连接上停滞、过慢
 （≤ 64 KiB/s）或传输过久（> 60 秒）的未完成消息，然后才关闭正在等待的 source；30 秒
 没有任何进展的消息则无论如何都会被关闭。这些都可以配置，见
 [configuration.md](configuration.md)。
 
-部分策略固定、不可配置：每条消息 1024 分片上限、v2 control 帧 64 KiB 上限、
-handshake 卫生检查 64 KiB 上限、每连接 4× ingress 上限，以及 upgrade 前 HTTP 上限
-（16 KiB 读缓冲、16 KiB header、64 个 header 字段）。其余都可配置；见
+部分策略固定、不可配置：每条消息 1024 分片上限、v2 control 帧 64 KiB 上限（入站帧和
+relay 生成的每条 `sync`）、handshake 卫生检查 64 KiB 上限，以及 upgrade 前 HTTP 上限
+（16 KiB 读缓冲、16 KiB header、64 个 header 字段）。每连接 ingress 上限默认按 4×
+派生，但可以配置。其余都可配置；见
 [configuration.md](configuration.md) 的 runtime contract。
 
 ## 需要多少内存？

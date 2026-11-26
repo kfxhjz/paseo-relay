@@ -54,7 +54,12 @@ its own within 30 seconds of the files changing, without dropping sessions
 [operations.md](operations.md#rotating-the-tls-certificate)). Clients then
 connect to the relay directly, so also set
 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` and move the operations endpoints off the
-public port with `PASEO_RELAY_OPS_PORT` (below).
+public port with `PASEO_RELAY_OPS_PORT` (below). The built-in
+`paseo-relay healthcheck` pins the leaf certificate at `PASEO_RELAY_TLS_CERT`
+(DER SHA-256) and accepts only that certificate, so a non-loopback probe target
+cannot be answered by a different local service; if native TLS is configured but
+the certificate cannot be read, it refuses non-loopback targets and only probes
+loopback.
 
 TLS is not optional for the public internet: although Paseo payloads are
 end-to-end encrypted, `serverId`, connection metadata, and availability are
@@ -80,8 +85,9 @@ Examples:
   string, and `error_log` at `crit`, because nginx's error log always includes
   the full request line.
 - HAProxy: [examples/haproxy.cfg](https://github.com/kfxhjz/paseo-relay/blob/main/examples/haproxy.cfg) — consistent hashing,
-  `/ready` checks, operations endpoints denied, per-source connection/rate
-  limits, and a log format that omits the query string.
+  `/ready` checks, operations endpoints denied, per-source TCP connection limits
+  (tracked before TLS/HTTP) plus HTTP request-rate limits, and a log format that
+  omits the query string.
 - Kubernetes with ingress-nginx: annotate the Ingress with
   `nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_serverId"` and use
   `/health` for liveness and `/ready` for readiness probes. The example also
@@ -146,8 +152,15 @@ example `-p 0.0.0.0:443:4000`).
 
 `v0.1.3` is the current release tag and `latest` follows the newest **stable**
 release. Prerelease tags (any tag containing `-`, for example `v0.2.0-rc1`) do
-not move `latest`. For an immutable reference, pin the multi-arch index digest
-for `v0.1.3` listed in the
+not move `latest`. Publication is staged so users never pull unverified bits:
+the multi-arch index is first assembled under a temporary candidate tag, then
+smoke-tested by digest, signed (cosign) and given a GitHub build provenance
+attestation, and only after those steps succeed is the version tag — and, when
+eligible, `latest` — promoted to the same digest. A failed build, smoke test or
+signing step therefore leaves the previous `latest` in place. `latest` also
+moves only to a stable version that is at least the highest stable tag on
+`main`, so an out-of-order older release cannot take it over. For an immutable
+reference, pin the multi-arch index digest for `v0.1.3` listed in the
 [release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.3)
 instead of the tag:
 
@@ -231,6 +244,12 @@ allow enough `TimeoutStopSec` for the drain grace window
 - `GET /health` — liveness; stays 200 while draining.
 - `GET /ready` — 200 only while the node admits new work; 503 while draining,
   shutting down, at WebSocket/session capacity, or during capacity failure.
+- `paseo-relay healthcheck` — with native TLS it pins the leaf certificate at
+  `PASEO_RELAY_TLS_CERT`; without readable TLS material it only probes
+  loopback and fails closed for a non-loopback target. A plaintext listener
+  cannot be authenticated: a non-loopback probe is allowed but should stay on
+  a trusted network; keep the operations host on loopback/wildcard where
+  possible.
 - `SIGTERM`/`SIGINT` — stop accepting, `/ready` flips to 503, existing sessions
   continue for `PASEO_RELAY_SHUTDOWN_GRACE_MS`, then close `1012` and exit.
 - `PASEO_RELAY_DRAIN=true` — start already unready; useful for a maintenance
@@ -266,9 +285,13 @@ keeping them private depends on an edge rule or a network policy being right.
 Setting `PASEO_RELAY_OPS_PORT` (for example `4001`) serves them on a separate
 plaintext listener instead; the public port then answers only `/ws` and
 `/health`. `PASEO_RELAY_OPS_HOST` defaults to `127.0.0.1`, which is enough for
-the container healthcheck; set it to a private address, or to `0.0.0.0` in a
-pod or container that does not publish that port, so probes and Prometheus can
-reach it. Then:
+the container healthcheck. Set it to `0.0.0.0` in a pod or container that does
+not publish that port, or to a private address, so probes and Prometheus can
+reach it. A plaintext listener bound to a **specific** non-loopback address can
+still be probed by the built-in `paseo-relay healthcheck`, but that probe is
+unauthenticated: any service answering `/health` looks healthy. Keep the
+operations listener on an internal network, or prefer a wildcard bind so the
+probe can use loopback. Then:
 
 - point Kubernetes probes, load-balancer health checks and Prometheus at the
   operations port (the examples carry the lines to uncomment);
@@ -307,6 +330,13 @@ Memory has two parts: idle/pre-upgrade sockets and in-flight payload accounting.
   validator requires the budget to admit one maximum message including that
   bookkeeping; use `--check-config` for the exact floor (the 129 MiB Compose
   budget still passes).
+- `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` (unset/`0` = auto) can lower that
+  per-connection cap. The derived default is the whole budget at the shipped
+  defaults, so one source can hold all of it for a delivery window; setting a
+  lower value bounds each source, and startup warns when the derived cap equals
+  the budget and `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` is off. Several
+  connections can still fill the budget, so edge per-source bandwidth limits
+  remain the primary mitigation.
 - `PASEO_RELAY_MAX_TCP_CONNECTIONS` is the total OS-socket cap and includes
   upgraded WebSockets (the slot is held for the whole socket lifetime), so
   `MAX_CONNECTIONS <= MAX_TCP_CONNECTIONS` must hold. Keep headroom above

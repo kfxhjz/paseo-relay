@@ -7,7 +7,7 @@
 [![CI](https://github.com/kfxhjz/paseo-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/kfxhjz/paseo-relay/actions/workflows/ci.yml)
 [![Paseo compatibility](https://github.com/kfxhjz/paseo-relay/actions/workflows/paseo-compat.yml/badge.svg)](https://github.com/kfxhjz/paseo-relay/actions/workflows/paseo-compat.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-blue.svg)](rust-toolchain.toml)
+[![Toolchain 1.100.0](https://img.shields.io/badge/toolchain-1.100.0-blue.svg)](rust-toolchain.toml)
 [![Image](https://img.shields.io/badge/ghcr.io-paseo--relay-blue)](https://github.com/kfxhjz/paseo-relay/pkgs/container/paseo-relay)
 [![Release](https://img.shields.io/github/v/release/kfxhjz/paseo-relay?sort=semver)](https://github.com/kfxhjz/paseo-relay/releases)
 [![GitHub stars](https://img.shields.io/github/stars/kfxhjz/paseo-relay?style=social)](https://github.com/kfxhjz/paseo-relay/stargazers)
@@ -167,8 +167,8 @@ the Elixir relay if you need its built-in cluster/ownership/reroute behavior.
 - **No account, no telemetry, no outbound calls**: the relay only listens; there
   is no signup, analytics, or phone-home (Paseo pairing is end-to-end).
 - **Deployment**: digest-pinned builder, multi-arch release workflow with
-  per-platform provenance and SBOM attestations, a signed image and build
-  provenance attestation (releases after `v0.1.2`), scratch non-root runtime,
+  per-platform provenance and SBOM attestations plus a signed multi-arch index
+  with build provenance (releases after `v0.1.2`), scratch non-root runtime,
   read-only friendly.
 
 ## Architecture in one picture
@@ -215,9 +215,11 @@ codes, and known differences from the Elixir relay.
 ## Deployment
 
 Release `v0.1.3` publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
-GHCR with per-platform provenance and SBOM attestations (the multi-arch index
-itself has no index-level attestation). Use the short version tag; the tag
-includes the leading `v` (`0.1.3` without it is not published):
+GHCR. Each per-platform image carries buildx-generated provenance and SBOM
+attestations, and the multi-arch index carries a GitHub build provenance
+attestation plus a keyless cosign signature (releases after `v0.1.2`). There is
+no index-level SBOM. Use the short version tag; the tag includes the leading
+`v` (`0.1.3` without it is not published):
 
 - **Image tag:** `ghcr.io/kfxhjz/paseo-relay:v0.1.3` (also tagged `latest`; only
   stable release tags move `latest`, so prerelease tags do not).
@@ -236,8 +238,9 @@ instead of the tag.
 Releases after `v0.1.2` are signed (cosign, keyless) and carry a GitHub build
 provenance attestation on the multi-arch index, so the image can be verified
 against this repository's release workflow before it is deployed; the commands
-are in [SECURITY.md](SECURITY.md#verifying-a-release). `v0.1.2` and earlier
-cannot be verified that way.
+are in [SECURITY.md](SECURITY.md#verifying-a-release). The same release also
+attaches buildx provenance and SBOM attestations to each per-platform image;
+there is no index-level SBOM. `v0.1.2` and earlier cannot be verified that way.
 
 Both topologies use the same image; the edge in front of it does the routing
 affinity:
@@ -282,10 +285,11 @@ across nodes will not pair. If you operate a public relay, read
 
 `/metrics` is aggregate-only Prometheus text (no `serverId` labels):
 readiness/draining, active WebSockets/sessions, ingress reserved and budget
-bytes for both pools, forwarded frames/bytes, slow consumers, delivery
-timeouts, rejections (WebSocket, session, per-IP, TCP, ingress), ingress
-reclaims, read and idle timeouts, handshake outcomes, max frame, uptime, build
-info. See
+bytes for both pools, relayed user frames/bytes (relay-generated control
+frames are excluded), slow consumers, delivery timeouts, control-send
+failures, rejections (WebSocket, session, session-connection, per-client,
+per-IP, TCP, operations, ingress), ingress reclaims, read and idle timeouts,
+handshake outcomes, max frame, uptime, build info. See
 [docs/operations.md](docs/operations.md),
 [examples/prometheus.yml](examples/prometheus.yml), and
 [examples/alerts.yml](examples/alerts.yml).
@@ -311,7 +315,8 @@ Payload accounting is incremental: a data-frame payload is charged in 8 KiB
 chunks as bytes arrive as `chunk_bytes × weight + 192` weighted units (the 192
 is per-chunk bookkeeping), the 256-byte per-message overhead is charged once per
 message, one connection can hold at most `min(budget, 4 × one-max-message
-charge)` of the weighted ingress budget, and one message may contain at most
+charge)` of the weighted ingress budget (or the explicit
+`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`), and one message may contain at most
 1024 fragments. A stalled header therefore cannot reserve budget for a payload
 it never sends, and the fragment cap bounds empty-fragment floods. Keep
 `PASEO_RELAY_MAX_TCP_CONNECTIONS` above `MAX_CONNECTIONS` (at least 64–128
@@ -358,10 +363,12 @@ of logs, and treat pairing links as secrets. See [SECURITY.md](SECURITY.md) and 
   an edge proxy; enable and size them for direct exposure.
 - **Large in-flight messages**: a few maximum-size messages can consume the
   configured ingress budget (one connection is capped at `min(budget, 4 ×
-  one-max-message charge)`). Unfinished ones are reclaimed under pressure and
-  small messages have their own reserve, but a peer that keeps sending large
-  messages nobody reads can still delay other large transfers; raise the
-  budget or limit bandwidth at the edge.
+  one-max-message charge)`, or `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`).
+  Unfinished ones are reclaimed under pressure and small messages have their own
+  reserve, but a peer that keeps sending large messages nobody reads can still
+  delay other large transfers; the default per-connection cap equals the whole
+  budget, and the per-IP cap is off by default. Raise the budget, lower
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`, or limit bandwidth at the edge.
 - **No per-user quotas or relay auth**: public operators must provide edge
   limits and a privacy/abuse policy; see [operator-policy.md](docs/operator-policy.md).
 - **No third-party security audit**: the evidence here is code review,
@@ -391,9 +398,10 @@ cargo build --release --locked
 scripts/ci.sh                 # local CI including a container smoke test
 ```
 
-The toolchain is pinned in `rust-toolchain.toml` (Rust `1.99.1`). The suite has
-85 unit tests plus 30 real-listener/real-WebSocket integration tests, with no
-mocks. Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and
+The toolchain is pinned in `rust-toolchain.toml` (Rust `1.100.0`; the MSRV is
+`1.99.1`). The suite includes unit tests plus real-listener/real-WebSocket
+integration tests, with no mocks. Contributions are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) and
 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Security reports go through
 [SECURITY.md](SECURITY.md), not public issues.
 

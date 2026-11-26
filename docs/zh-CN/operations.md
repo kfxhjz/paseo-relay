@@ -47,7 +47,9 @@ relay 按设计日志很少，并且永远不记录 `serverId`、`connectionId` 
 | `per_ip_limit` | 某个客户端达到了 `PASEO_RELAY_PER_IP_MAX_CONNECTIONS` |
 
 每一种都有对应的 counter（见下）；日志行的意义在于，没有接指标系统的节点也能看出自己
-正处于压力之下。
+正处于压力之下。运维监听的拒绝单独记录，日志带触发拒绝的 peer 地址，每 10 秒最多一行，
+并计入 `paseo_relay_ops_rejections_total`；这是唯一会记录 peer 的告警，因为运维额度
+刻意很小，运维需要找到占满它的来源。
 
 ## 轮换 TLS 证书
 
@@ -74,11 +76,33 @@ relay 每 30 秒检查一次这两个文件，发现变化就重新加载。新�
 
 Counter：`paseo_relay_frames_forwarded_total`、`paseo_relay_bytes_forwarded_total`、
 `paseo_relay_slow_consumer_disconnects_total`、`paseo_relay_delivery_timeouts_total`、
+`paseo_relay_delivery_ack_timeouts_total`、
+`paseo_relay_control_send_failures_total`、
 `paseo_relay_connection_rejections_total`、`paseo_relay_session_rejections_total`、
-`paseo_relay_per_ip_rejections_total`、`paseo_relay_tcp_rejections_total`、
+`paseo_relay_session_connection_rejections_total`、
+`paseo_relay_client_limit_rejections_total`、
+`paseo_relay_ops_rejections_total`、`paseo_relay_per_ip_rejections_total`、
+`paseo_relay_tcp_rejections_total`、
 `paseo_relay_ingress_rejections_total`、`paseo_relay_ingress_reclaims_total`、
 `paseo_relay_read_timeouts_total`、`paseo_relay_idle_timeouts_total`、
 `paseo_relay_handshake_accepted_total`、`paseo_relay_handshake_rejected_total`。
+
+转发类 counter 只统计 **中继的用户帧/字节**。relay 自己生成的控制帧（`sync`、
+`connected`、`disconnected` 和 v2 control `pong`）不计入
+`frames_forwarded_total`/`bytes_forwarded_total`，所以只有控制面活动、没有用户流量的
+session 不会增长。`delivery_timeouts_total` 按每次被 shed 的投递只计一次：source 侧计
+队列等待超时（`QueueTimeout`），destination writer 计写入 deadline 超时
+（`WriteTimeout`）。control 通知超过 1 秒发送超时时也计一次，同时计入
+`control_send_failures_total`。`delivery_ack_timeouts_total` 统计调用方等待 writer ack
+在 delivery deadline 到期。它可能与 `delivery_timeouts_total` 重叠（同一次投递中 source
+定时器与 writer deadline 都可能触发）；若 writer 恰在边界完成写入，destination 仍会以
+slow consumer 被关闭，但不增加 `delivery_timeouts_total` 或
+`slow_consumer_disconnects_total`。不要把该 counter 与两者相加；它用于解释未归因于
+shed 的 `1013` 关闭。
+`slow_consumer_disconnects_total` 统计因该 deadline 被 shed 的 destination。
+普通 transport/写错误两者都不计。`control_send_failures_total`
+统计无法入队/写出到 control socket 的 `sync`/`connected`/`disconnected`/pong 通知；
+初始或 watchdog `sync` 失败会 fail-closed 并关闭该 control socket。
 
 拒绝类 counter 按原因拆分：
 
@@ -86,9 +110,19 @@ Counter：`paseo_relay_frames_forwarded_total`、`paseo_relay_bytes_forwarded_to
   upgrade/handshake、Origin 不允许/无法解析，或 upgrade 失败/超时而拒绝的请求；
 - `paseo_relay_per_ip_rejections_total` 统计 per-IP WebSocket 上限（**不**计入
   `connection_rejections_total`）；
-- `paseo_relay_session_rejections_total` 统计 `MAX_SESSIONS` 上限；
+- `paseo_relay_session_rejections_total` **只**统计全局 `MAX_SESSIONS` 上限；
+- `paseo_relay_session_connection_rejections_total` 统计因 session 级
+  `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`（client id 与 daemon data 路由的并集）被
+  拒绝的 socket，或接受它会让 control `sync` 超过 64 KiB 而被拒绝的 socket；
+- `paseo_relay_client_limit_rejections_total` 统计因单个 `connectionId` 的
+  `PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION` 上限被拒绝的 client；
+- `paseo_relay_ops_rejections_total` 统计被运维监听 64 连接额度拒绝的连接（见
+  [运维监听](#运维监听)）；
 - `paseo_relay_tcp_rejections_total` 统计在 accept 时就被拒绝的 socket：达到
   `MAX_TCP_CONNECTIONS`，或命中 per-IP TCP 上限。
+
+这些 counter 可以准确区分容量原因：全局 session 上限、单个滥用 session、单个热点
+`connectionId`、运维监听打满，不再共用 `session_rejections_total`。
 
 ingress 相关的 counter 用来区分"有压力"和"有损失"：
 
@@ -115,8 +149,13 @@ Gauge：`paseo_relay_ready`、`paseo_relay_draining`、
 ingress 预留超过配置预算约 80%（用
 `paseo_relay_ingress_reserved_bytes / paseo_relay_ingress_budget_bytes` 比率，对任意
 配置预算都成立）、`paseo_relay_ingress_rejections_total` 出现任何增长、
-`paseo_relay_ingress_reclaims_total` 持续增长、实例从 scrape targets 消失。见
-[examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml)。
+`paseo_relay_ingress_reclaims_total` 持续增长、`paseo_relay_ops_rejections_total`
+出现任何增长（运维监听已打满，`/ready`/`/metrics` 可能不可达）、实例从 scrape
+targets 消失。`paseo_relay_session_connection_rejections_total` 或
+`paseo_relay_client_limit_rejections_total` 上升说明是单个 session 或单个
+`connectionId` 达到上限，而不是节点整体容量不足；用它们区分热点 session 和真正打满的
+节点。[examples/alerts.yml](https://github.com/kfxhjz/paseo-relay/blob/main/examples/alerts.yml)
+包含 ingress、connection、slow-consumer、per-session、per-client 和运维监听的规则。
 
 ## 容量与排障
 
@@ -138,8 +177,16 @@ ingress 预留超过配置预算约 80%（用
   `accept failed`，说明进程的 open-file 上限低于 `PASEO_RELAY_MAX_TCP_CONNECTIONS`；
   请调高它（`LimitNOFILE=`、`ulimits.nofile`）。在 Linux 上 relay 启动时会对此告警。
 - `connection_rejections_total` 覆盖 WebSocket 容量、draining、非法 upgrade/Origin
-  以及 upgrade 失败/超时；per-IP 拒绝由 `per_ip_rejections_total` 单独统计。需结合
-  边缘日志归因。
+  以及 upgrade 失败/超时；per-IP 拒绝由 `per_ip_rejections_total` 单独统计，
+  session 级/单连接 client 上限分别由 `session_connection_rejections_total` /
+  `client_limit_rejections_total` 统计。需结合边缘日志归因。
+- 如果只有运维监听上的 `/ready` 和 `/metrics` 返回 503，说明它的 64 连接额度已满
+  （慢 header 洪泛、抓取并发过高或探针配置错误）。`ops_rejections_total` 会增长，
+  告警日志会带 peer 地址；请保持探针短连接并限制抓取并发。
+- 默认派生的每连接上限可能等于整个 ingress 预算，单个快速 source 可以在 delivery
+  窗口内占满它。请调低 `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`、设置
+  `PASEO_RELAY_PER_IP_MAX_CONNECTIONS`，或在边缘限制 per-source 带宽；两个设置都在
+  默认/关闭值时，启动日志会给出警告。
 - relay 不记录 `serverId`、`connectionId` 或 payload。需要按用户归因时使用边缘日志
   （尽量脱敏 query string）。
 - `/version` 和 `build_info` 标识实际部署的 commit。如果 checkout 没有 `.git`，
@@ -155,6 +202,8 @@ ingress 预留超过配置预算约 80%（用
 | 持续 1012/1013 关闭 | 边缘/LB idle 或 write timeout 对长连接太短；检查 `PASEO_RELAY_DELIVERY_TIMEOUT_MS` 和 proxy tunnel timeout |
 | native TLS 握手失败 | 证书/密钥不匹配，或 UID 65532 没有读权限 |
 | `/ready` 或 `/metrics` 返回 404 | 设置了 `PASEO_RELAY_OPS_PORT`：它们只在运维端口上提供 |
+| 运维端口上的 `/ready` 和 `/metrics` 返回 503 | 运维监听 64 连接额度已满；`paseo_relay_ops_rejections_total` 上升，告警日志带 peer 地址。请降低抓取/探针并发或封禁来源 |
+| TLS healthcheck 报 "not loopback" / "could not be read" | 配置了原生 TLS，但探测目标不是 loopback 且无法固定 `PASEO_RELAY_TLS_CERT`：修复证书路径或改用 loopback 探测目标。明文监听允许非 loopback 探测，但无法认证 |
 | 大文件上传被 `1013` "Relay ingress reclaimed" 关闭 | ingress 预算已满且有别的 source 在等待；该上传处于停滞、慢于 `PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES`，或传输时间超过 `PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS`。按主机内存调大预算，或针对慢速链路调整这两个设置 |
 | source 在消息中途被 `1013` "Relay read timeout" 关闭 | 在 `PASEO_RELAY_READ_STALL_TIMEOUT_MS`（默认 30 秒）内没有任何 payload 进展，或超过了 frame/message deadline |
 | 某个设置不生效 | 查看启动日志或 `--check-config` 是否有 "is not a relay setting" 警告：变量名拼错了 |

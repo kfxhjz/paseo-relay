@@ -165,24 +165,44 @@ kill; this is the structural fix for shared-owner failure modes.
   `connectionId`) and per-connection data sockets. Attaching a control socket
   sends it a `sync` message with the sorted list of currently attached
   `connectionId`s, and replaces any previous control socket (also `1008`).
+  Every generated `sync` must serialize to at most 64 KiB (`CONTROL_FRAME_BYTES`):
+  a control attach whose initial `sync` would exceed it is refused `1013`
+  "Relay session sync capacity", and so is a client whose id would push the
+  next `sync` past the limit. That keeps the relay from emitting a control
+  frame the daemon's documented 64 KiB inbound cap cannot accept.
   Attaching a data socket replaces an existing socket for the same
   `connectionId`.
 - **v2 clients** attach to a `connectionId`. Clients normally omit it, in which
   case the relay generates `conn_<16 hex>`; a supplied value is validated and
-  used as-is for Elixir compatibility. The client is reported to the control
-  socket as `connected`; the last client detach removes the data socket (close
-  `1001`) and notifies the control socket with `disconnected`. A data socket
-  that dies closes its clients with `1012` ("Server disconnected").
+  used as-is for Elixir compatibility (query values are never trimmed, so a
+  whitespace-only value is rejected rather than treated as empty). The client
+  is reported to the control socket as `connected`; the last client detach
+  removes the data socket (close `1001`) and notifies the control socket with
+  `disconnected`. A data socket that dies closes its clients with `1012`
+  ("Server disconnected").
 - **Session lifetime.** A session is removed as soon as its last socket has
   left and no connection task still references it, so `MAX_SESSIONS` counts
   `serverId`s that somebody is attached to; an empty session holds no state
   worth keeping. The removal runs under the registry shard lock and checks the
   reference count, and a joiner takes its reference under the same lock before
   attaching, so a session about to gain a socket is never removed. A periodic
-  sweep remains as a safety net. Each session caps both distinct v2
-  `connectionId`s (`MAX_CONNECTIONS_PER_SESSION`, default `512`) and clients
-  per `connectionId` (`MAX_CLIENTS_PER_CONNECTION`), and runs at most one
-  deduplicated control watchdog holding only a `Weak<Session>` across awaits.
+  sweep remains as a safety net. Each session caps the **union** of distinct v2
+  `connectionId`s (`MAX_CONNECTIONS_PER_SESSION`, default `512`): a client id
+  and a data route for the same id share one slot, and the ceiling is checked
+  before a new client is attached (so a client cannot be accepted into a
+  session whose data routes are already full and then fail 15 s later). The
+  same session caps clients per `connectionId` (`MAX_CLIENTS_PER_CONNECTION`)
+  and runs at most one deduplicated control watchdog holding only a
+  `Weak<Session>` across awaits.
+- **Watchdog deadlines.** The watchdog keeps two clocks. `nudged_at` starts
+  from the first nudge that covered the oldest waiter and defines the `1011`
+  deadline; later arrivals do not move it. `last_nudge_at` is a separate
+  coverage clock: a client whose `waiting_since` is later than the last nudge
+  gets a supplementary `sync` before the deadline, without extending the
+  oldest waiter's `1011`. This implements the "later arrivals get their own
+  sync" rule without letting an attacker add clients forever to postpone
+  `1011`, and a nudge that cannot be sent is fail-closed rather than silently
+  skipped.
 - **No cross-session effects.** Operations under the session lock are short and
   synchronous (no `.await` while holding it); protocol actions that affect other
   sockets (replacement, data death, last client) are computed under the lock and
@@ -199,9 +219,11 @@ The relay's core reliability rule is **source backpressure, not buffering**:
    is accounted. The fixed 256-byte per-message overhead is charged once per
    message, not per fragment, and a message may contain at most 1024 fragments
    (fixed policy; exceeding it closes `1002`). A per-connection in-flight cap of
-   `min(global budget, 4 × one-max-message charge)` bounds how much of the budget
-   one connection can hold; the 4× factor covers the reader's pipelining of up
-   to four messages per connection.
+   `min(global budget, 4 × one-max-message charge)`—or the explicit
+   `PER_CONNECTION_LIMIT_BYTES`, clamped to `[one maximum message, budget]`—bounds
+   how much of the budget one connection can hold; the 4× factor covers the
+   reader's pipelining of up to four messages per connection and is the default
+   derivation.
 2. It resolves the destination from the registry and enqueues the frame on the
    destination's writer queue together with an `Arc<BudgetHold>` of the frame's
    ingress budget guards and an absolute delivery deadline, waiting for a
@@ -226,12 +248,14 @@ The relay's core reliability rule is **source backpressure, not buffering**:
    source with `1013`; waiting for budget never extends the read deadline.
 
 Per-destination writer queues are bounded twice: a 1024-message mpsc cap plus a
-byte semaphore whose size is `max(control_queue_bytes, max_message_bytes +
-64 KiB)`. A single maximum message always fits, so shedding happens by
-deadline, not by an unreservable slot. Ping/pong entries do not take the byte
+byte semaphore whose size is `max(control_queue_bytes, max_message_bytes + 64
+KiB)`—about 32 MiB at the defaults, so one maximum message always fits and
+shedding happens by deadline, not by an unreservable slot. Ping/pong entries do
+not take the byte
 semaphore, but are capped by the mpsc count and the RFC 125-byte control limit. The per-connection reader hands at most
 two completed messages to the routing task, so read-ahead is bounded too. The
-control socket has its own 64 KiB frame cap.
+control socket has its own 64 KiB frame cap, and the relay's own generated
+`sync` obeys the same cap.
 
 ### 2.5 Ingress budget
 
@@ -251,9 +275,12 @@ charged after it arrives and released when the frame is delivered or the
 connection dies, so at most one 8 KiB chunk per connection is allocated before
 it is charged (the payload vector is not preallocated to the declared length). A
 per-connection in-flight cap of
-`min(global budget, 4 × one-max-message charge)` applies: one connection can
-hold at most that much of the weighted budget, and the 4× factor covers the
-reader's pipelining of up to four messages per connection. Together
+`min(global budget, 4 × one-max-message charge)`, or the configured
+`PER_CONNECTION_LIMIT_BYTES`, applies: one connection can hold at most that much
+of the weighted budget, and the 4× default factor covers the reader's
+pipelining of up to four messages per connection. The cap is clamped to at least
+one maximum message so a single connection can always make progress, and to at
+most the global budget so it cannot exceed the pool. Together
 with the fixed maximum of 1024 fragments per message, these bounds limit what a
 stalled frame or a flood of empty fragments can reserve: the declared length of
 a frame is not charged until its bytes actually arrive.
@@ -328,6 +355,31 @@ configuration-reviewable constants, not measured allocator costs.
 - Sessions are node-local and ephemeral; a restart is always safe because Paseo
   clients and daemons reconnect. Nothing is persisted, by design.
 
+### 2.7 Observability
+
+`/metrics` is aggregate-only and never carries `serverId`, `connectionId`, or
+payload content. Two semantics are deliberate:
+
+- **Forwarded traffic is user traffic.** `frames_forwarded_total` and
+  `bytes_forwarded_total` count only relayed user frames and bytes; relay-
+  generated control JSON (`sync`, `connected`, `disconnected`, v2 `pong`) is
+  excluded, so a control-only session does not look like data forwarding.
+- **Rejections are attributed to one cause each.** `session_rejections_total`
+  counts only the global `MAX_SESSIONS` ceiling; the per-session
+  `connectionId` union cap and the 64 KiB `sync` limit are counted by
+  `session_connection_rejections_total`; the per-`connectionId` client cap by
+  `client_limit_rejections_total`; the operations listener's 64-connection
+  allowance by `ops_rejections_total`. `connection_rejections_total`,
+  `per_ip_rejections_total`, and `tcp_rejections_total` keep their existing
+  meanings. A delivery that misses its deadline is counted once per shed
+  delivery (`delivery_timeouts_total`): at the source for a queue wait, at the
+  destination writer for a write deadline; the destination is counted in
+  `slow_consumer_disconnects_total`. A control notification that misses its
+  1 s send timeout is counted there too, alongside
+  `control_send_failures_total`. Ordinary transport errors are not delivery
+  timeouts. Control notifications that cannot be queued or written are counted
+  by `control_send_failures_total` and, for `sync`, are fail-closed.
+
 ## 3. Protocol model
 
 ### 3.1 Common
@@ -361,8 +413,10 @@ session topology is unaffected).
 ### 3.3 v2
 
 - The daemon opens a **control socket** (`role=server`, empty `connectionId`).
-  The relay replies with `{"type":"sync","connectionIds":[...]}`. A new control
-  socket replaces the old one.
+  The relay replies with `{"type":"sync","connectionIds":[...]}`, sorted and
+  bounded to 64 KiB; a control attach whose snapshot would not fit is refused
+  `1013` "Relay session sync capacity". A new control socket replaces the old
+  one.
 - For each client connection the daemon opens a **data socket** with that
   `connectionId`. Data sockets are attached on demand; a client frame waits for
   its data socket only for `DATA_ATTACH_TIMEOUT_MS`.
@@ -370,17 +424,23 @@ session topology is unaffected).
   reports it to the daemon through the control socket as
   `{"type":"connected","connectionId":...}`. The last client detach emits
   `{"type":"disconnected",...}` and closes the data socket with `1001`.
+- The initial `sync` is not guaranteed to be written before a concurrent
+  client's `connected` or a detach's `disconnected`; the daemon must treat
+  `sync` as a baseline snapshot and apply the notifications idempotently. This
+  ordering race is accepted (Paseo v0.15.3 tolerates connected-before-sync) and
+  is not a data-plane boundary.
 - If a data socket disconnects, all clients for that `connectionId` are closed
   with `1012`.
 - Control input is ignored except for text `{"type":"ping"}`, which is answered
-  with `{"type":"pong","ts":<unix ms>}`; control frames are capped at 64 KiB.
+  with `{"type":"pong","ts":<unix ms>}`; control frames are capped at 64 KiB in
+  both directions.
 
 ## 4. Invariants
 
 | # | Invariant | Enforcement |
 |---|---|---|
 | I1 | Payloads are opaque and never logged or persisted. | No payload parsing except the bounded handshake-hygiene check; metrics count bytes, never content; `serverId` and payload bytes are never logged. |
-| I2 | Memory is bounded by configuration, not by peer behavior. | Frame/message caps, 1024-fragment policy, control-frame cap, writer byte semaphore for data frames, bounded mpsc, chunked ingress charging (payload weight plus per-chunk bookkeeping) with a per-connection in-flight cap, pre-upgrade HTTP buffer/header caps, connection/session/per-IP caps, HTTP header timeout; ping/pong frames are additionally bounded by the mpsc count and 125-byte RFC limit. |
+| I2 | Memory is bounded by configuration, not by peer behavior. | Frame/message caps, 1024-fragment policy, control-frame cap including relay-generated `sync`, writer byte semaphore for data frames, bounded mpsc, chunked ingress charging (payload weight plus per-chunk bookkeeping) with a per-connection in-flight cap, pre-upgrade HTTP buffer/header caps, connection/session/per-IP caps, HTTP header timeout; ping/pong frames are additionally bounded by the mpsc count and 125-byte RFC limit. |
 | I3 | A slow destination applies backpressure to its source; it never grows an unbounded queue. | Source waits for ingress budget and writer ack; delivery deadline sheds instead of buffering. |
 | I4 | A connection failure only affects that connection and its protocol-defined peers. | Detach removes only its own handle; writer ack is independent of source liveness; the only cross-socket closes are replacement (`1008`), v2 data death (`1012`), and last-client detach (`1001`). |
 | I5 | Fail closed: no half-open or silently dropped state transition. | Handshake/query errors return HTTP errors without session/writer/WebSocket/per-IP state; framing errors close with an explicit code; shutdown closes with `1012`. |
@@ -414,6 +474,7 @@ session topology is unaffected).
 | No frame in either direction for the optional idle timeout | WebSocket close `1013`, "Idle timeout" |
 | Delivery deadline exceeded / slow destination | WebSocket close `1013`, "Slow consumer" / "Delivery unavailable" |
 | v2 client has no data socket within the attach timeout | WebSocket close `1013`, "Data route unavailable" |
+| v2 client attach would exceed the 64 KiB control `sync` limit | WebSocket close `1013`, "Relay session sync capacity" |
 | Graceful drain / server restart | WebSocket close `1012`, "Relay shutting down" |
 | v2 server data socket disconnected | Client sockets close `1012`, "Server disconnected" |
 | Last v2 client for a connection detached | Data socket closes `1001`, "Client disconnected" |
@@ -501,8 +562,12 @@ implementation.
   the main pool is full, other sources' messages above 64 KiB may be closed
   `1013`; smaller ones use the reserve. Shedding undelivered messages under
   pressure would close this gap but changes delivery semantics and is left as
-  future work. The default 512 MiB global budget is slightly smaller than four
-  maximum messages' weighted charge, so a maximal four-message pipeline can see
+  future work. The default per-connection cap is the whole 512 MiB budget;
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` can lower it, but several
+  connections can still fill the pool and per-IP caps are off by default, so
+  edge per-source bandwidth limits remain the primary mitigation. The default
+  512 MiB global budget is slightly smaller than four maximum messages'
+  weighted charge, so a maximal four-message pipeline can see
   normal `1013` budget backpressure.
 - **Reclaim is a policy, and policies have losers.** On a node whose budget is
   genuinely too small for its traffic, a large upload that is slower than the

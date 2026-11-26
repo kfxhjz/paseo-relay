@@ -139,9 +139,14 @@ flowchart TD
 - **v2 daemon** socket 包括 control socket（`role=server`，空 `connectionId`）和每个
   connection 的 data socket。attach control socket 时会发送 `sync` 消息，内含当前
   已 attach 的 `connectionId` 排序列表，并替换之前的 control socket（同样 `1008`）。
-  attach data socket 会替换同一 `connectionId` 的已有 socket。
+  relay 生成的每条 `sync` 序列化后必须 ≤ 64 KiB（`CONTROL_FRAME_BYTES`）：初始
+  `sync` 就超限的 control attach 会以 `1013` "Relay session sync capacity" 拒绝；
+  会让下一条 `sync` 超限的新 client 同样被拒绝。这样 relay 不会发出超过 daemon
+  文档化 64 KiB 入站上限的控制帧。attach data socket 会替换同一 `connectionId` 的
+  已有 socket。
 - **v2 client** attach 到 `connectionId`。client 通常省略它，此时 relay 生成
-  `conn_<16 hex>`；如果提供，则校验后原样使用，以兼容 Elixir。client 会以
+  `conn_<16 hex>`；如果提供，则校验后原样使用，以兼容 Elixir（query 值不做 trim，
+  纯空白值会被拒绝而不是当成空值）。client 会以
   `connected` 通知 control socket；最后一个 client detach 会移除 data socket
   （close `1001`）并以 `disconnected` 通知 control socket。data socket 死亡时，它的
   所有 client 以 `1012`（"Server disconnected"）关闭。
@@ -149,10 +154,17 @@ flowchart TD
   时，session 立即被移除，所以 `MAX_SESSIONS` 统计的是有人 attach 的 `serverId`；空
   session 没有任何值得保留的状态。移除在 registry 的 shard 锁内进行并检查引用计数，
   而加入方在 attach 之前也是在同一把锁内取得引用，所以即将获得 socket 的 session 不会
-  被移除。周期性清理作为兜底保留。每个 session 同时限制不同 v2 `connectionId` 数量
-  （`MAX_CONNECTIONS_PER_SESSION`，默认 `512`）与每个 `connectionId` 的 client 数
+  被移除。周期性清理作为兜底保留。每个 session 限制不同 v2 `connectionId` 的
+  **并集**（`MAX_CONNECTIONS_PER_SESSION`，默认 `512`）：同一个 id 的 client 与 data
+  路由共用一个名额；上限在新 client attach 前检查，因此不会先接入 client、15 秒后
+  才因 data 路由已满而失败。同一个 session 还限制每个 `connectionId` 的 client 数
   （`MAX_CLIENTS_PER_CONNECTION`），并最多运行单个去重的 control watchdog（跨 await
   仅持 `Weak<Session>`）。
+- **Watchdog 截止时间。** watchdog 维护两个时钟。`nudged_at` 从覆盖最老等待者的第一次
+  nudge 开始计时，决定 `1011` deadline；后到者不会推迟它。`last_nudge_at` 是独立的覆盖
+  时钟：`waiting_since` 晚于上次 nudge 的 client 会在 deadline 前收到补充 `sync`，
+  但不会延长最老等待者的 `1011`。这样既落实"后到 client 收到自己的 sync"，又不让攻击者
+  靠不断加入 client 无限推迟 `1011`；nudge 发送失败是 fail-closed，而不是静默跳过。
 - **无跨 session 影响。** session lock 下的操作短且同步（持锁时没有 `.await`）；
   影响其他 socket 的协议动作（替换、data 死亡、最后 client）在锁内计算，锁释放后
   执行。
@@ -166,8 +178,9 @@ relay 的核心可靠性规则是 **源端背压，而不是缓冲**：
    单位用于 chunk 记账），因此每个连接在计费前最多分配一个 8 KiB chunk。每消息
    固定 256 字节开销 **每条消息只计一次**，不按分片重复计费；一条消息最多 1024 个
    分片（固定策略，超过则 close `1002`）。每连接 in-flight 上限为
-   `min(全局预算, 4 × 一条最大消息的计费)`，限制单个连接最多持有的预算；4× 对应
-   reader 最多流水化 4 条消息。
+   `min(全局预算, 4 × 一条最大消息的计费)`，或显式的
+   `PER_CONNECTION_LIMIT_BYTES`（clamp 到 `[一条最大消息, 预算]`），限制单个连接最多
+   持有的预算；4× 是默认派生方式，对应 reader 最多流水化 4 条消息。
 2. 它从 registry 解析 destination，并把帧连同该帧的 `Arc<BudgetHold>`（ingress 预算
    guard）与绝对投递 deadline 一起 enqueue 到 destination 的 writer 队列，等待有界
    byte permit。
@@ -185,11 +198,11 @@ relay 的核心可靠性规则是 **源端背压，而不是缓冲**：
    任何 payload 进展，同样以 `1013` 关闭 source；等待预算不会延长读取 deadline。
 
 每个 destination 的 writer 队列有两重限制：1024 条消息的 mpsc 上限，加上一个字节
-信号量，其大小为 `max(control_queue_bytes, max_message_bytes + 64 KiB)`。单条最大
-消息总能放下，所以淘汰由 deadline 触发，而不是由无法预留的 slot 触发。Ping/pong
-条目不占字节信号量，但受 mpsc 条数和 RFC 125 字节 control frame 上限约束。
-per-connection reader 最多把两条已完成消息交给 routing task，因此预读也有界。
-control socket 有自己的 64 KiB 帧上限。
+信号量，其大小为 `max(control_queue_bytes, max_message_bytes + 64 KiB)`——默认约
+32 MiB，因此单条最大消息总能放下，淘汰由 deadline 触发，而不是由无法预留的 slot
+触发。Ping/pong 条目不占字节信号量，但受 mpsc 条数和 RFC 125 字节 control frame
+上限约束。per-connection reader 最多把两条已完成消息交给 routing task，因此预读也有界。
+control socket 有自己的 64 KiB 帧上限，relay 自己生成的 `sync` 也遵守该上限。
 
 ### 2.5 Ingress 预算
 
@@ -204,10 +217,11 @@ guard 中，所以取消、panic 或 socket 死亡总会归还字节。
 计费是增量的，不是按声明帧长度一次性预留。reader 按 8 KiB chunk 读取 data frame
 payload；每个 chunk 到达后才计费，并在帧投递完成或连接死亡时释放，因此每个连接在
 计费前最多分配一个 8 KiB chunk（payload vector 不会按声明长度预分配）。每连接
-in-flight 上限为 `min(全局预算, 4 × 一条最大消息的计费)`：单个连接最多持有这么多
-加权预算，4× 对应 reader 最多流水化 4 条消息。再配合每条消息最多 1024 个分片的
-固定策略，这些上限限制了停滞帧或空分片洪泛能占用多少预算：帧声明的长度在字节真正
-到达之前不会被计费。
+in-flight 上限为 `min(全局预算, 4 × 一条最大消息的计费)`，或配置的
+`PER_CONNECTION_LIMIT_BYTES`：单个连接最多持有这么多加权预算，4× 默认值对应 reader
+最多流水化 4 条消息。该上限至少 clamp 到一条最大消息，保证单个连接总能取得进展；最多
+为全局预算，不会超过池大小。再配合每条消息最多 1024 个分片的固定策略，这些上限限制了
+停滞帧或空分片洪泛能占用多少预算：帧声明的长度在字节真正到达之前不会被计费。
 
 **两个池。** 主池（`INGRESS_BUDGET_BYTES`）接纳所有消息。第二个池
 （`INGRESS_SMALL_RESERVE_BYTES`）只接纳不超过 64 KiB 的完整单帧消息，这类消息优先计
@@ -259,6 +273,26 @@ read buffer 加 destination writer queue）留出余量，同时保持记账保�
 - Session 是节点本地且临时的；重启总是安全的，因为 Paseo client 和 daemon 会重连。
   按设计不持久化任何东西。
 
+### 2.7 可观测性
+
+`/metrics` 只有聚合值，绝不带 `serverId`、`connectionId` 或 payload 内容。有两条刻意
+保持的语义：
+
+- **转发流量是用户流量。** `frames_forwarded_total` 和 `bytes_forwarded_total` 只统计
+  relay 转发的用户帧/字节；relay 自己生成的控制 JSON（`sync`、`connected`、
+  `disconnected`、v2 `pong`）不计入，所以只有控制面活动的 session 不会显示成有数据转发。
+- **每类拒绝只计一个来源。** `session_rejections_total` 只统计全局 `MAX_SESSIONS`
+  上限；session 级 `connectionId` 并集上限与 64 KiB `sync` 上限计入
+  `session_connection_rejections_total`；每个 `connectionId` 的 client 上限计入
+  `client_limit_rejections_total`；运维监听的 64 连接额度计入
+  `ops_rejections_total`。`connection_rejections_total`、`per_ip_rejections_total`、
+  `tcp_rejections_total` 保持原义。超过 deadline 的投递按每次 shed 只计一次
+  （`delivery_timeouts_total`）：source 侧计队列等待超时，destination writer 计写入
+  deadline 超时；destination 另计 `slow_consumer_disconnects_total`。control 通知超过
+  1 秒发送超时时也会计一次，同时计入 `control_send_failures_total`。普通 transport
+  错误不算 delivery timeout。无法入队或写出的 control 通知计入
+  `control_send_failures_total`，其中 `sync` 失败是 fail-closed。
+
 ## 3. 协议模型
 
 ### 3.1 通用
@@ -285,22 +319,27 @@ read buffer 加 destination writer queue）留出余量，同时保持记账保�
 ### 3.3 v2
 
 - daemon 打开一个 **control socket**（`role=server`，空 `connectionId`）。relay 回复
-  `{"type":"sync","connectionIds":[...]}`。新 control socket 会替换旧 control socket。
+  `{"type":"sync","connectionIds":[...]}`，列表有序且限制在 64 KiB；初始快照放不下的
+  control attach 以 `1013` "Relay session sync capacity" 拒绝。新 control socket 会
+  替换旧 control socket。
 - 对每个 client connection，daemon 用对应 `connectionId` 打开一个 **data socket**。
   data socket 按需 attach；client 帧只等待 data socket `DATA_ATTACH_TIMEOUT_MS`。
 - v2 **client** 省略 `connectionId`；relay 分配 `conn_<16 hex>`，并通过 control
   socket 以 `{"type":"connected","connectionId":...}` 报告给 daemon。最后一个 client
   detach 时发出 `{"type":"disconnected",...}` 并以 `1001` 关闭 data socket。
+- 初始 `sync` 不保证先于并发 client 的 `connected` 或 detach 的 `disconnected` 写入；
+  daemon 应把 `sync` 当作基线快照，并幂等地应用这些通知。这个顺序竞态是已知且接受的
+  （Paseo v0.15.3 可容忍 connected-before-sync），不属于数据面边界。
 - 如果 data socket 断开，该 `connectionId` 下所有 client 以 `1012` 关闭。
 - control 输入除 text `{"type":"ping"}` 外忽略；ping 回复
-  `{"type":"pong","ts":<unix ms>}`；control 帧上限 64 KiB。
+  `{"type":"pong","ts":<unix ms>}`；control 帧双向都限制在 64 KiB。
 
 ## 4. 不变量
 
 | # | 不变量 | 执行方式 |
 |---|---|---|
 | I1 | payload 不透明，绝不记录或持久化。 | 除有界 handshake 卫生检查外不解析 payload；指标只计字节，不记内容；`serverId` 和 payload 字节绝不记录。 |
-| I2 | 内存由配置约束，而不是由 peer 行为约束。 | 帧/消息上限、1024 分片策略、control 帧上限、data frame 的 writer 字节信号量、有界 mpsc、带每连接 in-flight 上限的增量 ingress 计费（payload 权重加每 chunk 记账）、upgrade 前 HTTP 缓冲/header 上限、connection/session/per-IP 上限、HTTP header timeout；ping/pong 帧还受 mpsc 条数和 RFC 125 字节限制约束。 |
+| I2 | 内存由配置约束，而不是由 peer 行为约束。 | 帧/消息上限、1024 分片策略、包含 relay 自产 `sync` 的 control 帧上限、data frame 的 writer 字节信号量、有界 mpsc、带每连接 in-flight 上限的增量 ingress 计费（payload 权重加每 chunk 记账）、upgrade 前 HTTP 缓冲/header 上限、connection/session/per-IP 上限、HTTP header timeout；ping/pong 帧还受 mpsc 条数和 RFC 125 字节限制约束。 |
 | I3 | 慢 destination 对 source 施加背压；队列绝不无界增长。 | source 等待 ingress 预算和 writer ack；delivery deadline 触发淘汰而不是缓冲。 |
 | I4 | 连接失败只影响该连接及其协议定义的对端。 | detach 只移除自己的 handle；writer ack 独立于 source 存活；唯一的跨 socket 关闭是替换（`1008`）、v2 data 死亡（`1012`）和最后 client detach（`1001`）。 |
 | I5 | 失败即关闭：没有半开或静默丢弃的状态转换。 | 握手/query 错误返回 HTTP 错误且不创建 session/writer/WebSocket/per-IP 状态；framing 错误用明确 close code；shutdown 用 `1012`。 |
@@ -334,6 +373,7 @@ read buffer 加 destination writer queue）留出余量，同时保持记账保�
 | 在可选的 idle 超时内双向都没有任何帧 | WebSocket close `1013`，"Idle timeout" |
 | 超过 delivery deadline / 慢 destination | WebSocket close `1013`，"Slow consumer" / "Delivery unavailable" |
 | v2 client 在 attach timeout 内没有 data socket | WebSocket close `1013`，"Data route unavailable" |
+| v2 client attach 会让 control `sync` 超过 64 KiB | WebSocket close `1013`，"Relay session sync capacity" |
 | 优雅 drain / server 重启 | WebSocket close `1012`，"Relay shutting down" |
 | v2 server data socket 断开 | Client socket close `1012`，"Server disconnected" |
 | 一个 connection 的最后 v2 client detach | Data socket close `1001`，"Client disconnected" |
@@ -402,8 +442,10 @@ read buffer 加 destination writer queue）留出余量，同时保持记账保�
   （15 秒）deadline，要持续维持大约每 15–30 秒需要一整个预算量的 payload（默认约
   35–70 Mbit/s）。主池被占满期间，其他 source 大于 64 KiB 的消息可能以 `1013` 关闭；
   更小的消息走预留池。在压力下主动丢弃"未投递的消息"可以补上这个缺口，但会改变投递
-  语义，留作后续工作。默认 512 MiB 全局预算略小于四条最大消息的加权计费，因此最大的
-  4 消息流水线可能看到正常的 `1013` 预算反压。
+  语义，留作后续工作。默认每连接上限就是整个 512 MiB 预算；可用
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` 调低，但多条连接仍可占满预算，且 per-IP
+  上限默认关闭，所以主要缓解手段仍是边缘的 per-source 带宽限制。默认 512 MiB 全局预算
+  略小于四条最大消息的加权计费，因此最大的 4 消息流水线可能看到正常的 `1013` 预算反压。
 - **回收是一种策略，而策略总有输家。** 在预算确实小于流量需求的节点上，慢于速率下限
   或超过时长上限的大文件上传会被关闭以让位给更新的上传，而不是让更新的那个超时。阈值
   可配置，规则也只在有人等待时生效，但饱和节点上的慢速上行链路会看到以前没有的、可重试

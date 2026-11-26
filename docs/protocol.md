@@ -16,12 +16,15 @@ upgrade headers (including a 16-byte `Sec-WebSocket-Key` and
 |---|---|---|
 | `serverId` | yes | Routing key; 1..=256 bytes, valid UTF-8, no control characters or whitespace |
 | `role` | yes | `server` (daemon) or `client` |
-| `v` | no | `1` (default) or `2` |
-| `connectionId` | v2 only | Daemon data socket routing id. Clients normally omit it; the relay generates `conn_<16 hex>`. A v2 daemon control socket uses an empty value |
+| `v` | no | `1` (default) or `2`, matched **verbatim**. Absent or empty selects `1`; a padded or otherwise different value (for example `v=+2`, decoded as `" 2"`) is rejected `400` |
+| `connectionId` | v2 only | Daemon data socket routing id. For a v2 client, omitted/empty means the relay generates `conn_<16 hex>`; a supplied value is used verbatim (never trimmed) and must pass ID validation. For a v2 daemon, an omitted/empty value is the control socket |
 
 Paseo clients and daemons treat `serverId` as a bearer secret: anyone who knows
 it can attach to the session. The relay does not add authentication by design;
 see the security model in README and `SECURITY.md`.
+
+`v` and `connectionId` are not trimmed: `connectionId=%20` is a whitespace-only
+value and is rejected `400`, not treated as the empty/control value.
 
 Send exactly one unencoded `serverId`. If a query parameter appears more than
 once, the relay uses the **last** occurrence (last-wins, matching the Elixir
@@ -70,7 +73,10 @@ Behavior:
 
 - On control attach, the relay sends
   `{"type":"sync","connectionIds":[...]}` with the currently attached client
-  connection ids and replaces any previous control socket (`1008`).
+  connection ids and replaces any previous control socket (`1008`). Every
+  `sync` the relay sends is limited to 64 KiB after serialization. If the
+  current client list would not fit, the control attach is refused with `1013`
+  "Relay session sync capacity" instead of sending an oversized control frame.
 - On client attach, the relay reports
   `{"type":"connected","connectionId":"..."}` to the control socket.
 - When the last client for a `connectionId` detaches, the relay sends
@@ -81,16 +87,41 @@ Behavior:
 - Client frames wait for their data socket for up to
   `DATA_ATTACH_TIMEOUT_MS` (default 15 s); if it never attaches, the client is
   closed with `1013` "Data route unavailable".
-- Each session caps distinct v2 `connectionId`s at
-  `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` (default `512`); excess connections
-  are closed with `1013` "Relay session connection capacity".
+- `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` (default `512`) caps the **union**
+  of distinct v2 `connectionId`s in the session: client ids and daemon data
+  routes share the same budget, so one id occupies one slot whether a client
+  socket, a data socket, or both are attached. Excess connections are closed
+  with `1013` "Relay session connection capacity". A new client also has its id
+  checked against the 64 KiB `sync` budget before it is accepted; a client that
+  would push the next `sync` past the limit is refused with `1013` "Relay
+  session sync capacity", rather than being accepted into a state the daemon
+  cannot receive (and instead of failing later when its data route attaches).
 - While one or more clients are waiting for data, a single deduplicated control
   watchdog per session re-sends `sync` after `CONTROL_NUDGE_MS` and closes a
   still-unresponsive control socket with `1011` after
   `CONTROL_UNRESPONSIVE_MS`.
+- The watchdog tracks nudge coverage per client: a client that attaches after
+  the last `sync` gets a supplementary `sync` of its own while the oldest
+  waiter's deadline has not passed, but those late arrivals never extend that
+  deadline. Once the oldest deadline is reached the control socket is closed
+  even if a newer client joined late, so adding clients cannot postpone `1011`
+  indefinitely.
 - Control input is ignored except text `{"type":"ping"}`, answered with
   `{"type":"pong","ts":<unix ms>}`. Binary frames on the control socket are
   ignored.
+
+If an initial or watchdog `sync` cannot be queued or written within the 1 s
+control send timeout, the relay treats it as a control-plane failure: it counts
+`paseo_relay_control_send_failures_total` and closes the control socket instead
+of leaving the daemon with a stale routing table.
+
+**Ordering caveat.** The initial `sync` is sent after the control socket is
+attached, and a concurrently attaching client's `connected` (or a detaching
+client's `disconnected`) notification can reach the same writer queue before it.
+The relay does not guarantee `sync`-before-`connected`; a daemon must treat
+`sync` as a baseline snapshot and apply `connected`/`disconnected` idempotently.
+This ordering race is accepted and tested against Paseo v0.15.3 (which tolerates
+connected-before-sync); it is not a data-plane or security boundary.
 
 The v2 control/data flow and close propagation:
 
@@ -128,7 +159,7 @@ sequenceDiagram
 | Client data frame / reassembled message | `32 MiB - 14` bytes; overflow closes `1009` |
 | Fragments per message | At most 1024; exceeding closes `1002` |
 | Length encoding | The 126/127 length forms must be minimal; a non-minimal encoding closes `1002` |
-| v2 control frames | 64 KiB per frame/message |
+| v2 control frames | 64 KiB per frame/message, in both directions: inbound control frames are capped at 64 KiB, and every relay-generated `sync` is bounded to 64 KiB (a client that would make it larger is refused `1013` instead) |
 | WebSocket control frames | RFC 6455 (≤125 bytes, not fragmented) |
 | Close payload | Empty, or at least 2 bytes with a valid status code; an invalid code closes `1002` |
 | Compression | Not negotiated |
@@ -142,7 +173,7 @@ sequenceDiagram
 | Ingress budget wait | Limited to `min(INGRESS_WAIT_TIMEOUT_MS, remaining frame/message read deadline)`. While a source waits, unfinished messages of other connections are reclaimed (next row); a waiter for which nothing could be freed is closed `1013` "Relay ingress capacity" |
 | Budget reclaim | Only while another source waits for budget: an unfinished message that is stalled or slower than `INGRESS_RECLAIM_MIN_RATE_BYTES`/s, one that has been arriving for longer than `INGRESS_RECLAIM_AFTER_MS`, or (for a waiting message of at most 64 KiB) one at least 8× larger, is closed `1013` "Relay ingress reclaimed". Completely received messages are never reclaimed |
 | Small-message reserve | Complete single-frame messages of at most 64 KiB are charged to `INGRESS_SMALL_RESERVE_BYTES` first and to the main budget only when the reserve is full; fragmented messages always use the main budget |
-| Per-connection in-flight cap | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)` |
+| Per-connection in-flight cap | `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)`, or the configured `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` |
 | Slow destination | Bounded writer queue + deadline; destination sheds `1013` |
 
 Ingress accounting has two refinements that matter for abuse limits:
@@ -191,7 +222,7 @@ with a relay it does not trust.
 | `1009` | Frame or message too large |
 | `1011` | Control socket unresponsive |
 | `1012` | Relay shutting down, or v2 server data socket disconnected |
-| `1013` | Retryable: ingress budget exhausted ("Relay ingress capacity"), unfinished message reclaimed under budget pressure ("Relay ingress reclaimed"), per-session v2 connection cap reached ("Relay session connection capacity"), frame/message read or stall timeout ("Relay read timeout"), optional idle timeout ("Idle timeout"), data route unavailable, or delivery unavailable |
+| `1013` | Retryable: ingress budget exhausted ("Relay ingress capacity"), unfinished message reclaimed under budget pressure ("Relay ingress reclaimed"), per-session v2 connection cap reached ("Relay session connection capacity"), the control `sync` would exceed 64 KiB ("Relay session sync capacity"), frame/message read or stall timeout ("Relay read timeout"), optional idle timeout ("Idle timeout"), data route unavailable, or delivery unavailable |
 
 Valid close codes are `1000..=1003`, `1007..=1014`, and `3000..=4999`. An empty
 close payload is allowed; a one-byte payload is not. `1005`/`1006`/`1015` are

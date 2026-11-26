@@ -22,14 +22,15 @@ it does not know; see [Startup warnings](#startup-warnings).
 | `PASEO_RELAY_HOST` | `127.0.0.1` | Listener IP. The container image sets `0.0.0.0`. |
 | `PASEO_RELAY_PORT` | `4000` | Listener port for `/ws` and `/health`, and for the operations endpoints unless `PASEO_RELAY_OPS_PORT` moves them. |
 | `PASEO_RELAY_OPS_HOST` | `127.0.0.1` | Listener IP of the operations listener; used only when `PASEO_RELAY_OPS_PORT` is set. The default is reachable only from the same host or container. Use a private address (or `0.0.0.0` inside a pod/container that does not publish the port) so probes and Prometheus can reach it. |
-| `PASEO_RELAY_OPS_PORT` | unset | When set, `/ready`, `/metrics` and `/version` are served **only** on this plaintext listener (together with `/health`), and `PASEO_RELAY_PORT` keeps only `/ws` and `/health`. The listener has its own allowance of 64 connections, so probes and scrapes keep working when the public listener is at its TCP cap, and `paseo-relay healthcheck` uses it automatically. Unset = everything on `PASEO_RELAY_PORT`. |
+| `PASEO_RELAY_OPS_PORT` | unset | When set, `/ready`, `/metrics` and `/version` are served **only** on this plaintext listener (together with `/health`), and `PASEO_RELAY_PORT` keeps only `/ws` and `/health`. The listener has its own allowance of 64 connections, so probes and scrapes keep working when the public listener is at its TCP cap, and `paseo-relay healthcheck` uses it automatically. Unset = everything on `PASEO_RELAY_PORT`. A Kubernetes service-link value (for example `tcp://10.96.0.5:4001`, injected for a Service named `paseo-relay-ops`) is refused with an explanatory error instead of a bare parse failure. |
 | `PASEO_RELAY_DRAIN` | `false` | Start already draining: `/ready` returns 503 and new `/ws` upgrades are rejected. SIGTERM/SIGINT always trigger a drain. |
 | `PASEO_RELAY_MAX_CONNECTIONS` | `20000` | Maximum open WebSockets. Must be `<= PASEO_RELAY_MAX_TCP_CONNECTIONS`; keep `PASEO_RELAY_MAX_TCP_CONNECTIONS` above it (see below). |
 | `PASEO_RELAY_MAX_TCP_CONNECTIONS` | `25000` | Maximum open OS sockets, including pre-upgrade HTTP and upgraded WebSockets. A slot is held for the whole socket lifetime, so keep this above `PASEO_RELAY_MAX_CONNECTIONS` (at least 64–128 spare slots, more for probe bursts) or a full WebSocket load rejects `/health`, `/ready`, `/metrics`, and probes at accept. |
 | `PASEO_RELAY_MAX_SESSIONS` | `20000` | Maximum live `serverId` sessions. |
-| `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` | `512` | Maximum distinct v2 `connectionId`s per `serverId` session. Excess connections close with `1013` "Relay session connection capacity". |
-| `PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION` | `32` | Maximum v2 client sockets per `connectionId`. |
-| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | Node-wide weighted budget for in-flight payload bytes. Must admit one maximum message including the 256-byte per-message overhead and per-chunk bookkeeping (192 weighted units per 8 KiB chunk, including the 1024-fragment worst case); use `--check-config` for the exact floor. The 129 MiB Compose budget (135,266,304) still passes with ~64.6 KB headroom. One connection can hold at most `min(budget, 4 × one-max-message charge)`. |
+| `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION` | `512` | Maximum distinct v2 `connectionId`s per `serverId` session, counting the **union** of client connection ids and daemon data routes (one id occupies one slot whether a client socket, a data socket, or both are attached). Excess connections close with `1013` "Relay session connection capacity". If accepting a new client would make the control `sync` message exceed 64 KiB, the client is refused with `1013` "Relay session sync capacity" instead of accepting a state the daemon cannot receive. |
+| `PASEO_RELAY_MAX_CLIENTS_PER_CONNECTION` | `32` | Maximum v2 client sockets per `connectionId`; excess clients close with `1013` "Relay client capacity". |
+| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | Node-wide weighted budget for in-flight payload bytes. Must admit one maximum message including the 256-byte per-message overhead and per-chunk bookkeeping (192 weighted units per 8 KiB chunk, including the 1024-fragment worst case); use `--check-config` for the exact floor. The 129 MiB Compose budget (135,266,304) still passes with ~64.6 KB headroom. One connection can hold at most `min(budget, 4 × one-max-message charge)`, or the explicit value of `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`. |
+| `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` | `0` (auto) | Weighted in-flight cap for one connection. `0` derives `min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)`; with the defaults that is the whole budget, which is the documented single-source residual cost. A non-zero value is **clamped** to `[one-max-message charge, PASEO_RELAY_INGRESS_BUDGET_BYTES]` (an out-of-range tuning value is clamped, not fatal), shown by `--dump-config` as `per_connection_limit=...`, and can be used to bound how much of the budget one slow source holds. Values below `4 ×` the one-max-message charge can reduce the read-ahead pipeline and surface as retryable `1013` under large-frame pipelining. When the derived cap equals the budget and `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0`, startup logs a warning (see [Startup warnings](#startup-warnings)). |
 | `PASEO_RELAY_INGRESS_SMALL_RESERVE_BYTES` | `16777216` | Extra weighted budget, on top of `PASEO_RELAY_INGRESS_BUDGET_BYTES`, that only messages of at most 64 KiB may use, so handshakes and ordinary small frames keep flowing while large transfers fill the main budget. `0` disables it; otherwise it must admit one 64 KiB message (461,312 at the default weight). |
 | `PASEO_RELAY_INGRESS_RECLAIM_MIN_RATE_BYTES` | `65536` | While another source is waiting for budget, an unfinished message that received at most this many payload bytes per second over its last one to two seconds is closed first to free its reservation. `0` limits this to messages that received nothing at all. |
 | `PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS` | `60000` | While another source is waiting for budget, an unfinished message that has been arriving for longer than this gives way to a newer one. `0` disables the rule; otherwise at least `5000`. |
@@ -42,7 +43,7 @@ it does not know; see [Startup warnings](#startup-warnings).
 | `PASEO_RELAY_WS_IDLE_TIMEOUT_MS` | `0` | Close a WebSocket (`1013` "Idle timeout") after this long with no frame received from it and no data frame relayed to it. `0` (the default) never closes idle sockets; otherwise at least `1000`. Any frame, including a ping, counts as activity. Upstream Paseo (checked at v0.15.3) pings the v2 control socket every 10 s and clients send a heartbeat every 10 s, so a value of a few minutes (for example `300000`) removes only dead or abandoned sockets; a socket that is silent in both directions for the whole period is closed and is expected to reconnect. |
 | `PASEO_RELAY_DATA_ATTACH_TIMEOUT_MS` | `15000` | Maximum time a v2 client frame waits for its daemon data socket. |
 | `PASEO_RELAY_DELIVERY_TIMEOUT_MS` | `30000` | Maximum wait for a destination writer permission/write; slow destinations are shed `1013`. |
-| `PASEO_RELAY_CONTROL_QUEUE_BYTES` | `1048576` | Per-destination writer queue floor in bytes. The effective queue is at least `MAX_MESSAGE_BYTES + 64 KiB`. |
+| `PASEO_RELAY_CONTROL_QUEUE_BYTES` | `1048576` | Floor for **every** per-destination writer queue, in bytes (the `CONTROL_` name is historical; it applies to user-data destinations as well). The effective queue is `max(this, PASEO_RELAY_MAX_MESSAGE_BYTES + 64 KiB)`, which is about 32 MiB at the defaults (`33,619,954` bytes), so one maximum message always fits and shedding happens at the delivery deadline rather than from an unreservable queue slot. |
 | `PASEO_RELAY_CONTROL_NUDGE_MS` | `10000` | While a v2 client waits for data, re-send `sync` to control after this delay. |
 | `PASEO_RELAY_CONTROL_UNRESPONSIVE_MS` | `15000` | Close a still-unresponsive control socket with `1011` after this delay. Must be greater than the nudge delay. |
 | `PASEO_RELAY_SESSION_IDLE_MS` | `30000` | Age at which the periodic safety-net sweep removes an empty session. A session is normally removed as soon as its last socket closes, so this rarely applies. |
@@ -55,7 +56,7 @@ it does not know; see [Startup warnings](#startup-warnings).
 | `PASEO_RELAY_ALLOWED_ORIGINS` | unset | Comma-separated exact `Origin` allowlist for `/ws`; empty = allow any. Requests without Origin (native clients) are allowed; duplicate or unparseable `Origin` headers are rejected with `403`. |
 | `PASEO_RELAY_LOG` | `info` | `tracing` `EnvFilter` directive, e.g. `info`, `paseo_relay=debug`. Validated at startup; an invalid directive aborts startup. |
 | `PASEO_RELAY_LOG_FORMAT` | `text` | `text` or `json` structured logs. |
-| `PASEO_RELAY_HEALTHCHECK_HOST` | listener host / `127.0.0.1` | Host override for the `paseo-relay healthcheck` self-probe. When unset, follows `PASEO_RELAY_OPS_HOST` (if `PASEO_RELAY_OPS_PORT` is set) or `PASEO_RELAY_HOST` when bound to a specific IP, falling back to `127.0.0.1` (or `::1` for `::`) on wildcard binds. |
+| `PASEO_RELAY_HEALTHCHECK_HOST` | listener host / `127.0.0.1` | Host override for the `paseo-relay healthcheck` self-probe. When unset, it follows `PASEO_RELAY_OPS_HOST` (if `PASEO_RELAY_OPS_PORT` is set) or `PASEO_RELAY_HOST` when bound to a specific IP, falling back to `127.0.0.1` (or `::1` for `::`) on wildcard binds. With native TLS the probe pins the leaf certificate at `PASEO_RELAY_TLS_CERT` (DER SHA-256) and accepts only that certificate, so a non-loopback probe target is safe; if the certificate cannot be read, non-loopback targets are refused (fail-closed). A plaintext listener has no certificate to pin: a non-loopback probe is allowed but unauthenticated, so keep it on a trusted network or on loopback. |
 | `PASEO_RELAY_BUILD_REVISION` | build-derived | Build-time revision embedded in `/version` and metrics; overrides the git-derived value. |
 
 **Added in `v0.1.3`:** `PASEO_RELAY_OPS_HOST`, `PASEO_RELAY_OPS_PORT`,
@@ -66,6 +67,14 @@ it does not know; see [Startup warnings](#startup-warnings).
 and `PASEO_RELAY_WS_IDLE_TIMEOUT_MS`. The `v0.1.2` image ignores them, and it
 terminates on `SIGHUP` instead of reloading TLS. See the
 [changelog](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md).
+`PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` is newer than `v0.1.3`; images that
+predate it ignore it and keep the old derived cap.
+
+Listener conflicts are rejected at startup: if both listeners are configured on
+the same non-zero port, any wildcard bind (`0.0.0.0` or `::`) on either side is
+rejected, including across address families, because a dual-stack `::` bind can
+also take the IPv4 port. Distinct concrete addresses on the same port are
+allowed, and port `0` (OS-assigned, used by tests) is exempt.
 
 ## Ingress budget and bounded queues
 
@@ -88,11 +97,12 @@ per-chunk bookkeeping for the budget guard and vector slack), so at most one
 8 KiB chunk per connection is allocated before it is accounted. The fixed
 256-byte per-message overhead is charged **once per message**
 (`256 × INGRESS_WEIGHT`), not per fragment. A per-connection in-flight cap of
-`min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)` bounds how
-much of the weighted budget one connection can hold (the 4× factor covers the
-reader's pipelining of up to four messages). A message may contain at most
-1024 fragments (fixed policy, not configurable); exceeding it closes the source
-with `1002`.
+`min(PASEO_RELAY_INGRESS_BUDGET_BYTES, 4 × one-max-message charge)`, or the
+configured `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`, bounds how much of the
+weighted budget one connection can hold (the 4× factor covers the reader's
+pipelining of up to four messages). A message may contain at most 1024
+fragments (fixed policy, not configurable); exceeding it closes the source with
+`1002`.
 
 A destination whose writer queue or write exceeds
 `PASEO_RELAY_DELIVERY_TIMEOUT_MS` is shed with `1013`. A frame/message read
@@ -186,8 +196,16 @@ paseo-relay --help               # usage
 paseo-relay --version            # version + build revision
 paseo-relay --check-config       # validate environment and TLS files (regular, readable), print warnings, exit 0/1
 paseo-relay --dump-config        # print effective configuration
-paseo-relay healthcheck          # container self-probe (TLS-aware)
+paseo-relay healthcheck          # container self-probe (TLS-aware, certificate-pinned)
 ```
+
+With native TLS, `paseo-relay healthcheck` reads the leaf certificate at
+`PASEO_RELAY_TLS_CERT`, pins its DER SHA-256 fingerprint and accepts only that
+certificate from the probe target; a different (even otherwise valid)
+certificate fails the probe. If native TLS is configured but the certificate
+cannot be read, the probe only connects to loopback and fails closed for any
+non-loopback `PASEO_RELAY_HEALTHCHECK_HOST`. A plaintext listener has no
+certificate to pin: a non-loopback probe is allowed but unauthenticated.
 
 The service itself has no command-line configuration; use environment
 variables so the same contract works with Docker, Kubernetes, systemd, and
@@ -207,11 +225,22 @@ printed by `--check-config`:
 - **Native TLS without a per-IP cap.** With `PASEO_RELAY_TLS_CERT` set, clients
   probably connect directly, and `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0` lets
   one client take every WebSocket slot.
+- **Automatic per-connection limit equals the whole budget.** With
+  `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` unset, the derived cap is
+  `min(budget, 4 × one-max-message charge)`; at the defaults that is the entire
+  budget, and with `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0` one connection (or
+  one peer with many connections) can occupy all of it for a delivery window.
+  Set a lower `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` and/or a per-IP cap, or
+  keep per-source limits at the edge. See
+  [Residual availability risk](https://github.com/kfxhjz/paseo-relay/blob/main/SECURITY.md#threat-model).
 
 One Kubernetes case is an error rather than a warning: a Service named
 `paseo-relay` makes the kubelet inject `PASEO_RELAY_PORT=tcp://<ip>:<port>`
-into the pod. The relay refuses that value with a message that says so. Set
-`PASEO_RELAY_PORT` explicitly or use `enableServiceLinks: false`.
+into the pod, and a Service named `paseo-relay-ops` can inject the same form
+into `PASEO_RELAY_OPS_PORT` even when you set neither variable. The relay
+refuses either value with a message naming the colliding Service. Set the port
+explicitly or use `enableServiceLinks: false`; explicitly defined variables are
+not overwritten by service links.
 
 ## Signals
 
@@ -223,8 +252,11 @@ into the pod. The relay refuses that value with a message that says so. Set
   a warning is logged. The files are also checked every 30 seconds and
   reloaded when their modification time or size changes, so a certificate
   renewed in place (or a rotated Kubernetes Secret mount) is picked up without
-  a signal. Without native TLS, `SIGHUP` does nothing. `v0.1.2` and earlier do
-  not handle `SIGHUP` and terminate on it.
+  a signal. A path that stops being a regular file (a FIFO, socket or
+  directory) is ignored with a warning instead of being opened, so a bad mount
+  cannot block the reload; shutdown waits at most 2 s for a stuck watcher
+  before exiting. Without native TLS, `SIGHUP` does nothing. `v0.1.2` and
+  earlier do not handle `SIGHUP` and terminate on it.
 
 ## Example minimal deployment
 

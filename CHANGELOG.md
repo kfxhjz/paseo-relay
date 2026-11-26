@@ -6,6 +6,135 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Fixes for the third (2026-11) review round. No wire-protocol change for normal
+traffic; the v2 control plane now enforces the documented 64 KiB `sync` bound
+and a few operational defaults have safer validation.
+
+### Security
+
+- **The relay's v2 control `sync` is bounded to 64 KiB.** A `sync` is built
+  from client-chosen `connectionId`s, which may contain JSON-escaped characters;
+  enough long ids could previously make the relay emit a control frame larger
+  than the documented v2 control-frame limit (and, at an extreme
+  `PASEO_RELAY_MAX_CONNECTIONS_PER_SESSION`, larger than the writer queue). The
+  session layer now computes the serialized size before accepting a v2 client
+  (or an initial control socket) and refuses a client that would overflow it
+  with `1013` "Relay session sync capacity"; initial and watchdog `sync`
+  failures are fail-closed instead of being silently dropped, and are counted
+  by the new `paseo_relay_control_send_failures_total`.
+- **Control watchdog nudge coverage is tracked per client.** A client that
+  attached after the watchdog's nudge used to be closed `1011` without ever
+  receiving its own `sync`, while its wait window was still bounded by the
+  oldest waiter. The watchdog now keeps the oldest waiter's `1011` deadline
+  separate from a coverage clock, sends a supplementary `sync` for later
+  arrivals, and never lets new clients postpone that deadline.
+- **TLS healthcheck pins the relay certificate.** `paseo-relay healthcheck`
+  previously accepted any certificate whose signature verified (trust chain and
+  hostname were intentionally skipped), so a different local service or path
+  MITM could report a broken relay healthy on a non-loopback probe target. With
+  native TLS the probe now reads the leaf certificate at
+  `PASEO_RELAY_TLS_CERT`, pins its DER SHA-256 and accepts only that
+  certificate. If native TLS is configured but the certificate file cannot be
+  read, it only probes loopback and fails closed for non-loopback targets. A
+  plaintext listener has no certificate to pin: non-loopback probes are allowed
+  but unauthenticated.
+- **Per-connection ingress share is configurable, with a residual-risk
+  warning.** `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES` (0/unset = auto) clamps a
+  configured cap to `[one maximum message, ingress budget]`; the automatic
+  default remains `min(budget, 4 × one-max-message charge)`, which equals the
+  whole budget at the shipped defaults. Startup now warns when that derived cap
+  is the whole budget and `PASEO_RELAY_PER_IP_MAX_CONNECTIONS=0`. This reduces
+  one slow source's share but does **not** eliminate the documented availability
+  residual: several connections can still fill the budget, so edge per-source
+  bandwidth limits remain required.
+- **Release promotion is staged and version-checked.** The release workflow now
+  refuses a tag that is not `vX.Y.Z[-prerelease]`, does not match `Cargo.toml`,
+  or has no CHANGELOG section; it assembles the multi-arch index under a
+  temporary `candidate-<sha>` tag, smoke-tests that digest, signs it and
+  attaches build provenance, and only then promotes the version tag (and
+  `latest`, only for a stable release at least as high as the highest stable tag
+  on `main`). Publish runs in a `release` environment intended for required
+  reviewers, and release verification now runs the same fuzz smoke as CI.
+  Required status checks, tag protection and environment reviewers are GitHub
+  repository settings; `SECURITY.md` lists the expected configuration instead of
+  pretending code can enforce it.
+- **CI/supply-chain hardening.** The Docker builder, CI and
+  `rust-toolchain.toml` are aligned on Rust 1.100.0; `fuzz/Cargo.lock` drift is
+  checked against the root lockfile and a seed corpus was added; the Pages build
+  job no longer holds write credentials; `.dockerignore` excludes docs, examples,
+  fuzz output, local review data and nested PEM/key files; the HAProxy example
+  counts TCP connects (not only HTTP requests) for per-source limits; the Mermaid
+  asset is pinned and self-hosted. The release verification job also runs
+  `cargo audit` on both lockfiles and the fuzz smoke test, and the container
+  image is smoke-tested by immutable digest before promotion.
+
+### Changed
+
+- **Rejection metrics are attributed to one cause each.**
+  `paseo_relay_session_rejections_total` now counts only the global
+  `MAX_SESSIONS` ceiling. The new
+  `paseo_relay_session_connection_rejections_total` counts the per-session
+  `connectionId` union cap and 64 KiB `sync` refusals,
+  `paseo_relay_client_limit_rejections_total` counts the per-`connectionId`
+  client cap, and `paseo_relay_ops_rejections_total` counts operations-listener
+  quota refusals (which also log a rate-limited warning naming the peer).
+- **Forwarding and delivery metrics have precise semantics.**
+  `frames_forwarded_total`/`bytes_forwarded_total` count only relayed user
+  frames/bytes, not relay-generated `sync`/`connected`/`disconnected`/pong;
+  `delivery_timeouts_total` counts a missed delivery deadline once per shed
+  delivery (source for a queue wait, writer for a write deadline), transport
+  errors no longer count as delivery timeouts, and slow-consumer disconnects
+  are no longer double-counted by the writer and the source.
+- **The per-session `connectionId` cap counts the union of client ids and data
+  routes.** One id now occupies one slot whether a client socket, a data socket,
+  or both are attached; a new client is rejected immediately when the session's
+  data routes are already full instead of being accepted and failing 15 s later
+  with "Data route unavailable".
+- **Query values are no longer trimmed.** `v` is matched verbatim (`v=+2` is
+  `400`, not v2) and `connectionId=%20` is rejected instead of silently becoming
+  the empty/control value. Omitted or empty `connectionId` still means a
+  generated id for a v2 client and the control socket for a v2 daemon.
+- **Configuration validation is stricter and more diagnosable.** An IPv6
+  wildcard (`::`) conflicts with any same-port listener, and an IPv4 wildcard
+  (`0.0.0.0`) conflicts with same-port IPv4 listeners; concrete addresses of
+  different families can still coexist. A Kubernetes service-link value
+  injected into `PASEO_RELAY_OPS_PORT` now gets the same actionable error as
+  `PASEO_RELAY_PORT` (naming `paseo-relay-ops`).
+  `--dump-config` shows `per_connection_limit=auto(N)` or the clamped value.
+- **Control pong uses the 1 s control send timeout** instead of the 30 s data
+  delivery deadline, so a control socket that stops reading cannot stall its
+  own control plane for half a minute.
+- **Reclaim no longer treats a stalled frame header as a full-frame need.** The
+  ~1 KiB per-message overhead reservation now uses the small request weight as
+  its reclaim hint; only the payload-chunk phase uses the remaining frame
+  weight, so a peer that sends a large header and no payload cannot cause a
+  wave of unrelated in-progress messages to be evicted.
+- **Mutex-poison recovery and bounded shutdown.** Session/writer/capacity/server
+  lock helpers now recover the guarded state instead of panicking every later
+  caller; TLS reload refuses non-regular files (FIFO/socket/directory) instead
+  of blocking on them, and shutdown waits at most 2 s for a stuck background
+  watcher before exiting.
+- **Documentation** is synchronised across English and Chinese: the multi-arch
+  index attestation description (index build provenance exists; per-platform
+  provenance/SBOM exist; no index-level SBOM), the new configuration and
+  metrics, `sync`/64 KiB semantics, TLS healthcheck pinning, release ordering,
+  and the residual availability risk.
+
+### Fixed
+
+- The initial v2 control `sync` used to discard send errors with `let _ = ...`;
+  it now records a control-send failure and closes the control socket, matching
+  the watchdog path.
+- Operations-listener rejections were invisible; they now increment
+  `paseo_relay_ops_rejections_total` and emit a rate-limited warning with the
+  peer address.
+- Ordinary destination transport errors could be reported as delivery timeouts
+  and slow-consumer disconnects. They are now classified and counted once per
+  shed delivery (source or destination writer), and only real deadline misses
+  count against `delivery_timeouts_total`.
+- `paseo-relay healthcheck` no longer trusts an arbitrary certificate on a
+  non-loopback probe target (see Security above).
+
 ## [0.1.3] - 2026-11-26
 
 Fixes for the 2026-11 security and project review. No wire-protocol change:
