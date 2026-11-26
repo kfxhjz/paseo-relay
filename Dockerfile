@@ -10,6 +10,10 @@
 # Build: docker build -t paseo-relay .
 # Run:   docker run --rm -p 127.0.0.1:4000:4000 paseo-relay
 
+# Builder toolchain: keep in sync with rust-toolchain.toml and the
+# dtolnay/rust-toolchain inputs in .github/workflows/{ci,release,paseo-compat}.yml.
+# The fmt job in ci.yml asserts that these pins agree, so the released binary is
+# always produced by the same compiler that ran tests and clippy.
 FROM rust:1.100.0-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS builder
 
 # The Rust target is musl, so the Alpine host toolchain is enough. build-base

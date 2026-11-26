@@ -1,16 +1,28 @@
 # Build context for the static musl release image. Keep it minimal: the
 # builder only needs the manifests and src/. Never send git history, local
-# build artifacts, TLS material, or docs to the daemon.
+# build artifacts, TLS material, docs, or point-in-time review notes to the
+# daemon (with a remote BuildKit builder that is an outbound data transfer).
 .git
 .github
 target
 scripts
 tests
 
+# Not needed by the image and potentially large/local-only.
+docs
+examples
+fuzz
+assets
+.view
+site
+mkdocs.yml
+
 # Files that must not be baked into a build context or image layer.
 *.md
 *.pem
 *.key
+**/*.pem
+**/*.key
 .env
 .env.*
 local

@@ -51,7 +51,10 @@ markdown_extensions:
       alternate_style: true
 
 extra_javascript:
-  - https://unpkg.com/mermaid@11/dist/mermaid.min.js
+  # Vendored, pinned copy (no floating CDN version, no third-party script
+  # request). Source URL, npm integrity, and SHA-256 are recorded in
+  # docs/assets/vendor/mermaid-11.17.2.PROVENANCE.txt.
+  - assets/vendor/mermaid-11.17.2.min.js
 
 nav:
   - Home: README.md

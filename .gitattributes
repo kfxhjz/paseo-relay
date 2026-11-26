@@ -1,0 +1,5 @@
+# Fuzz seeds and vendored browser bundles are byte fixtures: keep their exact
+# bytes on checkout. Text files (licenses, provenance, seed READMEs) stay text.
+fuzz/seeds/**/*.bin binary
+fuzz/seeds/handshake/upgrade_request.http binary
+docs/assets/vendor/*.min.js binary

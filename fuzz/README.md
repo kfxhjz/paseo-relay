@@ -31,6 +31,25 @@ in both workflows together. A crash leaves its reproducer in
 `fuzz/artifacts/<target>/`, which the weekly workflow uploads.
 
 The fuzz crate is intentionally outside the root package so normal `cargo test`
-does not require nightly. It has its own `Cargo.lock`; cargo-fuzz has no
-`--locked`, so `scripts/fuzz.sh` fails if a run had to change the committed
-lockfile. See `SECURITY.md` for reporting issues found this way.
+does not require nightly. It has its own `Cargo.lock`, which must agree with the
+root lockfile on every shared crate: otherwise the fuzzed dependency graph (and
+`cargo audit --file fuzz/Cargo.lock`) diverges from the released binary. Run
+`scripts/check-fuzz-lock.sh` after any dependency change and bump the fuzz
+lockfile in the same commit:
+
+```sh
+cargo update --manifest-path fuzz/Cargo.toml
+# or pin a shared crate to the root version:
+cargo update --manifest-path fuzz/Cargo.toml -p <crate> --precise <version>
+```
+
+CI also runs `cargo metadata --manifest-path fuzz/Cargo.toml --locked` so a
+lockfile that cannot satisfy the manifests fails before the fuzz build. Because
+cargo-fuzz has no `--locked`, `scripts/fuzz.sh` additionally fails if a run had
+to rewrite the committed lockfile.
+
+The tracked seed corpus lives in `fuzz/seeds/<target>/` (see
+[`fuzz/seeds/README.md`](seeds/README.md)); `scripts/fuzz.sh` copies it with
+`cp -n` into the gitignored `fuzz/corpus/<target>/`, which CI restores from a
+cache so coverage accumulates across runs. See `SECURITY.md` for reporting
+issues found this way.

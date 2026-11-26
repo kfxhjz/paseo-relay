@@ -1,9 +1,13 @@
 # Toolchain pinned for local development and CI.
 #
 # Keep this in sync with the `toolchain` input of dtolnay/rust-toolchain in
-# .github/workflows/ci.yml. The relay requires stable Rust (see rust-version in
-# Cargo.toml); upgrading is a deliberate, reviewed change.
+# .github/workflows/{ci,release,paseo-compat}.yml and the `FROM rust:` builder
+# tag in the Dockerfile. The fmt job asserts that these four pins agree; if you
+# bump one, bump all of them (and the Docker image digest) in the same PR.
+#
+# `rust-version` in Cargo.toml is the minimum supported Rust version, which can
+# legitimately stay below the pinned toolchain; it is a separate promise.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

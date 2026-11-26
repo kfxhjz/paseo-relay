@@ -9,6 +9,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 echo '==> documentation links'
 python3 scripts/check-docs.py
 
+echo '==> fuzz lockfile sync'
+scripts/check-fuzz-lock.sh
+
 echo '==> cargo fmt'
 cargo fmt --all --check
 

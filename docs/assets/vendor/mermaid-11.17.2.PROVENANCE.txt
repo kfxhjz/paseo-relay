@@ -1,0 +1,33 @@
+mermaid 11.17.2 — vendored, pinned copy for the documentation site
+=====================================================================
+
+File:      mermaid-11.17.2.min.js
+License:   MIT (see mermaid-11.17.2.LICENSE.txt)
+Upstream:  https://www.npmjs.com/package/mermaid/v/11.17.2
+Downloaded from:
+  https://unpkg.com/mermaid@11.17.2/dist/mermaid.min.js
+  https://unpkg.com/mermaid@11.17.2/LICENSE
+Retrieved: 2026-11-26
+
+SHA-256 (mermaid-11.17.2.min.js):
+  581ed7d74bd9048d0e3a91363927d72ef22942d7722546b27f7cc29e35390eb8
+
+npm tarball (mermaid-11.17.2.tgz) sha512 integrity, from the registry
+metadata (https://registry.npmjs.org/mermaid/11.17.2):
+  sha512-V6K3C8EBdEsPFZXSKMJe6ppQOENxuHARr9GvHX4hh47lAbhMRD9qf4oEK7LoaRQxULMa80/qt5gHO73aCleBBg==
+
+Verification performed when vendoring (repeat when bumping the version):
+
+  curl -sSLO https://registry.npmjs.org/mermaid/-/mermaid-11.17.2.tgz
+  openssl dgst -sha512 -binary mermaid-11.17.2.tgz | openssl base64 -A
+  tar -xzf mermaid-11.17.2.tgz package/dist/mermaid.min.js package/LICENSE
+  sha256sum package/dist/mermaid.min.js
+  cmp package/dist/mermaid.min.js docs/assets/vendor/mermaid-11.17.2.min.js
+  cmp package/LICENSE docs/assets/vendor/mermaid-11.17.2.LICENSE.txt
+
+Why vendored: mkdocs.yml previously loaded a floating
+`https://unpkg.com/mermaid@11/...` URL with no integrity attribute, so any
+tampered 11.x release would run arbitrary JavaScript on the project's docs
+domain. A fixed local file means the site ships exactly the reviewed bytes and
+makes no third-party script request at all. Bump the version and this file in
+the same commit, and delete the old file.

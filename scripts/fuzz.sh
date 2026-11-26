@@ -35,8 +35,27 @@ if [[ -z "${host}" ]]; then
   exit 2
 fi
 
+# Fail before spending minutes in the fuzzer when a root dependency bump left
+# fuzz/Cargo.lock behind. The build afterwards would silently resolve different
+# versions for the fuzz crate than the ones tested and released.
+./scripts/check-fuzz-lock.sh
+
 # The four untrusted-input boundaries. Keep in sync with fuzz/Cargo.toml.
 readonly targets=(frame_reader handshake protocol upgrade)
+
+# Seed the (gitignored) corpus from the small, reviewable inputs under
+# fuzz/seeds/. `cp -n` never overwrites files the fuzzer already grew, so a
+# restored CI cache and a local corpus both keep their coverage.
+mkdir -p fuzz/corpus
+for target in "${targets[@]}"; do
+  mkdir -p "fuzz/corpus/${target}"
+  if [ -d "fuzz/seeds/${target}" ]; then
+    for seed in "fuzz/seeds/${target}"/*; do
+      [ -f "${seed}" ] || continue
+      cp -n "${seed}" "fuzz/corpus/${target}/"
+    done
+  fi
+done
 
 for target in "${targets[@]}"; do
   echo "==> fuzz ${target} (${seconds}s)"
