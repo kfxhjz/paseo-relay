@@ -6,6 +6,11 @@
 [Why this relay](comparison.md){ .md-button }
 [GitHub repository](https://github.com/kfxhjz/paseo-relay){ .md-button }
 
+!!! info "Current release: v0.1.4"
+    Container image `ghcr.io/kfxhjz/paseo-relay:v0.1.4` (also tagged `latest`).
+    See the [v0.1.4 release notes](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.4)
+    and the [CHANGELOG](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md).
+
 ## What it is
 
 Paseo's daemon connects **outbound** to a relay; clients meet it there. This project is a community, self-hostable implementation of that relay for Paseo v1/v2 sessions. It forwards encrypted payloads opaquely and never sees plaintext content or long-term keys.
@@ -13,7 +18,7 @@ Paseo's daemon connects **outbound** to a relay; clients meet it there. This pro
 - **One static binary + scratch image** — no BEAM, no EPMD, no node cookie, no cluster.
 - **Bounded by default** — chunked ingress accounting, connection/session/frame limits, bounded queues, read deadlines.
 - **Fail closed** — explicit HTTP status and WebSocket close codes; no half-open state.
-- **Operations ready** — health/readiness/metrics/version endpoints, graceful drain, built-in healthcheck, optional private operations listener, multi-arch image with per-platform provenance and SBOM attestations plus a signed multi-arch index with build provenance (releases after `v0.1.2`).
+- **Operations ready** — health/readiness/metrics/version endpoints, graceful drain, built-in healthcheck, optional private operations listener, multi-arch image with per-platform provenance and SBOM attestations plus a signed multi-arch index with build provenance (available since `v0.1.3`; current release `v0.1.4`).
 
 ## Start here
 

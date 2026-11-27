@@ -5,6 +5,11 @@
 这里是 Paseo Relay 的中文文档索引。英文文档是规范来源；中文翻译会在发布前同步。
 如果两者出现不一致，以英文文档为准。
 
+!!! info "当前版本：v0.1.4"
+    容器镜像 `ghcr.io/kfxhjz/paseo-relay:v0.1.4`（同时打 `latest`）。
+    详见 [v0.1.4 发布说明](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.4) 和
+    [CHANGELOG](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md)。
+
 ## 入门
 
 - [中文 README](https://github.com/kfxhjz/paseo-relay/blob/main/README.zh-CN.md) — 项目介绍、快速开始、与 Paseo 配合使用
