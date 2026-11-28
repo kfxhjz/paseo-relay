@@ -17,6 +17,8 @@
   必须接入 `paseo-relay` 网络；loopback 只适用于宿主机或 host 网络中的容器。
 - Caddy 示例改为可累加结构：导入 `examples/sites-enabled/*.caddy`，每个新域名一个
   文件，可独立 reload。
+- 新增 `examples/.env.example`：在 git 忽略的 `examples/.env` 里配置一次
+  `RELAY_DOMAIN`，升级时不再需要内联变量。
 
 ## [0.1.4] - 2026-11-27
 

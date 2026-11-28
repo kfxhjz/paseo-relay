@@ -24,3 +24,6 @@ site/
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/coverage/
+
+# Tracked template for the Caddy example; examples/.env stays ignored.
+!examples/.env.example

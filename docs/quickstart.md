@@ -29,7 +29,8 @@ The published image is ready to run; this path needs no Rust toolchain.
 git clone https://github.com/kfxhjz/paseo-relay.git
 cd paseo-relay
 
-RELAY_DOMAIN=relay.example.com \
+cp examples/.env.example examples/.env
+# edit examples/.env if your domain is not relay.example.com
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
@@ -43,7 +44,8 @@ version, and see [deployment.md](deployment.md) if you need an immutable digest
 pin. The example also caps `PASEO_RELAY_MAX_CONNECTIONS` (4,000),
 `PASEO_RELAY_MAX_SESSIONS` (4,000), and `PASEO_RELAY_MAX_TCP_CONNECTIONS`
 (5,000) so the 512 MB memory limit is realistic; raise them together with
-`PASEO_RELAY_MEM_LIMIT`.
+`PASEO_RELAY_MEM_LIMIT`. `examples/.env` is local and git-ignored, so the domain
+survives `git pull` and later `up -d` commands.
 
 The example pins the current stable Caddy image,
 `caddy:2.11.9-alpine` (multi-arch digest). Update that pin deliberately after
@@ -94,7 +96,9 @@ relay.example.com {
 
 - If it runs in Docker (this project or another Compose project), start only
   the relay first so the `paseo-relay` network exists:
-  `RELAY_DOMAIN=relay.example.com docker compose -f examples/docker-compose.caddy.yml up -d relay`.
+  `docker compose -f examples/docker-compose.caddy.yml up -d relay`.
+  Compose reads `examples/.env`; if you did not create it, prefix the command
+  with `RELAY_DOMAIN=...`.
   Then attach the Caddy container to that network and keep
   `reverse_proxy relay:4000`. For a manual container:
   `docker network connect paseo-relay <caddy-container-name>`. If Caddy is
@@ -115,7 +119,7 @@ services:
 ```
 
 ```sh
-RELAY_DOMAIN=relay.example.com \
+# examples/.env provides RELAY_DOMAIN
 docker compose \
   -f examples/docker-compose.caddy.yml \
   -f docker-compose.override.yml \
@@ -173,6 +177,9 @@ docker compose \
   up -d --build
 ```
 
+If you already created `examples/.env` from the template, the `RELAY_DOMAIN=`
+prefix is optional; Compose reads the file automatically.
+
 ## Point Paseo at it
 
 On the machine running the Paseo daemon:
@@ -196,10 +203,23 @@ able to reach `relay.example.com:443`.
 
 ## Upgrade
 
+If you have not created `examples/.env` yet, do it once (it is git-ignored and
+survives later `git pull` runs):
+
+```sh
+cp examples/.env.example examples/.env
+# set RELAY_DOMAIN to the hostname already in use
+```
+
+Then upgrade; no inline `RELAY_DOMAIN` is needed:
+
 ```sh
 git pull
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
+
+If you prefer not to create the file, pass `RELAY_DOMAIN=relay.example.com`
+inline on the `up` command.
 
 Relay state is ephemeral: Paseo clients reconnect, and E2EE pairing is
 end-to-end, not stored by the relay. Do not `SIGKILL`; Compose sends `SIGTERM`

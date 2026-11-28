@@ -1,5 +1,10 @@
 # Single-node VPS quickstart: Caddy terminates TLS and proxies to the relay.
 #
+#   cp examples/.env.example examples/.env   # edit RELAY_DOMAIN
+#   docker compose -f examples/docker-compose.caddy.yml up -d
+#
+# The `.env` file is git-ignored and survives `git pull`, so upgrades do not
+# need the RELAY_DOMAIN prefix again. Alternatively pass it inline:
 #   RELAY_DOMAIN=relay.example.com \
 #     docker compose -f examples/docker-compose.caddy.yml up -d
 #

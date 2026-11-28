@@ -19,6 +19,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loopback only works from the host or a host-network container.
 - Made the Caddy example additive: `examples/sites-enabled/*.caddy` is imported
   so each new domain lives in its own file and can be reloaded independently.
+- Added `examples/.env.example` so `RELAY_DOMAIN` is configured once in the
+  git-ignored `examples/.env`; upgrades no longer need it inline.
 
 ## [0.1.4] - 2026-11-27
 

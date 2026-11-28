@@ -27,7 +27,8 @@
 git clone https://github.com/kfxhjz/paseo-relay.git
 cd paseo-relay
 
-RELAY_DOMAIN=relay.example.com \
+cp examples/.env.example examples/.env
+# 如果域名不是 relay.example.com，编辑 examples/.env
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
 
@@ -38,7 +39,8 @@ Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.4`；`latest` �
 见[部署指南](deployment.md)。示例还把
 `PASEO_RELAY_MAX_CONNECTIONS`（4,000）、`PASEO_RELAY_MAX_SESSIONS`（4,000）、
 `PASEO_RELAY_MAX_TCP_CONNECTIONS`（5,000）限制到适合 512 MB 内存上限的值；调高
-`PASEO_RELAY_MEM_LIMIT` 时请一起调高这些上限。
+`PASEO_RELAY_MEM_LIMIT` 时请一起调高这些上限。`examples/.env` 是本地文件并被 git
+忽略，域名配置会跨 `git pull` 和后续 `up -d` 保留。
 
 示例固定当前稳定版 Caddy 镜像 `caddy:2.11.9-alpine`（多架构 digest）。升级前请查看
 Caddy release notes，再手动更新 pin，不要直接浮动到 `latest`。Caddy 会自动申请证书。
@@ -88,7 +90,9 @@ relay.example.com {
 
 - 如果现有 Caddy 在 Docker 中（本项目或另一个 Compose 项目），先只启动 relay，
   让 `paseo-relay` 网络存在：
-  `RELAY_DOMAIN=relay.example.com docker compose -f examples/docker-compose.caddy.yml up -d relay`。
+  `docker compose -f examples/docker-compose.caddy.yml up -d relay`。
+  Compose 会读取 `examples/.env`；如果还没有创建，请在命令前加
+  `RELAY_DOMAIN=...`。
   然后把 Caddy 容器接入该网络，保留 `reverse_proxy relay:4000`。手动容器可用
   `docker network connect paseo-relay <caddy-container-name>`；如果 Caddy 由 Compose
   管理，请在该项目的配置里声明 external `paseo-relay` 网络，因为容器重建后手动
@@ -108,7 +112,7 @@ services:
 ```
 
 ```sh
-RELAY_DOMAIN=relay.example.com \
+# examples/.env 提供 RELAY_DOMAIN
 docker compose \
   -f examples/docker-compose.caddy.yml \
   -f docker-compose.override.yml \
@@ -162,6 +166,9 @@ docker compose \
   up -d --build
 ```
 
+如果已经从模板创建了 `examples/.env`，可以省略 `RELAY_DOMAIN=` 前缀；Compose
+会自动读取该文件。
+
 ## 让 Paseo 接进来
 
 在运行 Paseo daemon 的机器上：
@@ -183,10 +190,23 @@ daemon 做端口映射；手机客户端必须能访问 `relay.example.com:443`�
 
 ## 升级
 
+如果还没有创建 `examples/.env`，先创建一次（该文件被 git 忽略，后续 `git pull`
+不会覆盖）：
+
+```sh
+cp examples/.env.example examples/.env
+# 把 RELAY_DOMAIN 改成已经在用的域名
+```
+
+然后直接升级，不需要再内联 `RELAY_DOMAIN`：
+
 ```sh
 git pull
 docker compose -f examples/docker-compose.caddy.yml up -d
 ```
+
+如果不想创建该文件，也可以在 `up` 命令前内联
+`RELAY_DOMAIN=relay.example.com`。
 
 relay 状态是临时的：Paseo 客户端会重连，E2EE 配对是端到端的，不存储在 relay。
 不要 `SIGKILL`；Compose 会发 `SIGTERM`，relay 会在 grace window 内 drain。
