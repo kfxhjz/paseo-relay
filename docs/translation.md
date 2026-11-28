@@ -48,11 +48,11 @@ up (East Asian characters count as two display columns). CI runs it.
 
 ## Current coverage
 
-Chinese: README, full design, protocol, configuration, deployment, quickstart,
-compatibility, operations, migration, benchmarks, FAQ, security, contributing,
-support, design summary, ADR summary, evidence snapshot, code of
+Chinese: README, full design, changelog, protocol, configuration, deployment,
+quickstart, compatibility, operations, migration, benchmarks, FAQ, security,
+contributing, support, design summary, ADR summary, evidence snapshot, code of
 conduct.
 
-English-only: ADR originals, changelog, and license text. These are explicitly
-labelled where linked from Chinese docs. The full DESIGN has a Chinese
-translation; the English version remains canonical.
+English-only: ADR originals and license text. These are explicitly labelled
+where linked from Chinese docs. The full DESIGN and CHANGELOG have Chinese
+translations; the English versions remain canonical.

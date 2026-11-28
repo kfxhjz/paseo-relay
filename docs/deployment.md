@@ -68,6 +68,11 @@ TLS is not optional for the public internet: although Paseo payloads are
 end-to-end encrypted, `serverId`, connection metadata, and availability are
 still exposed to a passive or active network attacker on plaintext `ws://`.
 
+If the VPS already runs Caddy for other domains, do not start a second proxy on
+ports 80/443; merge the relay site block into the existing Caddyfile. The
+[quickstart](quickstart.md#existing-caddy-or-other-domains) shows the block and
+the Docker-network/loopback variants.
+
 ## Edge load balancer (required for more than one node)
 
 The LB must:

@@ -40,7 +40,9 @@ Compose 会拉取当前 release `ghcr.io/kfxhjz/paseo-relay:v0.1.4`；`latest` �
 `PASEO_RELAY_MAX_TCP_CONNECTIONS`（5,000）限制到适合 512 MB 内存上限的值；调高
 `PASEO_RELAY_MEM_LIMIT` 时请一起调高这些上限。
 
-Caddy 会自动申请证书。验证：
+示例固定当前稳定版 Caddy 镜像 `caddy:2.11.9-alpine`（多架构 digest）。升级前请查看
+Caddy release notes，再手动更新 pin，不要直接浮动到 `latest`。Caddy 会自动申请证书。
+验证：
 
 ```sh
 curl https://relay.example.com/health   # {"status":"ok"}
@@ -58,6 +60,59 @@ flowchart LR
   DAEMON["Paseo daemon"] -->|"主动出站 wss"| CADDY
   CADDY --> RELAY["relay 容器 4000 仅内网"]
 ```
+
+## VPS 上已有 Caddy 或其他域名
+
+如果这台 VPS 已经为其他域名提供服务，80/443 端口只能由一个进程监听。此时
+**不要启动示例里的 `caddy` 服务**，而是复用已经在运行的反向代理。
+
+**已有 Caddy。** 把 relay 的 site block 合并进现有 Caddyfile（Caddy 按 TLS
+SNI/Host 选择站点，并为每个域名分别申请证书）：
+
+```caddyfile
+relay.example.com {
+    encode zstd gzip
+    @operations path /metrics /ready /version
+    handle @operations { respond 404 }
+    handle { reverse_proxy relay:4000 }
+}
+```
+
+- 如果现有 Caddy 在 Docker 中、且能访问本项目的网络，保留
+  `reverse_proxy relay:4000`。
+- 如果 Caddy 直接运行在宿主机上，只把 relay 发布到 loopback（见下方 override），
+  然后使用 `reverse_proxy 127.0.0.1:4000`。
+- 如果现有 Caddy 属于另一个 Compose 项目，把该 Caddy 容器接入本项目网络，或使用
+  loopback 端口。
+
+宿主机 Caddy 的最小 override 和只启动 relay 的命令：
+
+```yaml
+# docker-compose.override.yml
+services:
+  relay:
+    ports: ["127.0.0.1:4000:4000"]
+```
+
+```sh
+RELAY_DOMAIN=relay.example.com \
+docker compose \
+  -f examples/docker-compose.caddy.yml \
+  -f docker-compose.override.yml \
+  up -d relay
+```
+
+**把其他域名接到本 Caddy。** 保持只有一个 Caddy 进程，为每个域名添加独立的 site
+block（也可以把多个名字写在一起：`relay.example.com, relay2.example.com { ... }`）。
+每个公网域名都需要自己的 DNS 记录；Caddy 会自动申请证书。不要同时运行两个都发布
+80/443 的 Caddy/nginx 容器。
+
+**已有 Nginx/Traefik/HAProxy。** 增加一个虚拟主机，把
+`relay.example.com/ws` 反代到 relay，并保留 WebSocket upgrade；边缘要求和多节点示例见
+[部署指南](deployment.md)。
+
+同一个 relay 可以有多个公网域名，但 Paseo 必须配置用户实际访问的那个 hostname。
+证书签发按域名有速率限制；反复测试时请使用 staging CA。
 
 ## 从源码构建（可选）
 

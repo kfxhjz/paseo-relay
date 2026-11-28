@@ -1,10 +1,19 @@
 # Changelog
 
+**English** | [简体中文](CHANGELOG.zh-CN.md)
+
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Documentation
+
+- Added a complete Simplified Chinese changelog (`CHANGELOG.zh-CN.md`).
+- Updated the VPS quickstart's pinned Caddy image to `2.11.9-alpine` and
+  documented how to reuse an existing Caddy when the VPS already serves other
+  domains.
 
 ## [0.1.4] - 2026-11-27
 

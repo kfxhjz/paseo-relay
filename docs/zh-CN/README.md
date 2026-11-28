@@ -8,7 +8,7 @@
 !!! info "当前版本：v0.1.4"
     容器镜像 `ghcr.io/kfxhjz/paseo-relay:v0.1.4`（同时打 `latest`）。
     详见 [v0.1.4 发布说明](https://github.com/kfxhjz/paseo-relay/releases/tag/v0.1.4) 和
-    [CHANGELOG](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md)。
+    [CHANGELOG](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.zh-CN.md)。
 
 ## 入门
 

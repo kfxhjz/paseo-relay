@@ -62,7 +62,7 @@ relay 只从环境变量读取配置。启动时会校验；非法值（包括�
 `PASEO_RELAY_INGRESS_RECLAIM_AFTER_MS`、`PASEO_RELAY_READ_STALL_TIMEOUT_MS`、
 `PASEO_RELAY_WS_IDLE_TIMEOUT_MS`。`v0.1.2` 镜像会忽略它们，并且收到 `SIGHUP` 时会直接
 退出而不是重新加载 TLS。详见
-[changelog（英文）](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.md)。
+[变更日志](https://github.com/kfxhjz/paseo-relay/blob/main/CHANGELOG.zh-CN.md)。
 **`v0.1.4` 新增：** `PASEO_RELAY_PER_CONNECTION_LIMIT_BYTES`。`v0.1.3` 镜像会忽略
 它，继续使用旧的派生上限。
 

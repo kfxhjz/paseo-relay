@@ -5,6 +5,18 @@
 # need an edge that hashes the `serverId` query parameter (see nginx.conf /
 # haproxy.cfg); Caddy's generic reverse_proxy does not provide that.
 #
+# One Caddy instance can serve this relay and any number of other domains: add
+# their site blocks to this same file (or merge the block below into the
+# existing Caddyfile) and do not start a second process on ports 80/443. Caddy
+# selects the site by TLS SNI/Host and obtains a certificate per hostname.
+#
+# If the existing Caddy runs in Docker on a different Compose project, either
+# attach it to this project's network and keep `reverse_proxy relay:4000`, or
+# publish the relay only on loopback and use `reverse_proxy 127.0.0.1:4000`.
+#
+# Multiple public names for this relay can share one site block:
+#   relay.example.com, relay2.example.com { ... }
+#
 # `/metrics`, `/ready`, and `/version` are intentionally blocked from the public
 # listener. Scrape the relay directly on the private Docker network if you need
 # Prometheus metrics. Caddy OSS has no built-in per-IP rate limiting: put a

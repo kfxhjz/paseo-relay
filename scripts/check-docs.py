@@ -31,6 +31,7 @@ SKIP_PREFIXES = ("http://", "https://", "mailto:", "#")
 # English canonical path (relative to repo root) -> Chinese counterpart.
 PAIRS = {
     "README.md": "README.zh-CN.md",
+    "CHANGELOG.md": "CHANGELOG.zh-CN.md",
     "DESIGN.md": "DESIGN.zh-CN.md",
     "docs/quickstart.md": "docs/zh-CN/quickstart.md",
     "docs/comparison.md": "docs/zh-CN/comparison.md",

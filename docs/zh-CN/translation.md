@@ -37,8 +37,8 @@ python3 scripts/check-docs.py
 
 ## 当前覆盖
 
-中文：README、完整设计、协议、配置、部署、quickstart、兼容性、运维、迁移、benchmark、
-FAQ、安全、贡献、支持、设计摘要、ADR 摘要、E2E 证据、行为准则。
+中文：README、完整设计、变更日志、协议、配置、部署、quickstart、兼容性、运维、
+迁移、benchmark、FAQ、安全、贡献、支持、设计摘要、ADR 摘要、E2E 证据、行为准则。
 
-仅英文：ADR 原文、changelog、许可证文本。从中文文档链接时已明确标注。
-DESIGN 有完整中文翻译，英文版仍是规范来源。
+仅英文：ADR 原文、许可证文本。从中文文档链接时已明确标注。
+DESIGN 和 CHANGELOG 有完整中文翻译，英文版仍是规范来源。

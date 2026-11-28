@@ -45,7 +45,10 @@ pin. The example also caps `PASEO_RELAY_MAX_CONNECTIONS` (4,000),
 (5,000) so the 512 MB memory limit is realistic; raise them together with
 `PASEO_RELAY_MEM_LIMIT`.
 
-Caddy will obtain a certificate automatically. Verify:
+The example pins the current stable Caddy image,
+`caddy:2.11.9-alpine` (multi-arch digest). Update that pin deliberately after
+checking the Caddy release notes rather than floating on `latest`. Caddy will
+obtain a certificate automatically. Verify:
 
 ```sh
 curl https://relay.example.com/health   # {"status":"ok"}
@@ -64,6 +67,63 @@ flowchart LR
   DAEMON["Paseo daemon"] -->|"outbound wss"| CADDY
   CADDY --> RELAY["relay container 4000 internal only"]
 ```
+
+## Existing Caddy or other domains
+
+If the VPS already serves other domains, only one process can bind TCP 80/443.
+In that case **do not start the `caddy` service from this example**; reuse the
+reverse proxy that is already running.
+
+**Existing Caddy.** Merge the relay site block into the existing Caddyfile
+(Caddy selects the site by SNI/Host and obtains one certificate per hostname):
+
+```caddyfile
+relay.example.com {
+    encode zstd gzip
+    @operations path /metrics /ready /version
+    handle @operations { respond 404 }
+    handle { reverse_proxy relay:4000 }
+}
+```
+
+- If that Caddy runs in Docker and can reach this project's network, keep
+  `reverse_proxy relay:4000`.
+- If it runs on the host, publish the relay only on loopback (override below)
+  and use `reverse_proxy 127.0.0.1:4000`.
+- If it runs in another Compose project, attach that Caddy container to this
+  project's network or use the loopback port.
+
+For a host Caddy, a minimal override plus a relay-only start command:
+
+```yaml
+# docker-compose.override.yml
+services:
+  relay:
+    ports: ["127.0.0.1:4000:4000"]
+```
+
+```sh
+RELAY_DOMAIN=relay.example.com \
+docker compose \
+  -f examples/docker-compose.caddy.yml \
+  -f docker-compose.override.yml \
+  up -d relay
+```
+
+**Other domains on this Caddy.** Keep one Caddy process and add a separate site
+block per domain (or join names with commas: `relay.example.com,
+relay2.example.com { ... }`). Each public name needs its own DNS record; Caddy
+obtains the certificates automatically. Do not run two Caddy/nginx containers
+that both publish 80/443.
+
+**Existing Nginx/Traefik/HAProxy.** Add a virtual host that proxies
+`relay.example.com/ws` to the relay and preserves WebSocket upgrades; see
+[deployment.md](deployment.md) for the edge requirements and multi-node
+examples.
+
+Multiple public names for one relay are fine, but configure Paseo with the exact
+hostname users will reach. Certificate issuance rate limits apply per domain;
+use a staging CA for repeated tests.
 
 ## Build from source instead
 

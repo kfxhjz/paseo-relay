@@ -335,7 +335,7 @@ Paseo 把 relay 当作 **不可信** 组件：内容由 E2EE 保护；relay 能�
 - [Discussions](https://github.com/kfxhjz/paseo-relay/discussions) — 部署问答、想法和 Show and tell
 - [完整设计（中文）](DESIGN.zh-CN.md) / [English design](DESIGN.md)
 - [English documentation index](docs/README.md) — 英文规范文档
-- [变更日志](CHANGELOG.md)
+- [变更日志](CHANGELOG.zh-CN.md)
 - [贡献指南](CONTRIBUTING.zh-CN.md)、[安全策略](SECURITY.zh-CN.md)、[支持渠道](SUPPORT.zh-CN.md)
 
 
