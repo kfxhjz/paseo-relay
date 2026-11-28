@@ -115,10 +115,32 @@ docker compose \
   up -d relay
 ```
 
-**把其他域名接到本 Caddy。** 保持只有一个 Caddy 进程，为每个域名添加独立的 site
-block（也可以把多个名字写在一起：`relay.example.com, relay2.example.com { ... }`）。
-每个公网域名都需要自己的 DNS 记录；Caddy 会自动申请证书。不要同时运行两个都发布
-80/443 的 Caddy/nginx 容器。
+**把其他域名接到本 Caddy。** 示例会导入
+`examples/sites-enabled/*.caddy` 下的每个文件，因此新增域名只需新建文件，不要修改
+relay 的 site block：
+
+```caddyfile
+# examples/sites-enabled/app.caddy
+app.example.com {
+    reverse_proxy app:3000
+}
+```
+
+`app` 必须是 `paseo-relay` 网络上可达的服务（也可以挂载内容目录后使用
+`root`/`file_server`）。
+
+校验并 reload（不会断开 relay session）：
+
+```sh
+docker compose -f examples/docker-compose.caddy.yml exec caddy \
+  caddy validate --config /etc/caddy/Caddyfile
+docker compose -f examples/docker-compose.caddy.yml exec caddy \
+  caddy reload --config /etc/caddy/Caddyfile
+```
+
+校验或 reload 失败时 Caddy 会保留旧配置。每个公网域名都需要自己的 DNS 记录；
+Caddy 会自动申请证书。保持只有一个 Caddy 进程，不要同时运行两个都发布 80/443 的
+Caddy/nginx 容器。
 
 **已有 Nginx/Traefik/HAProxy。** 增加一个虚拟主机，把
 `relay.example.com/ws` 和 `/health`（或整站）反代到 relay，并保留 WebSocket

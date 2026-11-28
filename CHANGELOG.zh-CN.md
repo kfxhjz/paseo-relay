@@ -15,6 +15,8 @@
   为其他域名提供服务时如何复用现有 Caddy。
 - 修正 quickstart 中的 Caddyfile 为合法的多行 block，并明确 bridge 网络中的 Caddy
   必须接入 `paseo-relay` 网络；loopback 只适用于宿主机或 host 网络中的容器。
+- Caddy 示例改为可累加结构：导入 `examples/sites-enabled/*.caddy`，每个新域名一个
+  文件，可独立 reload。
 
 ## [0.1.4] - 2026-11-27
 

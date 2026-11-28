@@ -122,10 +122,32 @@ docker compose \
   up -d relay
 ```
 
-**Other domains on this Caddy.** Keep one Caddy process and add a separate site
-block per domain (or join names with commas: `relay.example.com,
-relay2.example.com { ... }`). Each public name needs its own DNS record; Caddy
-obtains the certificates automatically. Do not run two Caddy/nginx containers
+**Other domains on this Caddy.** The example imports every
+`examples/sites-enabled/*.caddy` file, so add one file per domain instead of
+editing the relay block:
+
+```caddyfile
+# examples/sites-enabled/app.caddy
+app.example.com {
+    reverse_proxy app:3000
+}
+```
+
+`app` must be a service reachable on the `paseo-relay` network (or use
+`root`/`file_server` with a mounted content directory).
+
+Validate and reload (without dropping relay sessions):
+
+```sh
+docker compose -f examples/docker-compose.caddy.yml exec caddy \
+  caddy validate --config /etc/caddy/Caddyfile
+docker compose -f examples/docker-compose.caddy.yml exec caddy \
+  caddy reload --config /etc/caddy/Caddyfile
+```
+
+Caddy keeps the previous configuration if validation or reload fails. Each
+public name needs its own DNS record; Caddy obtains the certificates
+automatically. Keep one Caddy process and do not run two Caddy/nginx containers
 that both publish 80/443.
 
 **Existing Nginx/Traefik/HAProxy.** Add a virtual host that proxies

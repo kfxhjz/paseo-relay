@@ -47,3 +47,8 @@
 		reverse_proxy relay:4000
 	}
 }
+
+# Load one file per additional site from examples/sites-enabled/. Adding a new
+# domain is a new file in that directory, not an edit to this relay block. The
+# directory is mounted at /etc/caddy/sites-enabled by the Compose example.
+import /etc/caddy/sites-enabled/*.caddy

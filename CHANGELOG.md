@@ -17,6 +17,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Corrected the quickstart Caddyfile to use valid multi-line blocks and
   clarified that a bridge-network Caddy must join the `paseo-relay` network;
   loopback only works from the host or a host-network container.
+- Made the Caddy example additive: `examples/sites-enabled/*.caddy` is imported
+  so each new domain lives in its own file and can be reloaded independently.
 
 ## [0.1.4] - 2026-11-27
 

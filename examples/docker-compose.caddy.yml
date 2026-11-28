@@ -14,6 +14,11 @@
 # (plus UDP 443 for HTTP/3). The relay itself has no host port and is reachable
 # only on the Compose network.
 #
+# Additional domains: add one file per site under examples/sites-enabled/.
+# examples/Caddyfile imports that directory and reloads with:
+#   docker compose -f examples/docker-compose.caddy.yml exec caddy \
+#     caddy reload --config /etc/caddy/Caddyfile
+#
 # If this VPS already runs Caddy (or another reverse proxy) on ports 80/443,
 # do not start the `caddy` service below: add the relay site block from
 # examples/Caddyfile to the existing Caddyfile, or proxy to the relay from the
@@ -92,6 +97,7 @@ services:
       RELAY_DOMAIN: "${RELAY_DOMAIN:?set RELAY_DOMAIN to your public hostname}"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./sites-enabled:/etc/caddy/sites-enabled:ro
       - caddy_data:/data
       - caddy_config:/config
 
