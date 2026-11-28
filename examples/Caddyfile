@@ -10,9 +10,17 @@
 # existing Caddyfile) and do not start a second process on ports 80/443. Caddy
 # selects the site by TLS SNI/Host and obtains a certificate per hostname.
 #
-# If the existing Caddy runs in Docker on a different Compose project, either
-# attach it to this project's network and keep `reverse_proxy relay:4000`, or
-# publish the relay only on loopback and use `reverse_proxy 127.0.0.1:4000`.
+# If the existing Caddy runs in Docker, start only the relay first so the
+# `paseo-relay` network exists, then attach Caddy to it and keep
+# `reverse_proxy relay:4000`:
+#   docker compose -f examples/docker-compose.caddy.yml up -d relay
+#   docker network connect paseo-relay <caddy-container-name>
+# If another Compose project manages that Caddy, declare the `paseo-relay`
+# network as external there so the attachment survives container recreation.
+#
+# The loopback form (`reverse_proxy 127.0.0.1:4000`) only works when Caddy
+# runs directly on the host or uses `network_mode: host`; a bridge-network
+# container cannot reach the host's loopback through 127.0.0.1.
 #
 # Multiple public names for this relay can share one site block:
 #   relay.example.com, relay2.example.com { ... }

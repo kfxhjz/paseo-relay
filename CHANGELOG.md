@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Updated the VPS quickstart's pinned Caddy image to `2.11.9-alpine` and
   documented how to reuse an existing Caddy when the VPS already serves other
   domains.
+- Corrected the quickstart Caddyfile to use valid multi-line blocks and
+  clarified that a bridge-network Caddy must join the `paseo-relay` network;
+  loopback only works from the host or a host-network container.
 
 ## [0.1.4] - 2026-11-27
 

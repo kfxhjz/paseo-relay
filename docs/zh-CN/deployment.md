@@ -58,8 +58,8 @@ Paseo payload 虽然 E2EE，但 `serverId`、连接元数据和可用性仍会�
 被动/主动攻击者，所以公网不能只跑 `ws://`。
 
 如果 VPS 上已经有 Caddy 在为其他域名服务，不要在 80/443 再启动一个反向代理；把
-relay 的 site block 合并进现有 Caddyfile。[快速开始](quickstart.md) 给出了该 block
-以及 Docker 网络/loopback 两种接法。
+relay 的 site block 合并进现有 Caddyfile。[快速开始](quickstart.md#existing-caddy-or-other-domains)
+给出了该 block 以及 Docker 网络/loopback 两种接法。
 
 ## 边缘负载均衡（多节点必需）
 

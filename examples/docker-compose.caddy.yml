@@ -98,3 +98,9 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  # Fixed name so an existing Caddy container from another Compose project can
+  # be attached with `docker network connect paseo-relay <container>`.
+  default:
+    name: paseo-relay

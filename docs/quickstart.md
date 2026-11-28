@@ -80,18 +80,30 @@ reverse proxy that is already running.
 ```caddyfile
 relay.example.com {
     encode zstd gzip
+
     @operations path /metrics /ready /version
-    handle @operations { respond 404 }
-    handle { reverse_proxy relay:4000 }
+    handle @operations {
+        respond 404
+    }
+
+    handle {
+        reverse_proxy relay:4000
+    }
 }
 ```
 
-- If that Caddy runs in Docker and can reach this project's network, keep
-  `reverse_proxy relay:4000`.
+- If it runs in Docker (this project or another Compose project), start only
+  the relay first so the `paseo-relay` network exists:
+  `RELAY_DOMAIN=relay.example.com docker compose -f examples/docker-compose.caddy.yml up -d relay`.
+  Then attach the Caddy container to that network and keep
+  `reverse_proxy relay:4000`. For a manual container:
+  `docker network connect paseo-relay <caddy-container-name>`. If Caddy is
+  managed by Compose, add the external `paseo-relay` network to that project
+  instead; a manual `docker network connect` is lost when the container is
+  recreated.
 - If it runs on the host, publish the relay only on loopback (override below)
-  and use `reverse_proxy 127.0.0.1:4000`.
-- If it runs in another Compose project, attach that Caddy container to this
-  project's network or use the loopback port.
+  and use `reverse_proxy 127.0.0.1:4000`. A loopback port is not reachable from
+  inside another bridge-network container.
 
 For a host Caddy, a minimal override plus a relay-only start command:
 
@@ -117,9 +129,9 @@ obtains the certificates automatically. Do not run two Caddy/nginx containers
 that both publish 80/443.
 
 **Existing Nginx/Traefik/HAProxy.** Add a virtual host that proxies
-`relay.example.com/ws` to the relay and preserves WebSocket upgrades; see
-[deployment.md](deployment.md) for the edge requirements and multi-node
-examples.
+`relay.example.com/ws` and `/health` (or the whole site) to the relay and
+preserves WebSocket upgrades; see [deployment.md](deployment.md) for the edge
+requirements and multi-node examples.
 
 Multiple public names for one relay are fine, but configure Paseo with the exact
 hostname users will reach. Certificate issuance rate limits apply per domain;

@@ -13,6 +13,8 @@
 - 新增完整的简体中文变更日志（`CHANGELOG.zh-CN.md`）。
 - 将 VPS quickstart 固定的 Caddy 镜像更新到 `2.11.9-alpine`，并记录了当 VPS 已经在
   为其他域名提供服务时如何复用现有 Caddy。
+- 修正 quickstart 中的 Caddyfile 为合法的多行 block，并明确 bridge 网络中的 Caddy
+  必须接入 `paseo-relay` 网络；loopback 只适用于宿主机或 host 网络中的容器。
 
 ## [0.1.4] - 2026-11-27
 

@@ -61,6 +61,8 @@ flowchart LR
   CADDY --> RELAY["relay 容器 4000 仅内网"]
 ```
 
+<a id="existing-caddy-or-other-domains"></a>
+
 ## VPS 上已有 Caddy 或其他域名
 
 如果这台 VPS 已经为其他域名提供服务，80/443 端口只能由一个进程监听。此时
@@ -72,18 +74,29 @@ SNI/Host 选择站点，并为每个域名分别申请证书）：
 ```caddyfile
 relay.example.com {
     encode zstd gzip
+
     @operations path /metrics /ready /version
-    handle @operations { respond 404 }
-    handle { reverse_proxy relay:4000 }
+    handle @operations {
+        respond 404
+    }
+
+    handle {
+        reverse_proxy relay:4000
+    }
 }
 ```
 
-- 如果现有 Caddy 在 Docker 中、且能访问本项目的网络，保留
-  `reverse_proxy relay:4000`。
+- 如果现有 Caddy 在 Docker 中（本项目或另一个 Compose 项目），先只启动 relay，
+  让 `paseo-relay` 网络存在：
+  `RELAY_DOMAIN=relay.example.com docker compose -f examples/docker-compose.caddy.yml up -d relay`。
+  然后把 Caddy 容器接入该网络，保留 `reverse_proxy relay:4000`。手动容器可用
+  `docker network connect paseo-relay <caddy-container-name>`；如果 Caddy 由 Compose
+  管理，请在该项目的配置里声明 external `paseo-relay` 网络，因为容器重建后手动
+  `docker network connect` 会丢失。
 - 如果 Caddy 直接运行在宿主机上，只把 relay 发布到 loopback（见下方 override），
-  然后使用 `reverse_proxy 127.0.0.1:4000`。
-- 如果现有 Caddy 属于另一个 Compose 项目，把该 Caddy 容器接入本项目网络，或使用
-  loopback 端口。
+  然后使用 `reverse_proxy 127.0.0.1:4000`。bridge 网络中的容器不能通过
+  `127.0.0.1` 访问宿主机上另一个容器发布的端口；loopback 接法只适用于宿主机或
+  `network_mode: host` 的 Caddy。
 
 宿主机 Caddy 的最小 override 和只启动 relay 的命令：
 
@@ -108,8 +121,8 @@ block（也可以把多个名字写在一起：`relay.example.com, relay2.exampl
 80/443 的 Caddy/nginx 容器。
 
 **已有 Nginx/Traefik/HAProxy。** 增加一个虚拟主机，把
-`relay.example.com/ws` 反代到 relay，并保留 WebSocket upgrade；边缘要求和多节点示例见
-[部署指南](deployment.md)。
+`relay.example.com/ws` 和 `/health`（或整站）反代到 relay，并保留 WebSocket
+upgrade；边缘要求和多节点示例见[部署指南](deployment.md)。
 
 同一个 relay 可以有多个公网域名，但 Paseo 必须配置用户实际访问的那个 hostname。
 证书签发按域名有速率限制；反复测试时请使用 staging CA。
