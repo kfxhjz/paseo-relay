@@ -67,11 +67,40 @@ flowchart LR
 
 ## VPS 上已有 Caddy 或其他域名
 
-如果这台 VPS 已经为其他域名提供服务，80/443 端口只能由一个进程监听。此时
-**不要启动示例里的 `caddy` 服务**，而是复用已经在运行的反向代理。
+80/443 只能由一个进程监听。如果 VPS 已有 Caddy，不要再启动示例里的 `caddy`
+服务。按现有 Caddy 的运行位置选择 relay 地址：
 
-**已有 Caddy。** 把 relay 的 site block 合并进现有 Caddyfile（Caddy 按 TLS
-SNI/Host 选择站点，并为每个域名分别申请证书）：
+| 现有 Caddy 的位置 | relay 地址 | 需要的配置 |
+|---|---|---|
+| Docker，本项目的网络 | `relay:4000` | 先启动 relay；把 Caddy 接入 `paseo-relay` |
+| 直接运行在宿主机 | `127.0.0.1:4000` | 用 `host-caddy` override 启动 relay |
+| Docker，另一个网络 | `relay:4000` | 把 Caddy 接入 external `paseo-relay` 网络 |
+
+下面的命令假设已经创建了 `examples/.env`（见上面的部署章节）。
+
+**Caddy 在 Docker 中。** 先只启动 relay，这会创建 `paseo-relay` 网络：
+
+```sh
+docker compose -f examples/docker-compose.caddy.yml up -d relay
+```
+
+把现有 Caddy 容器接入该网络
+（`docker network connect paseo-relay <caddy-container-name>`），或在另一个
+Compose 项目里声明 external 网络（保留它原有的网络列表）：
+
+```yaml
+# 现有 Caddy 的 Compose 项目
+networks:
+  paseo-relay:
+    external: true
+services:
+  caddy:
+    networks:
+      - default
+      - paseo-relay
+```
+
+然后使用 Compose 服务名：
 
 ```caddyfile
 relay.example.com {
@@ -88,35 +117,34 @@ relay.example.com {
 }
 ```
 
-- 如果现有 Caddy 在 Docker 中（本项目或另一个 Compose 项目），先只启动 relay，
-  让 `paseo-relay` 网络存在：
-  `docker compose -f examples/docker-compose.caddy.yml up -d relay`。
-  Compose 会读取 `examples/.env`；如果还没有创建，请在命令前加
-  `RELAY_DOMAIN=...`。
-  然后把 Caddy 容器接入该网络，保留 `reverse_proxy relay:4000`。手动容器可用
-  `docker network connect paseo-relay <caddy-container-name>`；如果 Caddy 由 Compose
-  管理，请在该项目的配置里声明 external `paseo-relay` 网络，因为容器重建后手动
-  `docker network connect` 会丢失。
-- 如果 Caddy 直接运行在宿主机上，只把 relay 发布到 loopback（见下方 override），
-  然后使用 `reverse_proxy 127.0.0.1:4000`。bridge 网络中的容器不能通过
-  `127.0.0.1` 访问宿主机上另一个容器发布的端口；loopback 接法只适用于宿主机或
-  `network_mode: host` 的 Caddy。
+`relay:4000` 只在 Docker 网络内可解析。宿主机上的 Caddy 用这个地址会报
+`lookup relay: i/o timeout`（或 DNS 超时）；请改用下面的宿主机方案。
 
-宿主机 Caddy 的最小 override 和只启动 relay 的命令：
-
-```yaml
-# docker-compose.override.yml
-services:
-  relay:
-    ports: ["127.0.0.1:4000:4000"]
-```
+**Caddy 在宿主机上。** 用 loopback override 只启动 relay：
 
 ```sh
-# examples/.env 提供 RELAY_DOMAIN
 docker compose \
   -f examples/docker-compose.caddy.yml \
-  -f docker-compose.override.yml \
+  -f examples/docker-compose.caddy.host-caddy.yml \
   up -d relay
+```
+
+该 override 只把 relay 发布到 `127.0.0.1:4000`，不会启动示例的 Caddy。Caddy
+配置使用：
+
+```caddyfile
+relay.example.com {
+    encode zstd gzip
+
+    @operations path /metrics /ready /version
+    handle @operations {
+        respond 404
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:4000
+    }
+}
 ```
 
 **把其他域名接到本 Caddy。** 示例会导入
@@ -130,10 +158,27 @@ app.example.com {
 }
 ```
 
-`app` 必须是 `paseo-relay` 网络上可达的服务（也可以挂载内容目录后使用
-`root`/`file_server`）。
+后端必须能用 `reverse_proxy` 里的名字访问：
 
-校验并 reload（不会断开 relay session）：
+- **同一个 Compose 项目：** 把服务加到 `examples/docker-compose.caddy.yml`。它会自动
+  加入默认的 `paseo-relay` 网络，`reverse_proxy app:3000` 可以直接工作。
+- **另一个 Compose 项目：** 在该项目声明 external 网络，并把 Caddy 和后端（至少后端）
+  接进去：
+  ```yaml
+  networks:
+    paseo-relay:
+      external: true
+  services:
+    app:
+      networks: [paseo-relay]
+  ```
+- **宿主机进程：** Caddy 容器不能用 `127.0.0.1` 访问它。给 Caddy 服务加
+  `extra_hosts: ["host.docker.internal:host-gateway"]`，然后使用
+  `reverse_proxy host.docker.internal:3000`；或者把 Caddy 跑在宿主机上，使用
+  `reverse_proxy 127.0.0.1:3000`。
+- **静态内容：** 把目录挂载进 Caddy 容器，使用 `root` + `file_server`。
+
+校验并 reload 示例的 Docker Caddy（不会断开 relay session）：
 
 ```sh
 docker compose -f examples/docker-compose.caddy.yml exec caddy \
@@ -141,6 +186,9 @@ docker compose -f examples/docker-compose.caddy.yml exec caddy \
 docker compose -f examples/docker-compose.caddy.yml exec caddy \
   caddy reload --config /etc/caddy/Caddyfile
 ```
+
+如果 Caddy 运行在宿主机，请对它的 Caddyfile 运行 `caddy validate`，并 reload 它的
+服务（例如 `systemctl reload caddy`）；`docker compose exec` 只适用于示例容器。
 
 校验或 reload 失败时 Caddy 会保留旧配置。每个公网域名都需要自己的 DNS 记录；
 Caddy 会自动申请证书。保持只有一个 Caddy 进程，不要同时运行两个都发布 80/443 的

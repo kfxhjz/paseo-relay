@@ -1,0 +1,11 @@
+# Optional override for a Caddy running directly on the host (not in Docker).
+# It publishes the relay only on loopback; use:
+#   docker compose \
+#     -f examples/docker-compose.caddy.yml \
+#     -f examples/docker-compose.caddy.host-caddy.yml \
+#     up -d relay
+# Do not start the example's `caddy` service in this mode.
+services:
+  relay:
+    ports:
+      - "127.0.0.1:4000:4000"

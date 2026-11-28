@@ -72,12 +72,43 @@ flowchart LR
 
 ## Existing Caddy or other domains
 
-If the VPS already serves other domains, only one process can bind TCP 80/443.
-In that case **do not start the `caddy` service from this example**; reuse the
-reverse proxy that is already running.
+Only one process can bind TCP 80/443. If the VPS already runs Caddy, do not
+start the `caddy` service from this example. Use the relay address that matches
+where that Caddy runs:
 
-**Existing Caddy.** Merge the relay site block into the existing Caddyfile
-(Caddy selects the site by SNI/Host and obtains one certificate per hostname):
+| Existing Caddy runs... | Relay address | Required setup |
+|---|---|---|
+| In Docker on this project's network | `relay:4000` | start relay first; attach Caddy to `paseo-relay` |
+| Directly on the host | `127.0.0.1:4000` | start relay with the `host-caddy` override |
+| In Docker on another network | `relay:4000` | attach Caddy to the external `paseo-relay` network |
+
+The commands below assume `examples/.env` exists (see the deploy section above).
+
+**Caddy in Docker.** Start only the relay first; this creates the
+`paseo-relay` network:
+
+```sh
+docker compose -f examples/docker-compose.caddy.yml up -d relay
+```
+
+Attach the existing Caddy container to that network
+(`docker network connect paseo-relay <caddy-container-name>`), or declare the
+external network in the other Compose project (keep its existing networks in the
+list):
+
+```yaml
+# existing Caddy Compose project
+networks:
+  paseo-relay:
+    external: true
+services:
+  caddy:
+    networks:
+      - default
+      - paseo-relay
+```
+
+Then use the Compose service name:
 
 ```caddyfile
 relay.example.com {
@@ -94,36 +125,35 @@ relay.example.com {
 }
 ```
 
-- If it runs in Docker (this project or another Compose project), start only
-  the relay first so the `paseo-relay` network exists:
-  `docker compose -f examples/docker-compose.caddy.yml up -d relay`.
-  Compose reads `examples/.env`; if you did not create it, prefix the command
-  with `RELAY_DOMAIN=...`.
-  Then attach the Caddy container to that network and keep
-  `reverse_proxy relay:4000`. For a manual container:
-  `docker network connect paseo-relay <caddy-container-name>`. If Caddy is
-  managed by Compose, add the external `paseo-relay` network to that project
-  instead; a manual `docker network connect` is lost when the container is
-  recreated.
-- If it runs on the host, publish the relay only on loopback (override below)
-  and use `reverse_proxy 127.0.0.1:4000`. A loopback port is not reachable from
-  inside another bridge-network container.
+`relay:4000` only resolves inside the Docker network. A Caddy running on the
+host will fail with `lookup relay: i/o timeout` (or a DNS timeout); use the
+host variant below instead.
 
-For a host Caddy, a minimal override plus a relay-only start command:
-
-```yaml
-# docker-compose.override.yml
-services:
-  relay:
-    ports: ["127.0.0.1:4000:4000"]
-```
+**Caddy on the host.** Start only the relay with the loopback override:
 
 ```sh
-# examples/.env provides RELAY_DOMAIN
 docker compose \
   -f examples/docker-compose.caddy.yml \
-  -f docker-compose.override.yml \
+  -f examples/docker-compose.caddy.host-caddy.yml \
   up -d relay
+```
+
+The override publishes the relay on `127.0.0.1:4000` and does not start the
+example's Caddy. Proxy to that address:
+
+```caddyfile
+relay.example.com {
+    encode zstd gzip
+
+    @operations path /metrics /ready /version
+    handle @operations {
+        respond 404
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:4000
+    }
+}
 ```
 
 **Other domains on this Caddy.** The example imports every
@@ -137,10 +167,30 @@ app.example.com {
 }
 ```
 
-`app` must be a service reachable on the `paseo-relay` network (or use
-`root`/`file_server` with a mounted content directory).
+The backend must be reachable under the name used in `reverse_proxy`:
 
-Validate and reload (without dropping relay sessions):
+- **Same Compose project:** add the service to
+  `examples/docker-compose.caddy.yml`. It joins the default `paseo-relay`
+  network automatically, so `reverse_proxy app:3000` works.
+- **Another Compose project:** declare the external network in that project and
+  attach both Caddy and the backend (or at least the backend):
+  ```yaml
+  networks:
+    paseo-relay:
+      external: true
+  services:
+    app:
+      networks: [paseo-relay]
+  ```
+- **A process on the host:** a Caddy container cannot reach it via
+  `127.0.0.1`; add
+  `extra_hosts: ["host.docker.internal:host-gateway"]` to the Caddy service and
+  use `reverse_proxy host.docker.internal:3000`, or run Caddy on the host and
+  use `reverse_proxy 127.0.0.1:3000`.
+- **Static content:** mount the directory into the Caddy container and use
+  `root` + `file_server`.
+
+Validate and reload the bundled Docker Caddy without dropping relay sessions:
 
 ```sh
 docker compose -f examples/docker-compose.caddy.yml exec caddy \
@@ -148,6 +198,10 @@ docker compose -f examples/docker-compose.caddy.yml exec caddy \
 docker compose -f examples/docker-compose.caddy.yml exec caddy \
   caddy reload --config /etc/caddy/Caddyfile
 ```
+
+If Caddy runs on the host, run the same `caddy validate` against its own
+Caddyfile and reload its service instead (for example `systemctl reload caddy`);
+the `docker compose exec` commands only apply to the bundled container.
 
 Caddy keeps the previous configuration if validation or reload fails. Each
 public name needs its own DNS record; Caddy obtains the certificates

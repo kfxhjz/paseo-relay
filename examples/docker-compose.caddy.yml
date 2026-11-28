@@ -28,6 +28,12 @@
 # do not start the `caddy` service below: add the relay site block from
 # examples/Caddyfile to the existing Caddyfile, or proxy to the relay from the
 # existing proxy. See docs/quickstart.md ("Existing Caddy or other domains").
+#
+# If that Caddy runs on the host (not in Docker), use the host-caddy override:
+#   docker compose -f examples/docker-compose.caddy.yml \
+#     -f examples/docker-compose.caddy.host-caddy.yml up -d relay
+# and proxy to 127.0.0.1:4000. The `relay` service name only resolves inside
+# the `paseo-relay` Docker network.
 
 services:
   relay:

@@ -1,5 +1,11 @@
 # Single-node deployment: automatic HTTPS + WebSocket reverse proxy.
 #
+# This file belongs to the Docker `caddy` service from
+# examples/docker-compose.caddy.yml. It uses the Compose DNS name `relay`, which
+# only resolves inside the `paseo-relay` network. A Caddy running directly on
+# the host must instead use examples/docker-compose.caddy.host-caddy.yml and
+# `reverse_proxy 127.0.0.1:4000`.
+#
 # Caddy obtains and renews the certificate for {$RELAY_DOMAIN}. This is the
 # recommended setup when you run exactly one relay node. For multiple nodes you
 # need an edge that hashes the `serverId` query parameter (see nginx.conf /

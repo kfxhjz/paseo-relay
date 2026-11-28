@@ -19,6 +19,9 @@
   文件，可独立 reload。
 - 新增 `examples/.env.example`：在 git 忽略的 `examples/.env` 里配置一次
   `RELAY_DOMAIN`，升级时不再需要内联变量。
+- 新增 host-Caddy override，并明确两种反向代理地址：容器内 Caddy 使用
+  `paseo-relay` 网络上的 `relay:4000`，宿主机 Caddy 使用 `127.0.0.1:4000`。
+  新域名后端必须接入 `paseo-relay`，或通过 `host.docker.internal` 访问宿主机。
 
 ## [0.1.4] - 2026-11-27
 

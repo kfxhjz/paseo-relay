@@ -21,6 +21,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so each new domain lives in its own file and can be reloaded independently.
 - Added `examples/.env.example` so `RELAY_DOMAIN` is configured once in the
   git-ignored `examples/.env`; upgrades no longer need it inline.
+- Added a host-Caddy override and clarified the two reverse-proxy addresses:
+  container Caddy uses `relay:4000` on `paseo-relay`, host Caddy uses
+  `127.0.0.1:4000`. New-domain backends must join `paseo-relay` or use
+  `host.docker.internal`.
 
 ## [0.1.4] - 2026-11-27
 
